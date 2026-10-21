@@ -448,6 +448,26 @@ def _number_log(text: str, max_lines: int = 400, max_chars: int = 16000) -> str:
     return body
 
 
+# Concrete per-level guidance so easy/medium/hard actually differ, per genre.
+_DIFFICULTY_RUBRIC = {
+    "reverse": {
+        "easy": "a SINGLE reversible byte transform (e.g. XOR or add with one key); "
+                "a player can solve it by reading the source or just running the binary.",
+        "medium": "a named cipher/encoding or a multi-step check (e.g. an S-box, RC4/TEA, "
+                  "a state machine); solving requires re-implementing the transform.",
+        "hard": "layered and non-obvious (e.g. a cipher PLUS an anti-debug/anti-VM gate, a "
+                "custom bytecode VM, or self-modifying code); solving requires real reversing.",
+    },
+    "log": {
+        "easy": "the answer is found in a SINGLE line (one grep / one regex).",
+        "medium": "the answer requires filtering and aggregating, or correlating two fields "
+                  "across lines (a count, number of distinct values, a max).",
+        "hard": "the answer requires multi-step correlation across many lines — time windows, "
+                "joining related events, or decoding embedded/encoded data.",
+    },
+}
+
+
 def _build_generation_prompt(
     user_prompt: str,
     difficulty: str,
@@ -463,7 +483,9 @@ def _build_generation_prompt(
             f"{target_platform or _default_platform()} "
             "They MUST compile and run there, so do not call APIs that platform lacks."
         )
-    parts.append(f"Target difficulty: {difficulty}.")
+    genre_key = "reverse" if schema is _SCHEMA_RULES else "log"
+    rubric = _DIFFICULTY_RUBRIC[genre_key].get(difficulty.lower())
+    parts.append(f"Target difficulty: {difficulty}." + (f" At this level, {rubric}" if rubric else ""))
     if category:
         parts.append(f"Category / flavour: {category}.")
     parts.append("")
@@ -546,7 +568,9 @@ def _normalize_challenge(
     """Fill defaults and normalize fields so downstream writes never KeyError."""
     data = dict(data)
     data.setdefault("title", "SlothCTF Challenge")
-    data.setdefault("difficulty", difficulty)
+    # The requested difficulty wins over the model's self-label, so the recorded
+    # level always matches what was asked for.
+    data["difficulty"] = difficulty
     data.setdefault("readme", f"# {data.get('title')}\n")
 
     if genre == "log":

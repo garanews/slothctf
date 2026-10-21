@@ -59,6 +59,19 @@ class PromptBuildTests(unittest.TestCase):
         self.assertIn("previous attempt failed", text.lower())
         self.assertIn("missing semicolon", text)
 
+    def test_difficulty_rubric_in_prompt(self):
+        from slothctf.generator import _SCHEMA_RULES_LOG
+        hard = _build_generation_prompt("x", "hard", None, None)
+        self.assertIn("Target difficulty: hard", hard)
+        self.assertIn("layered", hard.lower())  # reverse hard rubric
+        easy_log = _build_generation_prompt("x", "easy", None, None, schema=_SCHEMA_RULES_LOG)
+        self.assertIn("single line", easy_log.lower())  # log easy rubric
+
+    def test_requested_difficulty_overrides_model(self):
+        from slothctf.generator import _normalize_challenge
+        data = _normalize_challenge({"difficulty": "hard", "flag": "x"}, "easy", None, "reverse")
+        self.assertEqual(data["difficulty"], "easy")
+
     def test_coerce_json_from_fenced_block(self):
         raw = 'Sure!\n```json\n{"flag": "sloth{a}"}\n```\n'
         self.assertEqual(_coerce_json(raw)["flag"], "sloth{a}")
