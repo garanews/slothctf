@@ -525,6 +525,8 @@ def _write_challenge_files(base_dir: Path, data: dict[str, Any]) -> None:
         (private_dir / "encoder.c").write_text(data["encoder_code"], encoding="utf-8")
     if "generator_code" in data:
         (private_dir / "generator.py").write_text(data["generator_code"], encoding="utf-8")
+    for stale in private_dir.glob("extractor_*.py"):  # drop extractors of removed tasks
+        stale.unlink()
     for i, t in enumerate(data.get("tasks", []), 1):  # per-task extractors (log genre)
         (private_dir / f"extractor_{i}.py").write_text(t.get("extractor_code", ""), encoding="utf-8")
 
@@ -855,10 +857,46 @@ _DECOY_LOG = (
 ) * 4
 
 
+def _check_one_task(task: dict[str, Any], ext: Path, log_path: Path, log_text: str,
+                    lines: list[str], decoy: Path) -> tuple[bool, str]:
+    """Verify a single task's extractor. Returns (ok, reason-if-failed)."""
+    answer = _clean_answer(str(task.get("answer", "")))
+    task["answer"] = answer
+    etype = str(task.get("type", "extractive")).strip().lower()
+    ext.write_text(_strip_code_fences(str(task.get("extractor_code", ""))), encoding="utf-8")
+    try:
+        ok, out, err = _run_python(ext, [str(log_path)])
+        ok2, out2, _ = _run_python(ext, [str(log_path)])
+    except subprocess.TimeoutExpired:
+        return False, "extractor timed out"
+    if not ok or not ok2:
+        return False, f"extractor crashed: {err.splitlines()[-1][:160] if err.strip() else 'error'}"
+    if out.strip() != out2.strip():
+        return False, "extractor is not deterministic"
+    if out.strip() != answer:
+        return False, f"extractor printed {out.strip()[:80]!r} but declared answer is {answer!r}"
+    if etype == "extractive":
+        if answer not in log_text:
+            return False, f"extractive answer {answer!r} not present verbatim in the log"
+        try:
+            ln = int(task.get("evidence_line", 0))
+        except (TypeError, ValueError):
+            ln = 0
+        if not (1 <= ln <= len(lines)) or answer not in lines[ln - 1]:
+            return False, f"evidence_line does not point to a line containing {answer!r}"
+    try:
+        _ok, decoy_out, _e = _run_python(ext, [str(decoy)])
+        if decoy_out.strip() == answer:
+            return False, "extractor prints the answer on an unrelated log (hardcoded)"
+    except subprocess.TimeoutExpired:
+        pass
+    return True, ""
+
+
 def _verify_tasks_against_log(base_dir: Path, data: dict[str, Any], log_path: Path) -> AttemptResult:
-    """Shared check for log challenges: every task's extractor must recover its
-    answer from the log, deterministically; extractive answers must be grounded
-    at the cited line; and no extractor may hardcode its answer (decoy test)."""
+    """Check each task independently and KEEP the ones that verify, dropping any
+    that fail. The challenge is valid if at least one task survives — a log
+    naturally supports several questions and we ship only the proven ones."""
     org = base_dir / "organizer"
     org.mkdir(parents=True, exist_ok=True)
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
@@ -870,52 +908,27 @@ def _verify_tasks_against_log(base_dir: Path, data: dict[str, Any], log_path: Pa
 
     decoy = base_dir / "evidence" / "_decoy.log"
     decoy.write_text(_DECOY_LOG, encoding="utf-8")
+    kept: list[dict[str, Any]] = []
+    reasons: list[str] = []
     try:
         for i, task in enumerate(tasks, 1):
-            answer = _clean_answer(str(task.get("answer", "")))
-            task["answer"] = answer
-            etype = str(task.get("type", "extractive")).strip().lower()
-            ext = org / f"extractor_{i}.py"
-            ext.write_text(_strip_code_fences(str(task.get("extractor_code", ""))), encoding="utf-8")
-
-            try:
-                ok, out, err = _run_python(ext, [str(log_path)])
-                ok2, out2, _ = _run_python(ext, [str(log_path)])
-            except subprocess.TimeoutExpired:
-                return AttemptResult(0, False, "extractor-timeout", f"task {i}: extractor did not finish in 20s.")
-            if not ok or not ok2:
-                return AttemptResult(0, False, "extractor-crash", f"task {i}: extractor failed:\n{err[:300]}")
-            if out.strip() != out2.strip():
-                return AttemptResult(0, False, "nondeterministic", f"task {i}: extractor is not deterministic.")
-            if out.strip() != answer:
-                return AttemptResult(
-                    0, False, "answer-mismatch",
-                    f"task {i}: extractor printed {out.strip()[:120]!r} but the declared answer is {answer!r}.",
-                )
-
-            if etype == "extractive":
-                if answer not in log_text:
-                    return AttemptResult(0, False, "not-grounded",
-                                         f"task {i}: extractive answer {answer!r} is not present verbatim in the log.")
-                try:
-                    ln = int(task.get("evidence_line", 0))
-                except (TypeError, ValueError):
-                    ln = 0
-                if not (1 <= ln <= len(lines)) or answer not in lines[ln - 1]:
-                    return AttemptResult(0, False, "bad-evidence",
-                                         f"task {i}: evidence_line must be the 1-based line containing {answer!r}.")
-
-            try:
-                _ok, decoy_out, _e = _run_python(ext, [str(decoy)])
-                if decoy_out.strip() == answer:
-                    return AttemptResult(0, False, "hardcoded-answer",
-                                         f"task {i}: extractor prints the answer on an unrelated log — do not hardcode it.")
-            except subprocess.TimeoutExpired:
-                pass
+            ok, reason = _check_one_task(task, org / f"_probe_{i}.py", log_path, log_text, lines, decoy)
+            if ok:
+                kept.append(task)
+            else:
+                reasons.append(f"task {i} ({task.get('question','')[:50]}): {reason}")
     finally:
         decoy.unlink(missing_ok=True)
+        for p in org.glob("_probe_*.py"):
+            p.unlink(missing_ok=True)
 
-    return AttemptResult(0, True, "passed", f"{len(tasks)} task(s) verified")
+    data["tasks"] = kept
+    if not kept:
+        detail = "no task verified. " + " | ".join(reasons[:4])
+        return AttemptResult(0, False, "no-valid-tasks", detail)
+    dropped = len(tasks) - len(kept)
+    note = f"{len(kept)}/{len(tasks)} task(s) verified" + (f", {dropped} dropped" if dropped else "")
+    return AttemptResult(0, True, "passed", note)
 
 
 def _verify_log_challenge(base_dir: Path, data: dict[str, Any], compiler: str | None = None) -> AttemptResult:

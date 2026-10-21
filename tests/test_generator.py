@@ -216,20 +216,25 @@ class LogVerifyTests(unittest.TestCase):
             return generator._verify_log_challenge(Path(tmp) / "c", data)
 
     def test_passes_multi_task(self):
-        r = self._run({"generator_code": self.GOOD_GEN, "tasks": self._tasks()})
+        data = {"generator_code": self.GOOD_GEN, "tasks": self._tasks()}
+        r = self._run(data)
         self.assertTrue(r.ok, r.detail)
+        self.assertEqual(len(data["tasks"]), 2)  # both kept
 
-    def test_answer_mismatch(self):
-        tasks = self._tasks(); tasks[1]["answer"] = "99"
+    def test_keeps_good_drops_bad(self):
+        tasks = self._tasks(); tasks[1]["answer"] = "99"  # 2nd task wrong
+        data = {"generator_code": self.GOOD_GEN, "tasks": tasks}
+        r = self._run(data)
+        self.assertTrue(r.ok, r.detail)          # still valid...
+        self.assertEqual(len(data["tasks"]), 1)  # ...with only the good task kept
+
+    def test_all_bad_fails(self):
+        tasks = self._tasks()
+        tasks[0]["extractor_code"] = "import sys\nprint('10.0.0.9')\n"  # hardcoded -> dropped
+        tasks[1]["answer"] = "99"                                        # mismatch -> dropped
         r = self._run({"generator_code": self.GOOD_GEN, "tasks": tasks})
         self.assertFalse(r.ok)
-        self.assertEqual(r.stage, "answer-mismatch")
-
-    def test_hardcoded_answer_is_caught(self):
-        tasks = self._tasks(); tasks[0]["extractor_code"] = "import sys\nprint('10.0.0.9')\n"
-        r = self._run({"generator_code": self.GOOD_GEN, "tasks": tasks})
-        self.assertFalse(r.ok)
-        self.assertEqual(r.stage, "hardcoded-answer")
+        self.assertEqual(r.stage, "no-valid-tasks")
 
     def test_generator_must_print_log(self):
         r = self._run({"generator_code": "pass\n", "tasks": self._tasks()})
@@ -264,20 +269,23 @@ class LogAnalysisVerifyTests(unittest.TestCase):
         self.assertTrue(r.ok, r.detail)
 
     def test_not_grounded(self):
+        # single bad task -> nothing survives
         r = self._run([{"type": "extractive", "answer": "9.9.9.9", "evidence_line": 2, "extractor_code": self.EXT}])
         self.assertFalse(r.ok)
-        self.assertEqual(r.stage, "answer-mismatch")  # extractor yields 10.0.0.42, not 9.9.9.9
+        self.assertEqual(r.stage, "no-valid-tasks")
 
     def test_bad_evidence_line(self):
         r = self._run([{"type": "extractive", "answer": "10.0.0.42", "evidence_line": 1, "extractor_code": self.EXT}])
         self.assertFalse(r.ok)
-        self.assertEqual(r.stage, "bad-evidence")
+        self.assertEqual(r.stage, "no-valid-tasks")
+        self.assertIn("evidence_line", r.detail)
 
     def test_hardcoded_rejected(self):
         hard = "import sys\nprint('10.0.0.42')\n"
         r = self._run([{"type": "extractive", "answer": "10.0.0.42", "evidence_line": 2, "extractor_code": hard}])
         self.assertFalse(r.ok)
-        self.assertEqual(r.stage, "hardcoded-answer")
+        self.assertEqual(r.stage, "no-valid-tasks")
+        self.assertIn("hardcoded", r.detail)
 
 
 if __name__ == "__main__":
