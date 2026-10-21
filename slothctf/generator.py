@@ -409,9 +409,12 @@ Return ONE JSON object (no prose, no fences) with EXACTLY these keys:
 
 %(tasks)s
 
-CODE RULES: build each log line as a normal string and join with "\\n" — NEVER put
-a real line break inside a string literal (that is a syntax error). The generator
-must PRINT the log (not write a file); each extractor reads its log file argument.
+CODE RULES: write NORMAL, properly indented multi-line Python — each statement on
+its OWN line. Do NOT cram the whole program onto one line with semicolons (`def`
+and `for` cannot be collapsed that way — it is a syntax error). The only rule
+about newlines is inside a STRING LITERAL: use "\\n" there, never a real line
+break. The generator PRINTS the log (opens/writes no file); each extractor reads
+its log-file argument.
 
 HARD REQUIREMENTS (breaking any is rejected): running the generator then each
 task's extractor must reproduce EXACTLY that task's answer; each extractor derives
