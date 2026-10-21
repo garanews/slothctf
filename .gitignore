@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.DS_Store
+generated/
+examples/generated/
+
+# build artifacts / local junk
+*.exe
+*.o
+*.obj
+InstallationLog.txt
+tmp_hello.c
+pytest_results.txt
+verification_status.txt

@@ -1,0 +1,8 @@
+{
+  "title": "XORed Flag",
+  "category": "Reverse Engineering",
+  "difficulty": "easy",
+  "description": "A binary has hidden the flag using XOR encryption. Can you retrieve it?",
+  "flag": "sloth{easy_xor}",
+  "challenge_kind": "decode"
+}

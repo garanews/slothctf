@@ -1,0 +1,185 @@
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import mock
+
+from slothctf import generator
+from slothctf.generator import (
+    AttemptResult,
+    ENCODED_PLACEHOLDER,
+    GenerationError,
+    _build_generation_prompt,
+    _coerce_json,
+    _flag_leaks_in_binary,
+    _generate_endpoint,
+    _normalize_flag,
+    _parse_encoder_output,
+    _render_readme,
+    _render_solution,
+    _SCHEMA_RULES,
+    _strip_code_fences,
+    generate_challenge,
+)
+
+
+class FlagHelperTests(unittest.TestCase):
+    def test_normalize_wraps_bare_secret(self):
+        self.assertEqual(_normalize_flag("devourer of destiny"), "sloth{devourer_of_destiny}")
+
+    def test_normalize_keeps_wellformed_flag(self):
+        self.assertEqual(_normalize_flag("sloth{already_good}"), "sloth{already_good}")
+
+    def test_normalize_empty_falls_back(self):
+        self.assertEqual(_normalize_flag("   "), "sloth{slow_and_steady}")
+
+    def test_flag_leak_detection(self):
+        with TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "challenge"
+            binary.write_bytes(b"\x00\x01sloth{visible_secret}\x02padding")
+            self.assertTrue(_flag_leaks_in_binary(binary, "sloth{visible_secret}"))
+            self.assertTrue(_flag_leaks_in_binary(binary, "visible_secret"))
+
+    def test_flag_leak_detection_negative(self):
+        with TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "challenge"
+            binary.write_bytes(b"\xde\xad\xbe\xef random compiled bytes")
+            self.assertFalse(_flag_leaks_in_binary(binary, "sloth{hidden}"))
+
+
+class PromptBuildTests(unittest.TestCase):
+    def test_prompt_contains_request_and_schema(self):
+        text = _build_generation_prompt("make an xor challenge", "easy", None, None)
+        self.assertIn("make an xor challenge", text)
+        self.assertIn('"encoder_code"', text)
+        self.assertIn('"challenge_code"', text)
+        self.assertIn(ENCODED_PLACEHOLDER, text)
+
+    def test_feedback_is_included_for_repair(self):
+        text = _build_generation_prompt("x", "easy", None, "gcc failed: missing semicolon")
+        self.assertIn("previous attempt failed", text.lower())
+        self.assertIn("missing semicolon", text)
+
+    def test_coerce_json_from_fenced_block(self):
+        raw = 'Sure!\n```json\n{"flag": "sloth{a}"}\n```\n'
+        self.assertEqual(_coerce_json(raw)["flag"], "sloth{a}")
+
+    def test_strip_code_fences(self):
+        self.assertEqual(_strip_code_fences("```c\nint main(){}\n```"), "int main(){}")
+        self.assertEqual(_strip_code_fences("int main(){}"), "int main(){}")
+        # stray opening fence only
+        self.assertEqual(_strip_code_fences("```c\nint x;"), "int x;")
+
+    def test_schema_does_not_request_prose_fields(self):
+        # The repair loop must stay cheap: the model is not asked for README or
+        # the walkthrough (those are rendered locally on success).
+        self.assertNotIn('"readme"', _SCHEMA_RULES)
+        self.assertNotIn('"solution"', _SCHEMA_RULES)
+        self.assertIn('"encoder_code"', _SCHEMA_RULES)
+        self.assertIn('"challenge_code"', _SCHEMA_RULES)
+
+    def test_schema_describes_both_kinds(self):
+        self.assertIn('"decode"', _SCHEMA_RULES)
+        self.assertIn('"check"', _SCHEMA_RULES)
+        self.assertIn("success_marker", _SCHEMA_RULES)
+
+    def test_check_readme_mentions_stdin(self):
+        data = {
+            "title": "Pwd", "category": "RE", "difficulty": "easy",
+            "description": "d", "flag": "sloth{p}", "challenge_kind": "check",
+            "success_marker": "Access Granted", "encoder_code": "x",
+        }
+        self.assertIn("standard input", _render_readme(data).lower())
+        self.assertIn("Access Granted", _render_solution(data))
+
+    def test_parse_encoder_output(self):
+        self.assertEqual(_parse_encoder_output("0x31,0x2e,0x2d,"), "0x31, 0x2e, 0x2d")
+        self.assertEqual(_parse_encoder_output("junk 0xAB more 0x0f"), "0xab, 0x0f")
+        self.assertIsNone(_parse_encoder_output("no bytes here"))
+
+    def test_prose_is_rendered_locally(self):
+        data = {
+            "title": "XOR Lock",
+            "category": "Reverse Engineering",
+            "difficulty": "easy",
+            "description": "Find the key.",
+            "flag": "sloth{ok}",
+            "encoder_code": "int main(){/*encoder*/}",
+        }
+        readme = _render_readme(data)
+        solution = _render_solution(data)
+        self.assertIn("XOR Lock", readme)
+        self.assertIn("sloth{ok}", solution)
+        self.assertIn("/*encoder*/", solution)
+
+    def test_endpoint_from_base_url(self):
+        self.assertEqual(_generate_endpoint("http://10.0.0.2:11434"), "http://10.0.0.2:11434/api/generate")
+        self.assertEqual(_generate_endpoint("http://10.0.0.2:11434/"), "http://10.0.0.2:11434/api/generate")
+        self.assertEqual(
+            _generate_endpoint("http://h:11434/api/generate"), "http://h:11434/api/generate"
+        )
+
+
+class GenerationLoopTests(unittest.TestCase):
+    """The retry loop is tested with the compiler and verifier stubbed so the
+    tests need neither Ollama nor gcc."""
+
+    def _run(self, responses, verify_side_effect, max_attempts=5):
+        calls = {"n": 0}
+
+        def fake_caller(prompt, model):
+            idx = calls["n"]
+            calls["n"] += 1
+            return responses[min(idx, len(responses) - 1)]
+
+        with mock.patch.object(generator, "_find_compiler", return_value="gcc"), \
+             mock.patch.object(generator, "_write_challenge_files"), \
+             mock.patch.object(generator, "_verify_challenge", side_effect=verify_side_effect):
+            return generate_challenge(
+                "unit_test_challenge",
+                prompt="make a challenge",
+                caller=fake_caller,
+                max_attempts=max_attempts,
+                return_report=True,
+            )
+
+    def test_succeeds_on_first_attempt(self):
+        good = {"encoder_code": "int main(){}", "challenge_code": "int main(){}", "flag": "sloth{x}"}
+        report = self._run([good], lambda b, d, c: AttemptResult(0, True, "passed", "flag recovered"))
+        self.assertTrue(report.success)
+        self.assertEqual(report.attempts_used, 1)
+
+    def test_repairs_then_succeeds(self):
+        payload = {"encoder_code": "e", "challenge_code": "c", "flag": "sloth{y}"}
+        outcomes = iter([
+            AttemptResult(0, False, "challenge-compile", "gcc failed"),
+            AttemptResult(0, True, "passed", "ok"),
+        ])
+        report = self._run([payload, payload], lambda b, d, c: next(outcomes))
+        self.assertTrue(report.success)
+        self.assertEqual(report.attempts_used, 2)
+        self.assertEqual(report.attempts[0].stage, "challenge-compile")
+
+    def test_gives_up_after_max_attempts(self):
+        payload = {"encoder_code": "e", "challenge_code": "c", "flag": "sloth{z}"}
+        report = self._run(
+            [payload],
+            lambda b, d, c: AttemptResult(0, False, "flag-mismatch", "nope"),
+            max_attempts=3,
+        )
+        self.assertFalse(report.success)
+        self.assertEqual(report.attempts_used, 3)
+
+    def test_missing_schema_field_is_fed_back(self):
+        bad = {"encoder_code": "e"}  # no challenge_code
+        report = self._run([bad], lambda b, d, c: AttemptResult(0, True, "passed"), max_attempts=2)
+        self.assertFalse(report.success)
+        self.assertEqual(report.attempts[0].stage, "bad-schema")
+
+    def test_raises_without_compiler(self):
+        with mock.patch.object(generator, "_find_compiler", return_value=None):
+            with self.assertRaises(GenerationError):
+                generate_challenge("x", caller=lambda p, m: {}, return_report=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,9 @@
+{
+  "title": "Sloth's Password Vault",
+  "category": "Reverse Engineering",
+  "difficulty": "easy",
+  "description": "Enter the correct password to gain access to Sloth's secrets.",
+  "flag": "sloth{securepass}",
+  "challenge_kind": "check",
+  "success_marker": "Access Granted"
+}

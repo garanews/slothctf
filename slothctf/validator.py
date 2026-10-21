@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def install_toolchain_windows(dry_run: bool = False) -> str:
+    if os.name != "nt":
+        return "This install helper is intended for Windows systems. On Linux/macOS, install gcc with your system package manager."
+
+    if shutil.which("winget") is None:
+        return (
+            "GCC compiler not found and winget is unavailable. "
+            "Install MSYS2 or MinGW-w64 manually, then add C:\\msys64\\mingw64\\bin to PATH."
+        )
+
+    if dry_run:
+        return (
+            "GCC compiler not found. Recommended installation path: "
+            "winget install --id MSYS2.MSYS2 -e --source winget; "
+            "then add C:\\msys64\\mingw64\\bin to PATH and reopen the terminal."
+        )
+
+    result = subprocess.run(
+        ["winget", "install", "--id", "MSYS2.MSYS2", "-e", "--source", "winget"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return (
+            "MSYS2 was installed successfully. Reopen the terminal and run: "
+            "python main.py validate --dir <challenge-dir>"
+        )
+
+    return (
+        "GCC compiler not found. Automatic installation via winget failed. "
+        "Install MSYS2 or MinGW-w64 manually and add C:\\msys64\\mingw64\\bin to PATH."
+        f"\nwinget output:\n{result.stderr or result.stdout}"
+    )
+
+
+def _find_compiler() -> str | None:
+    for candidate in ("gcc", "clang", "x86_64-w64-mingw32-gcc", "gcc.exe"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return None
+
+
+def _compile_binary(challenge_dir: Path) -> tuple[bool, str, str]:
+    compiler = _find_compiler()
+    if compiler is None:
+        return (
+            False,
+            "",
+            "GCC compiler not found. Run: python main.py install-toolchain --dry-run\n"
+            "or install MinGW-w64 / MSYS2 and add C:\\msys64\\mingw64\\bin to PATH."
+        )
+
+    source_path = challenge_dir / "src" / "challenge.c"
+    binary_path = challenge_dir / "bin" / "challenge"
+    result = subprocess.run(
+        [compiler, "-O2", "-s", "-o", str(binary_path), str(source_path)],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0, result.stdout, result.stderr
+
+
+def _resolve_binary(challenge_dir: Path) -> Path:
+    """MinGW gcc appends `.exe`, so the artifact may be challenge.exe on Windows."""
+    binary_path = challenge_dir / "bin" / "challenge"
+    if binary_path.exists():
+        return binary_path
+    exe = binary_path.with_suffix(".exe")
+    return exe if exe.exists() else binary_path
+
+
+def _run_challenge(challenge_dir: Path, stdin_text: str | None = None) -> tuple[bool, str, str]:
+    binary_path = _resolve_binary(challenge_dir)
+    result = subprocess.run(
+        [str(binary_path)],
+        input=stdin_text,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    return result.returncode == 0, result.stdout, result.stderr.strip()
+
+
+def validate_challenge(challenge_dir: Path) -> str:
+    challenge_dir = Path(challenge_dir)
+    required = [
+        challenge_dir / "README.md",
+        challenge_dir / "challenge.json",
+        challenge_dir / "solution.md",
+    ]
+
+    for required_file in required:
+        if not required_file.exists():
+            return f"Validation failed: missing {required_file.name}"
+
+    src_c = challenge_dir / "src" / "challenge.c"
+    if src_c.exists():
+        compile_ok, compile_out, compile_err = _compile_binary(challenge_dir)
+        if not compile_ok:
+            if "GCC compiler not found" in compile_err:
+                return compile_err
+            return f"Validation failed: compile error\n{compile_err}"
+
+        try:
+            metadata = json.loads((challenge_dir / "challenge.json").read_text(encoding="utf-8"))
+            expected_flag = metadata["flag"]
+            kind = metadata.get("challenge_kind", "decode")
+        except Exception:
+            return "Validation failed: invalid challenge.json"
+
+        if kind == "check":
+            marker = str(metadata.get("success_marker", "")).strip()
+            if not marker:
+                return "Validation failed: check challenge missing success_marker"
+            try:
+                _, good_out, _ = _run_challenge(challenge_dir, stdin_text=expected_flag + "\n")
+                _, bad_out, _ = _run_challenge(challenge_dir, stdin_text="definitely_wrong_" + expected_flag + "\n")
+            except Exception as exc:
+                return f"Validation failed: challenge did not run\n{exc}"
+            if marker not in good_out:
+                return f"Validation failed: correct secret rejected (expected marker {marker!r})"
+            if marker in bad_out:
+                return "Validation failed: a wrong input was also accepted"
+            return (
+                "Validation successful: challenge compiled; the secret is accepted and "
+                f"wrong input is rejected.\nDir: {challenge_dir}"
+            )
+
+        run_ok, out, run_err = _run_challenge(challenge_dir)
+        if not run_ok:
+            return f"Validation failed: challenge did not run\n{run_err}"
+        if out.strip() != expected_flag:
+            return f"Validation failed: incorrect flag\nExpected: {expected_flag}\nGot: {out.strip()}"
+
+        return (
+            "Validation successful: challenge compiled, ran, and printed the expected flag.\n"
+            f"Dir: {challenge_dir}"
+        )
+
+    try:
+        metadata = json.loads((challenge_dir / "challenge.json").read_text(encoding="utf-8"))
+        expected_flag = metadata["flag"]
+        title = metadata["title"]
+        if not expected_flag or not title:
+            raise ValueError("Invalid metadata")
+    except Exception:
+        return "Validation failed: invalid challenge.json or missing required metadata"
+
+    return (
+        "Validation successful: evidence-based challenge generated and metadata verified.\n"
+        f"Dir: {challenge_dir}"
+    )
