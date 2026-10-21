@@ -181,5 +181,45 @@ class GenerationLoopTests(unittest.TestCase):
                 generate_challenge("x", caller=lambda p, m: {}, return_report=True)
 
 
+class LogVerifyTests(unittest.TestCase):
+    """Exercises the real log verifier (runs python subprocesses, no model)."""
+
+    GOOD_GEN = (
+        "import sys\n"
+        "open(sys.argv[2],'w').write('noise\\nALERT from '+sys.argv[1]+'\\nmore noise\\n')\n"
+    )
+    GOOD_EXT = (
+        "import sys,re\n"
+        "print(re.search(r'ALERT from (\\S+)', open(sys.argv[1]).read()).group(1))\n"
+    )
+
+    def _run(self, data):
+        with TemporaryDirectory() as tmp:
+            return generator._verify_log_challenge(Path(tmp) / "c", data)
+
+    def test_passes(self):
+        r = self._run({"flag": "10.0.0.9", "generator_code": self.GOOD_GEN, "extractor_code": self.GOOD_EXT})
+        self.assertTrue(r.ok, r.detail)
+
+    def test_answer_mismatch(self):
+        bad_ext = "import sys\nprint('wrong')\n"
+        r = self._run({"flag": "10.0.0.9", "generator_code": self.GOOD_GEN, "extractor_code": bad_ext})
+        self.assertFalse(r.ok)
+        self.assertEqual(r.stage, "answer-mismatch")
+
+    def test_hardcoded_answer_is_caught(self):
+        # Prints the answer no matter the log -> must be rejected as hardcoded.
+        hard_ext = "import sys\nprint('10.0.0.9')\n"
+        r = self._run({"flag": "10.0.0.9", "generator_code": self.GOOD_GEN, "extractor_code": hard_ext})
+        self.assertFalse(r.ok)
+        self.assertEqual(r.stage, "hardcoded-answer")
+
+    def test_generator_must_write_log(self):
+        empty_gen = "import sys\n"  # writes nothing
+        r = self._run({"flag": "x", "generator_code": empty_gen, "extractor_code": self.GOOD_EXT})
+        self.assertFalse(r.ok)
+        self.assertEqual(r.stage, "no-log")
+
+
 if __name__ == "__main__":
     unittest.main()

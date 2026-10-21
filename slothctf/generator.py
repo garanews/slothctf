@@ -373,19 +373,60 @@ def _default_platform() -> str:
     return f"{system or 'a POSIX system'} with a C compiler; prefer portable standard C."
 
 
+_SCHEMA_RULES_LOG = """\
+You are SlothCTF generating a LOG ANALYSIS (forensics) challenge. The player is
+given a realistic log file and must find a specific answer in it. You invent the
+scenario and write TWO Python 3 programs; the machine runs them, so you never
+just assert the answer — it is derived from the log.
+
+Return ONE JSON object (no prose, no fences) with EXACTLY these keys:
+  "title"          : short challenge name
+  "category"       : e.g. "Forensics" or "Log Analysis"
+  "difficulty"     : "easy", "medium" or "hard"
+  "description"    : 1-2 sentences the player sees (no spoiler)
+  "question"       : one line stating exactly what to find
+  "flag"           : the EXACT answer string the player must find (e.g. an IP
+                     address, a username, a token). Plain value, not sloth{...}.
+  "generator_code" : a complete Python 3 script (organizer tool)
+  "extractor_code" : a complete Python 3 script (organizer ground-truth solver)
+
+HARD REQUIREMENTS (breaking any is rejected and sent back to you):
+
+1. generator_code is run as:  python generator.py <answer> <outfile>
+   - writes a realistic synthetic log (syslog / HTTP access / SSH / firewall
+     style) with MANY lines of plausible noise to <outfile>;
+   - builds the scenario so that <answer> (passed on argv) is the correct answer
+     to "question" (e.g. the attacker IP, the exfiltrated token);
+   - is deterministic (use a fixed random seed);
+   - prints nothing to stdout.
+
+2. extractor_code is run as:  python extractor.py <logfile>
+   - reads the log, performs the analysis that answers "question", and prints
+     ONLY the answer to stdout — nothing else;
+   - MUST derive the answer from the log's contents. Do NOT hardcode the answer
+     string anywhere in extractor_code.
+
+3. Python 3 only, standard library only. Running the generator and then the
+   extractor must reproduce EXACTLY the declared flag. The extractor must NOT
+   produce that answer when run on an unrelated log (it reads evidence, not a
+   constant)."""
+
+
 def _build_generation_prompt(
     user_prompt: str,
     difficulty: str,
     category: str | None,
     feedback: str | None,
     target_platform: str | None = None,
+    schema: str = _SCHEMA_RULES,
 ) -> str:
-    parts = [_SCHEMA_RULES, ""]
-    parts.append(
-        "BUILD TARGET — both C programs are compiled and run on: "
-        f"{target_platform or _default_platform()} "
-        "They MUST compile and run there, so do not call APIs that platform lacks."
-    )
+    parts = [schema, ""]
+    if schema is _SCHEMA_RULES:
+        parts.append(
+            "BUILD TARGET — both C programs are compiled and run on: "
+            f"{target_platform or _default_platform()} "
+            "They MUST compile and run there, so do not call APIs that platform lacks."
+        )
     parts.append(f"Target difficulty: {difficulty}.")
     if category:
         parts.append(f"Category / flavour: {category}.")
@@ -408,16 +449,20 @@ def _build_generation_prompt(
 def _write_challenge_files(base_dir: Path, data: dict[str, Any]) -> None:
     """Write the artifacts. `data` is expected to hold the (possibly injected)
     challenge_code, the organizer-only encoder_code, and the rendered prose."""
-    src_dir = base_dir / "src"
-    bin_dir = base_dir / "bin"
     private_dir = base_dir / "organizer"
-    src_dir.mkdir(parents=True, exist_ok=True)
-    bin_dir.mkdir(parents=True, exist_ok=True)
     private_dir.mkdir(parents=True, exist_ok=True)
 
-    (src_dir / "challenge.c").write_text(data.get("challenge_code", ""), encoding="utf-8")
-    # The encoder is the organizer's tool, kept out of the player-facing src/.
-    (private_dir / "encoder.c").write_text(data.get("encoder_code", ""), encoding="utf-8")
+    # Only write the artifacts the genre actually produced.
+    if "challenge_code" in data:
+        (base_dir / "src").mkdir(parents=True, exist_ok=True)
+        (base_dir / "src" / "challenge.c").write_text(data["challenge_code"], encoding="utf-8")
+    if "encoder_code" in data:  # organizer-only tool
+        (private_dir / "encoder.c").write_text(data["encoder_code"], encoding="utf-8")
+    if "generator_code" in data:
+        (private_dir / "generator.py").write_text(data["generator_code"], encoding="utf-8")
+    if "extractor_code" in data:
+        (private_dir / "extractor.py").write_text(data["extractor_code"], encoding="utf-8")
+
     (base_dir / "README.md").write_text(data["readme"], encoding="utf-8")
     (base_dir / "solution.md").write_text(data["solution"], encoding="utf-8")
     meta = {
@@ -430,6 +475,8 @@ def _write_challenge_files(base_dir: Path, data: dict[str, Any]) -> None:
     }
     if data.get("challenge_kind") == "check":
         meta["success_marker"] = data.get("success_marker", "Access Granted")
+    if data.get("challenge_kind") == "log":
+        meta["question"] = data.get("question", "")
     (base_dir / "challenge.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
@@ -445,23 +492,46 @@ def _strip_code_fences(code: str) -> str:
     return s.strip()
 
 
-def _normalize_challenge(data: dict[str, Any], difficulty: str, category: str | None) -> dict[str, Any]:
-    """Fill defaults and normalize the flag so downstream writes never KeyError."""
+def _clean_answer(ans: str) -> str:
+    """For log challenges the flag is a plain answer (IP, token…), not sloth{}."""
+    return (ans or "").strip().strip("\"'`").strip()
+
+
+def _log_name(data: dict[str, Any]) -> str:
+    return data.get("log_file", "challenge.log")
+
+
+def _normalize_challenge(
+    data: dict[str, Any], difficulty: str, category: str | None, genre: str = "reverse"
+) -> dict[str, Any]:
+    """Fill defaults and normalize fields so downstream writes never KeyError."""
     data = dict(data)
     data.setdefault("title", "SlothCTF Challenge")
-    data.setdefault("category", category or "Reverse Engineering")
     data.setdefault("difficulty", difficulty)
+    data.setdefault("readme", f"# {data.get('title')}\n")
+
+    if genre == "log":
+        data.setdefault("category", category or "Forensics")
+        data["challenge_kind"] = "log"
+        data.setdefault("description", "Analyze the log and answer the question.")
+        data.setdefault("question", "Find the answer in the log.")
+        data.setdefault("solution", "See organizer/extractor.py for the automated answer.")
+        for k in ("generator_code", "extractor_code"):
+            if k in data:
+                data[k] = _strip_code_fences(str(data[k]))
+        data["flag"] = _clean_answer(str(data.get("flag", ""))) or "unknown"
+        return data
+
+    # reverse / crypto (C encoder pipeline)
+    data.setdefault("category", category or "Reverse Engineering")
     data.setdefault("description", "Reverse the binary and recover the flag.")
     kind = str(data.get("challenge_kind", "decode")).strip().lower()
     data["challenge_kind"] = "check" if kind == "check" else "decode"
     data.setdefault("success_marker", "Access Granted")
-    # README / solution are rendered locally on success, not asked of the model.
-    data.setdefault("readme", f"# {data['title']}\n\n{data['description']}\n")
     data.setdefault("solution", "See organizer/encoder.c for how the flag was hidden.")
-    if "encoder_code" in data:
-        data["encoder_code"] = _strip_code_fences(str(data["encoder_code"]))
-    if "challenge_code" in data:
-        data["challenge_code"] = _strip_code_fences(str(data["challenge_code"]))
+    for k in ("encoder_code", "challenge_code"):
+        if k in data:
+            data[k] = _strip_code_fences(str(data[k]))
     data["flag"] = _normalize_flag(str(data.get("flag", "")))
     return data
 
@@ -469,6 +539,17 @@ def _normalize_challenge(data: dict[str, Any], difficulty: str, category: str | 
 def _render_readme(data: dict[str, Any]) -> str:
     """Player-facing README, rendered locally (no LLM call) once the challenge
     is verified."""
+    if data.get("challenge_kind") == "log":
+        return (
+            f"# {data['title']}\n\n"
+            f"**Category:** {data['category']}  \n"
+            f"**Difficulty:** {data['difficulty']}\n\n"
+            f"{data['description']}\n\n"
+            "## Files\n\n"
+            f"- `evidence/{_log_name(data)}` — the log to analyze\n\n"
+            "## Task\n\n"
+            f"{data.get('question', 'Find the answer in the log.')}\n"
+        )
     if data.get("challenge_kind") == "check":
         goal = (
             "## Goal\n\n"
@@ -503,6 +584,23 @@ def _render_solution(data: dict[str, Any]) -> str:
     """Organizer-only walkthrough, rendered locally once the challenge is
     verified. Running the challenge binary prints the flag, and the encoder
     (organizer tool) documents exactly how the bytes were produced."""
+    if data.get("challenge_kind") == "log":
+        return (
+            f"# Solution — {data['title']}\n\n"
+            f"**Question:** {data.get('question', '')}\n\n"
+            f"**Answer:** `{data['flag']}`\n\n"
+            "This challenge was verified automatically: the generator planted the "
+            "answer in a synthetic log, the extractor below recovered exactly it, "
+            "and the extractor does not reproduce the answer on an unrelated log "
+            "(so it reads the evidence rather than hardcoding it).\n\n"
+            "## Recover the answer (`organizer/extractor.py`)\n\n"
+            "```\n"
+            f"python organizer/extractor.py evidence/{_log_name(data)}\n"
+            "```\n\n"
+            "```python\n"
+            f"{data.get('extractor_code', '')}\n"
+            "```\n"
+        )
     if data.get("challenge_kind") == "check":
         recover = (
             f"**Secret input:** `{data['flag']}`\n\n"
@@ -660,6 +758,77 @@ def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str) -> At
     return AttemptResult(0, True, "passed", f"{kind} verified: {expected}")
 
 
+def _run_python(script: Path, args: list[str], timeout: float = 20.0) -> tuple[bool, str, str]:
+    """Run a generated Python script in isolated mode."""
+    result = subprocess.run(
+        ["python", "-I", str(script), *args],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    return result.returncode == 0, result.stdout, result.stderr.strip()
+
+
+def _verify_log_challenge(base_dir: Path, data: dict[str, Any], compiler: str | None = None) -> AttemptResult:
+    """Build and self-check a log challenge: run the generator to plant the
+    answer in a synthetic log, run the extractor to recover it, and confirm the
+    extractor reads the evidence (does not hardcode the answer)."""
+    answer = data["flag"]
+    org = base_dir / "organizer"
+    ev = base_dir / "evidence"
+    org.mkdir(parents=True, exist_ok=True)
+    ev.mkdir(parents=True, exist_ok=True)
+
+    gen = org / "generator.py"
+    ext = org / "extractor.py"
+    gen.write_text(data.get("generator_code", ""), encoding="utf-8")
+    ext.write_text(data.get("extractor_code", ""), encoding="utf-8")
+
+    log_path = ev / f"{base_dir.name}.log"
+    data["log_file"] = log_path.name
+    try:
+        ok, _out, err = _run_python(gen, [answer, str(log_path)])
+    except subprocess.TimeoutExpired:
+        return AttemptResult(0, False, "generator-timeout", "generator.py did not finish within 20s.")
+    if not ok:
+        return AttemptResult(0, False, "generator-crash", f"generator.py failed:\n{err[:300]}")
+    if not log_path.exists() or log_path.stat().st_size == 0:
+        return AttemptResult(0, False, "no-log", "generator.py did not write a non-empty log file to its argv[2].")
+
+    try:
+        ok, out, err = _run_python(ext, [str(log_path)])
+    except subprocess.TimeoutExpired:
+        return AttemptResult(0, False, "extractor-timeout", "extractor.py did not finish within 20s.")
+    if not ok:
+        return AttemptResult(0, False, "extractor-crash", f"extractor.py failed:\n{err[:300]}")
+    if out.strip() != answer:
+        return AttemptResult(
+            0, False, "answer-mismatch",
+            f"extractor.py printed {out.strip()[:120]!r} but the declared answer is {answer!r}. "
+            "Make the generator plant the answer and the extractor recover exactly it.",
+        )
+
+    # Anti-hardcode: on an unrelated log, the extractor must NOT print the answer.
+    decoy = ev / "_decoy.log"
+    decoy.write_text(
+        "2026-01-01 00:00:00 sshd[1]: Accepted password for root from 192.0.2.1 port 2222\n"
+        "2026-01-01 00:00:01 kernel: nothing to see here\n" * 5,
+        encoding="utf-8",
+    )
+    try:
+        _ok, decoy_out, _err = _run_python(ext, [str(decoy)])
+        if decoy_out.strip() == answer:
+            return AttemptResult(
+                0, False, "hardcoded-answer",
+                "extractor.py printed the answer even for an unrelated log — it must "
+                "derive the answer from the log, not hardcode it.",
+            )
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        decoy.unlink(missing_ok=True)
+
+    return AttemptResult(0, True, "passed", f"log answer recovered: {answer}")
+
+
 # --------------------------------------------------------------------------- #
 # Public entry point
 # --------------------------------------------------------------------------- #
@@ -675,6 +844,7 @@ def generate_challenge(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     ollama_url: str = DEFAULT_OLLAMA_URL,
     target_platform: str | None = None,
+    genre: str = "reverse",
     *,
     caller: Callable[[str, str], dict[str, Any]] | None = None,
     return_report: bool = False,
@@ -704,12 +874,18 @@ def generate_challenge(
         category = random.choice(SURPRISE_CATEGORIES)
         user_prompt = f"Surprise me with a {difficulty} challenge: {category}."
 
-    compiler = _find_compiler()
-    if compiler is None:
-        raise GenerationError(
-            "No C compiler found. Install one (e.g. `python main.py install-toolchain`) "
-            "and ensure gcc is on PATH — the self-verifying loop needs to compile."
-        )
+    # Per-genre configuration: schema, required JSON fields, and verifier.
+    if genre == "log":
+        schema, required, verify_fn = _SCHEMA_RULES_LOG, ("generator_code", "extractor_code"), _verify_log_challenge
+        compiler = None  # log challenges are Python, no C compiler needed
+    else:
+        schema, required, verify_fn = _SCHEMA_RULES, ("encoder_code", "challenge_code"), _verify_challenge
+        compiler = _find_compiler()
+        if compiler is None:
+            raise GenerationError(
+                "No C compiler found. Install one (e.g. `python main.py install-toolchain`) "
+                "and ensure gcc is on PATH — the self-verifying loop needs to compile."
+            )
 
     ask = caller or (lambda p, m: _call_ollama(p, m, base_url=ollama_url))
 
@@ -717,7 +893,7 @@ def generate_challenge(
     feedback: str | None = None
 
     for attempt in range(1, max_attempts + 1):
-        full_prompt = _build_generation_prompt(user_prompt, difficulty, category, feedback, target_platform)
+        full_prompt = _build_generation_prompt(user_prompt, difficulty, category, feedback, target_platform, schema)
         try:
             raw = ask(full_prompt, model)
         except GenerationError as exc:
@@ -725,15 +901,15 @@ def generate_challenge(
             feedback = str(exc)
             continue
 
-        if "encoder_code" not in raw or "challenge_code" not in raw:
-            missing = [f for f in ("encoder_code", "challenge_code") if f not in raw]
+        missing = [f for f in required if f not in raw]
+        if missing:
             feedback = f"Your JSON was missing required field(s): {', '.join(missing)}."
             report.attempts.append(AttemptResult(attempt, False, "bad-schema", feedback))
             continue
 
-        data = _normalize_challenge(raw, difficulty, category)
+        data = _normalize_challenge(raw, difficulty, category, genre)
 
-        result = _verify_challenge(base_dir, data, compiler)
+        result = verify_fn(base_dir, data, compiler)
         result.index = attempt
         report.attempts.append(result)
         if result.ok:

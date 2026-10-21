@@ -27,6 +27,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Prompt for challenge generation",
     )
     gen.add_argument(
+        "--genre",
+        choices=["reverse", "log"],
+        default="reverse",
+        help="Challenge genre: 'reverse' (C binary) or 'log' (synthetic log analysis)",
+    )
+    gen.add_argument(
         "--category",
         default=None,
         help="Optional free-form category/flavour hint passed to the model (e.g. 'cryptography', 'reverse engineering')",
@@ -94,6 +100,7 @@ def main() -> None:
                 surprise=args.surprise,
                 max_attempts=args.max_attempts,
                 ollama_url=args.ollama_url,
+                genre=args.genre,
                 return_report=True,
             )
         except GenerationError as exc:

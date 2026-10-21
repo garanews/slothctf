@@ -30,7 +30,9 @@ There are **no templates and no per-scheme `if` ladders**: the model is free to
 invent any obfuscation (XOR, add, S-box, RC4, TEA, FNV, a bytecode VM, …). The
 harness only guarantees correctness.
 
-## Two kinds of challenge
+## Challenge kinds
+
+Reverse / crypto (`--genre reverse`, the default) come in two kinds:
 
 - **`decode`** — the binary decodes an embedded array at runtime and prints the
   flag. Verified by: *run it → stdout equals the flag*.
@@ -40,6 +42,18 @@ harness only guarantees correctness.
   not printed*.
 
 Both are also checked so the plaintext secret is **not** readable via `strings`.
+
+Log analysis (`--genre log`) produces a forensics challenge: the model writes a
+Python **generator** (plants the answer in a realistic synthetic log) and an
+**extractor** (recovers it). Verified by: *generate the log → the extractor
+recovers exactly the answer → the extractor does NOT reproduce it on an
+unrelated log* (so it reads the evidence, not a hardcoded constant).
+
+```bash
+python main.py generate --name ssh_case --genre log \
+  --prompt "An SSH brute-force where one IP finally logs in as root; the answer is that IP" \
+  --model qwen2.5-coder:32b
+```
 
 ## Requirements
 
