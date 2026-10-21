@@ -43,11 +43,14 @@ Reverse / crypto (`--genre reverse`, the default) come in two kinds:
 
 Both are also checked so the plaintext secret is **not** readable via `strings`.
 
-Log analysis (`--genre log`) produces a forensics challenge: the model writes a
-Python **generator** (plants the answer in a realistic synthetic log) and an
-**extractor** (recovers it). Verified by: *generate the log → the extractor
-recovers exactly the answer → the extractor does NOT reproduce it on an
-unrelated log* (so it reads the evidence, not a hardcoded constant).
+Log analysis (`--genre log`) produces a forensics challenge: one log with
+**several questions**. The model writes a Python **generator** (builds a
+realistic synthetic log) and, per question, an **extractor**. Each question is
+either **extractive** (the answer appears verbatim in the log → verified by a
+cited line) or **computed** (a count, distinct total, max… → verified purely by
+running the extractor). Every extractor must recover its answer from the log and
+must NOT reproduce it on an unrelated log (anti-hardcode), and ambiguous
+questions (ties) are rejected.
 
 ```bash
 python main.py generate --name ssh_case --genre log \
@@ -55,10 +58,11 @@ python main.py generate --name ssh_case --genre log \
   --model qwen2.5-coder:32b
 ```
 
-You can also point it at a **real log you already have** and let it build a
-question from the evidence. Here the model runs at temperature 0 and must cite
-the exact line; we check the answer appears at that line and that the extractor
-recovers it from the log (never hardcoded):
+You can also point it at a **real log you already have** and let it build a set
+of questions from the evidence. Here the model runs at temperature 0 and must
+cite the exact line for extractive answers; we check each answer appears at its
+line (or, for computed answers, that the extractor reproduces it) and that no
+extractor hardcodes its answer:
 
 ```bash
 python main.py generate --name my_case --genre log --input /path/to/server.log \

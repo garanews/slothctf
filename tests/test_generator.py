@@ -182,47 +182,58 @@ class GenerationLoopTests(unittest.TestCase):
 
 
 class LogVerifyTests(unittest.TestCase):
-    """Exercises the real log verifier (runs python subprocesses, no model)."""
+    """Exercises the real multi-task log synthesis verifier (no model)."""
 
+    # Generator plants a known ALERT line plus noise; count is a computed task.
     GOOD_GEN = (
         "import sys\n"
-        "open(sys.argv[2],'w').write('noise\\nALERT from '+sys.argv[1]+'\\nmore noise\\n')\n"
+        "open(sys.argv[1],'w').write('noise\\nALERT from 10.0.0.9\\nhit\\nhit\\n')\n"
     )
-    GOOD_EXT = (
-        "import sys,re\n"
-        "print(re.search(r'ALERT from (\\S+)', open(sys.argv[1]).read()).group(1))\n"
-    )
+    EXT_IP = ("import sys,re\n"
+              "print(re.search(r'ALERT from (\\S+)', open(sys.argv[1]).read()).group(1))\n")
+    EXT_COUNT = ("import sys\n"
+                 "print(sum(1 for l in open(sys.argv[1]) if 'hit' in l))\n")
+
+    def _tasks(self):
+        return [
+            {"question": "attacker IP?", "type": "extractive", "answer": "10.0.0.9",
+             "evidence_line": 2, "evidence_text": "ALERT from 10.0.0.9", "extractor_code": self.EXT_IP},
+            {"question": "how many hits?", "type": "computed", "answer": "2", "extractor_code": self.EXT_COUNT},
+        ]
 
     def _run(self, data):
         with TemporaryDirectory() as tmp:
             return generator._verify_log_challenge(Path(tmp) / "c", data)
 
-    def test_passes(self):
-        r = self._run({"flag": "10.0.0.9", "generator_code": self.GOOD_GEN, "extractor_code": self.GOOD_EXT})
+    def test_passes_multi_task(self):
+        r = self._run({"generator_code": self.GOOD_GEN, "tasks": self._tasks()})
         self.assertTrue(r.ok, r.detail)
 
     def test_answer_mismatch(self):
-        bad_ext = "import sys\nprint('wrong')\n"
-        r = self._run({"flag": "10.0.0.9", "generator_code": self.GOOD_GEN, "extractor_code": bad_ext})
+        tasks = self._tasks(); tasks[1]["answer"] = "99"
+        r = self._run({"generator_code": self.GOOD_GEN, "tasks": tasks})
         self.assertFalse(r.ok)
         self.assertEqual(r.stage, "answer-mismatch")
 
     def test_hardcoded_answer_is_caught(self):
-        # Prints the answer no matter the log -> must be rejected as hardcoded.
-        hard_ext = "import sys\nprint('10.0.0.9')\n"
-        r = self._run({"flag": "10.0.0.9", "generator_code": self.GOOD_GEN, "extractor_code": hard_ext})
+        tasks = self._tasks(); tasks[0]["extractor_code"] = "import sys\nprint('10.0.0.9')\n"
+        r = self._run({"generator_code": self.GOOD_GEN, "tasks": tasks})
         self.assertFalse(r.ok)
         self.assertEqual(r.stage, "hardcoded-answer")
 
     def test_generator_must_write_log(self):
-        empty_gen = "import sys\n"  # writes nothing
-        r = self._run({"flag": "x", "generator_code": empty_gen, "extractor_code": self.GOOD_EXT})
+        r = self._run({"generator_code": "import sys\n", "tasks": self._tasks()})
         self.assertFalse(r.ok)
         self.assertEqual(r.stage, "no-log")
 
+    def test_no_tasks(self):
+        r = self._run({"generator_code": self.GOOD_GEN, "tasks": []})
+        self.assertFalse(r.ok)
+        self.assertEqual(r.stage, "no-tasks")
+
 
 class LogAnalysisVerifyTests(unittest.TestCase):
-    """Exercises the provided-log analysis verifier."""
+    """Exercises the provided-log multi-task analysis verifier."""
 
     LOG = ("2026-03-01 sshd: Failed password from 10.0.0.2\n"
            "2026-03-01 sshd: Accepted password from 10.0.0.42\n"
@@ -230,31 +241,31 @@ class LogAnalysisVerifyTests(unittest.TestCase):
     EXT = ("import sys,re\n"
            "print(re.search(r'Accepted password from (\\S+)', open(sys.argv[1]).read()).group(1))\n")
 
-    def _run(self, data):
+    def _run(self, tasks):
         with TemporaryDirectory() as tmp:
             log = Path(tmp) / "provided.log"
             log.write_text(self.LOG, encoding="utf-8")
-            return generator._verify_log_analysis(Path(tmp) / "c", data, log)
+            return generator._verify_log_analysis(Path(tmp) / "c", {"tasks": tasks}, log)
 
     def test_passes_when_grounded(self):
-        r = self._run({"flag": "10.0.0.42", "evidence_line": 2,
-                       "evidence_text": "2026-03-01 sshd: Accepted password from 10.0.0.42",
-                       "extractor_code": self.EXT})
+        r = self._run([{"type": "extractive", "answer": "10.0.0.42", "evidence_line": 2,
+                        "evidence_text": "2026-03-01 sshd: Accepted password from 10.0.0.42",
+                        "extractor_code": self.EXT}])
         self.assertTrue(r.ok, r.detail)
 
     def test_not_grounded(self):
-        r = self._run({"flag": "9.9.9.9", "evidence_line": 2, "extractor_code": self.EXT})
+        r = self._run([{"type": "extractive", "answer": "9.9.9.9", "evidence_line": 2, "extractor_code": self.EXT}])
         self.assertFalse(r.ok)
-        self.assertEqual(r.stage, "not-grounded")
+        self.assertEqual(r.stage, "answer-mismatch")  # extractor yields 10.0.0.42, not 9.9.9.9
 
     def test_bad_evidence_line(self):
-        r = self._run({"flag": "10.0.0.42", "evidence_line": 1, "extractor_code": self.EXT})
+        r = self._run([{"type": "extractive", "answer": "10.0.0.42", "evidence_line": 1, "extractor_code": self.EXT}])
         self.assertFalse(r.ok)
         self.assertEqual(r.stage, "bad-evidence")
 
     def test_hardcoded_rejected(self):
         hard = "import sys\nprint('10.0.0.42')\n"
-        r = self._run({"flag": "10.0.0.42", "evidence_line": 2, "extractor_code": hard})
+        r = self._run([{"type": "extractive", "answer": "10.0.0.42", "evidence_line": 2, "extractor_code": hard}])
         self.assertFalse(r.ok)
         self.assertEqual(r.stage, "hardcoded-answer")
 

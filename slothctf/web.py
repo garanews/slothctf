@@ -182,10 +182,12 @@ async function openDetail(name){
     <div class="sub"><code>${esc(d.name)}</code> · ${esc(d.category)} · ${esc(d.difficulty)} · ${esc(d.kind)}</div>
     <p>${esc(d.description)}</p>
     <div class="meta">flag: <code>${esc(d.flag)}</code>${d.success_marker?` · success marker: <code>${esc(d.success_marker)}</code>`:''}</div>
+    ${(d.tasks&&d.tasks.length)?`<h4>Questions</h4><ol>${d.tasks.map(t=>`<li>${esc(t.question)} <span class="tag">${esc(t.type||'')}</span></li>`).join('')}</ol>`:''}
     <h4>Player files (download)</h4>
     <div class="files">${player.length? player.map(dl).join('') : '<span class="desc">none</span>'}</div>
     <h4>How the flag is built <button class="btn" id="revealBtn" onclick="toggleReveal()">reveal ▸</button></h4>
     <div id="reveal" style="display:none">
+      ${(d.tasks&&d.tasks.length)?`<p>Answers:</p><ul>${d.tasks.map((t,i)=>`<li><b>${i+1}.</b> <code>${esc(t.answer)}</code> <span class="tag">${esc(t.type||'')}</span>${t.evidence_line?` · line ${esc(String(t.evidence_line))}`:''}</li>`).join('')}</ul>`:''}
       <div class="files">${author.map(view).join('')}</div>
       <pre id="viewer" style="display:none"></pre>
     </div>`;
@@ -251,6 +253,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "flag": meta.get("flag", ""),
                 "success_marker": meta.get("success_marker", ""),
                 "description": meta.get("description", ""),
+                "tasks": meta.get("tasks", []),
                 "files": _list_files(d),
             })
         elif path == "/api/file":

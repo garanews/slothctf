@@ -374,69 +374,64 @@ def _default_platform() -> str:
     return f"{system or 'a POSIX system'} with a C compiler; prefer portable standard C."
 
 
+_TASK_SPEC = """\
+Each entry of "tasks" is an object with:
+  "question"       : one line; the exact thing to find. It MUST have a SINGLE
+                     unambiguous answer — never ask something with a tie (e.g. two
+                     usernames with the same count).
+  "type"           : "extractive" if the answer appears VERBATIM in the log,
+                     else "computed" (a count, a number of distinct values, a max…)
+  "answer"         : the exact answer string
+  "evidence_line"  : (extractive only) the 1-based line number whose text contains
+                     the answer
+  "evidence_text"  : (extractive only) that line's exact text
+  "extractor_code" : a Python 3 script, run as `python extractor.py <logfile>`,
+                     that reads the log, computes THIS task's answer, and prints
+                     ONLY it to stdout. Deterministic, standard library only, and
+                     it MUST derive the answer from the log — never hardcode it."""
+
 _SCHEMA_RULES_LOG = """\
-You are SlothCTF generating a LOG ANALYSIS (forensics) challenge. The player is
-given a realistic log file and must find a specific answer in it. You invent the
-scenario and write TWO Python 3 programs; the machine runs them, so you never
-just assert the answer — it is derived from the log.
+You are SlothCTF generating a LOG ANALYSIS (forensics) challenge: a realistic
+synthetic log plus SEVERAL questions about it. You never just assert an answer —
+each is derived by an extractor the machine runs.
 
 Return ONE JSON object (no prose, no fences) with EXACTLY these keys:
   "title"          : short challenge name
   "category"       : e.g. "Forensics" or "Log Analysis"
   "difficulty"     : "easy", "medium" or "hard"
   "description"    : 1-2 sentences the player sees (no spoiler)
-  "question"       : one line stating exactly what to find
-  "flag"           : the EXACT answer string the player must find (e.g. an IP
-                     address, a username, a token). Plain value, not sloth{...}.
-  "generator_code" : a complete Python 3 script (organizer tool)
-  "extractor_code" : a complete Python 3 script (organizer ground-truth solver)
+  "generator_code" : a Python 3 script, run as `python generator.py <outfile>`,
+                     that writes a realistic synthetic log (syslog / HTTP / SSH /
+                     firewall style) with plenty of plausible noise to <outfile>,
+                     is deterministic (use a fixed random seed), and prints nothing
+  "tasks"          : a list of 3 to 6 task objects (see below)
 
-HARD REQUIREMENTS (breaking any is rejected and sent back to you):
+%(tasks)s
 
-1. generator_code is run as:  python generator.py <answer> <outfile>
-   - writes a realistic synthetic log (syslog / HTTP access / SSH / firewall
-     style) with MANY lines of plausible noise to <outfile>;
-   - builds the scenario so that <answer> (passed on argv) is the correct answer
-     to "question" (e.g. the attacker IP, the exfiltrated token);
-   - is deterministic (use a fixed random seed);
-   - prints nothing to stdout.
-
-2. extractor_code is run as:  python extractor.py <logfile>
-   - reads the log, performs the analysis that answers "question", and prints
-     ONLY the answer to stdout — nothing else;
-   - MUST derive the answer from the log's contents. Do NOT hardcode the answer
-     string anywhere in extractor_code.
-
-3. Python 3 only, standard library only. Running the generator and then the
-   extractor must reproduce EXACTLY the declared flag. The extractor must NOT
-   produce that answer when run on an unrelated log (it reads evidence, not a
-   constant)."""
+HARD REQUIREMENTS (breaking any is rejected): running the generator and then each
+task's extractor must reproduce EXACTLY that task's answer; each extractor must
+derive its answer from the log (no hardcoding); every question must be
+unambiguous.""" % {"tasks": _TASK_SPEC}
 
 
 _SCHEMA_RULES_LOG_ANALYSIS = """\
-You are SlothCTF turning a PROVIDED log into a forensics CTF question. The log
-is given below with 1-based line numbers. Pick ONE concrete, verifiable fact in
-it (an attacker IP, a leaked token, a suspicious username, a timestamp) and turn
-it into a challenge. GROUND every claim in the log — never invent a value.
+You are SlothCTF turning a PROVIDED log (shown below with 1-based line numbers)
+into SEVERAL forensics questions. Pick concrete, verifiable facts (attacker IP,
+leaked token, suspicious username, a count, number of distinct values, a max…)
+and turn each into a task. GROUND every claim in the log — never invent a value.
 
 Return ONE JSON object (no prose, no fences) with EXACTLY these keys:
-  "title"         : short challenge name
-  "category"      : e.g. "Forensics" or "Log Analysis"
-  "difficulty"    : "easy", "medium" or "hard"
-  "description"   : 1-2 sentences the player sees (no spoiler)
-  "question"      : one line stating exactly what to find
-  "flag"          : the EXACT answer, copied VERBATIM from the log
-  "evidence_line" : the 1-based line number in the log that proves the answer
-  "evidence_text" : the exact text of that line, copied verbatim
-  "extractor_code": a Python 3 script, run as `python extractor.py <logfile>`,
-                    that reads the log, derives the answer, and prints ONLY it
+  "title"       : short challenge name
+  "category"    : e.g. "Forensics" or "Log Analysis"
+  "difficulty"  : "easy", "medium" or "hard"
+  "description" : 1-2 sentences the player sees (no spoiler)
+  "tasks"       : a list of 3 to 6 task objects (see below)
 
-HARD REQUIREMENTS (breaking any is rejected):
-1. flag must appear verbatim somewhere in the log.
-2. evidence_line must be the line number that contains flag, and evidence_text
-   must equal that line's exact text.
-3. extractor_code must read the log and print exactly flag; do NOT hardcode the
-   answer string in it; Python 3, standard library only; print nothing else."""
+%(tasks)s
+
+HARD REQUIREMENTS (breaking any is rejected): for extractive tasks the answer
+appears verbatim at evidence_line; each extractor derives its answer from the log
+(no hardcoding); every question must be unambiguous (no ties).""" % {"tasks": _TASK_SPEC}
 
 
 def _number_log(text: str, max_lines: int = 400, max_chars: int = 16000) -> str:
@@ -501,8 +496,8 @@ def _write_challenge_files(base_dir: Path, data: dict[str, Any]) -> None:
         (private_dir / "encoder.c").write_text(data["encoder_code"], encoding="utf-8")
     if "generator_code" in data:
         (private_dir / "generator.py").write_text(data["generator_code"], encoding="utf-8")
-    if "extractor_code" in data:
-        (private_dir / "extractor.py").write_text(data["extractor_code"], encoding="utf-8")
+    for i, t in enumerate(data.get("tasks", []), 1):  # per-task extractors (log genre)
+        (private_dir / f"extractor_{i}.py").write_text(t.get("extractor_code", ""), encoding="utf-8")
 
     (base_dir / "README.md").write_text(data["readme"], encoding="utf-8")
     (base_dir / "solution.md").write_text(data["solution"], encoding="utf-8")
@@ -517,7 +512,10 @@ def _write_challenge_files(base_dir: Path, data: dict[str, Any]) -> None:
     if data.get("challenge_kind") == "check":
         meta["success_marker"] = data.get("success_marker", "Access Granted")
     if data.get("challenge_kind") == "log":
-        meta["question"] = data.get("question", "")
+        meta["tasks"] = [
+            {k: t.get(k) for k in ("question", "answer", "type", "evidence_line") if k in t}
+            for t in data.get("tasks", [])
+        ]
     (base_dir / "challenge.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
@@ -554,13 +552,21 @@ def _normalize_challenge(
     if genre == "log":
         data.setdefault("category", category or "Forensics")
         data["challenge_kind"] = "log"
-        data.setdefault("description", "Analyze the log and answer the question.")
-        data.setdefault("question", "Find the answer in the log.")
-        data.setdefault("solution", "See organizer/extractor.py for the automated answer.")
-        for k in ("generator_code", "extractor_code"):
-            if k in data:
-                data[k] = _strip_code_fences(str(data[k]))
-        data["flag"] = _clean_answer(str(data.get("flag", ""))) or "unknown"
+        data.setdefault("description", "Analyze the log and answer the questions.")
+        data.setdefault("solution", "See organizer/ for the per-task extractors.")
+        if "generator_code" in data:
+            data["generator_code"] = _strip_code_fences(str(data["generator_code"]))
+        tasks = data.get("tasks")
+        if not isinstance(tasks, list):
+            tasks = []
+        for t in tasks:
+            if isinstance(t, dict):
+                t["answer"] = _clean_answer(str(t.get("answer", "")))
+                if "extractor_code" in t:
+                    t["extractor_code"] = _strip_code_fences(str(t["extractor_code"]))
+        data["tasks"] = tasks
+        # catalog/display summary; the real answers live per-task
+        data["flag"] = f"{len(tasks)} task(s)"
         return data
 
     # reverse / crypto (C encoder pipeline)
@@ -581,6 +587,7 @@ def _render_readme(data: dict[str, Any]) -> str:
     """Player-facing README, rendered locally (no LLM call) once the challenge
     is verified."""
     if data.get("challenge_kind") == "log":
+        qs = "\n".join(f"{i}. {t.get('question','')}" for i, t in enumerate(data.get("tasks", []), 1))
         return (
             f"# {data['title']}\n\n"
             f"**Category:** {data['category']}  \n"
@@ -588,8 +595,8 @@ def _render_readme(data: dict[str, Any]) -> str:
             f"{data['description']}\n\n"
             "## Files\n\n"
             f"- `evidence/{_log_name(data)}` — the log to analyze\n\n"
-            "## Task\n\n"
-            f"{data.get('question', 'Find the answer in the log.')}\n"
+            "## Questions\n\n"
+            f"{qs}\n"
         )
     if data.get("challenge_kind") == "check":
         goal = (
@@ -626,34 +633,24 @@ def _render_solution(data: dict[str, Any]) -> str:
     verified. Running the challenge binary prints the flag, and the encoder
     (organizer tool) documents exactly how the bytes were produced."""
     if data.get("challenge_kind") == "log":
-        if "generator_code" in data:  # synthesis mode
-            how = (
-                "This challenge was verified automatically: the generator planted the "
-                "answer in a synthetic log, the extractor below recovered exactly it, "
-                "and the extractor does not reproduce the answer on an unrelated log "
-                "(so it reads the evidence rather than hardcoding it).\n\n"
+        mode = "synthetic log" if "generator_code" in data else "provided log"
+        parts = [
+            f"# Solution — {data['title']}\n",
+            f"Built from a {mode}. Each answer is produced by its own extractor, which "
+            "the tool ran against the log; computed answers are verified by the "
+            "extractor's deterministic output, extractive ones also by the cited line. "
+            "No extractor reproduces its answer on an unrelated log.\n",
+        ]
+        for i, t in enumerate(data.get("tasks", []), 1):
+            parts.append(f"## Task {i} — {t.get('question','')}\n")
+            parts.append(f"**Answer:** `{t.get('answer','')}`  ·  type: `{t.get('type','extractive')}`")
+            if str(t.get("type", "")).lower() == "extractive" and t.get("evidence_line"):
+                parts.append(f"Evidence line {t.get('evidence_line')}: `{t.get('evidence_text','')}`")
+            parts.append(
+                f"```\npython organizer/extractor_{i}.py evidence/{_log_name(data)}\n```\n"
+                f"```python\n{t.get('extractor_code','')}\n```\n"
             )
-        else:  # analysis of a provided log
-            ln = data.get("evidence_line", "?")
-            how = (
-                f"This challenge was built from a provided log. The answer is grounded "
-                f"at **line {ln}**:\n\n```\n{data.get('evidence_text', '')}\n```\n\n"
-                "It was verified automatically: the extractor below recovers exactly the "
-                "answer from the log and does not reproduce it on an unrelated log.\n\n"
-            )
-        return (
-            f"# Solution — {data['title']}\n\n"
-            f"**Question:** {data.get('question', '')}\n\n"
-            f"**Answer:** `{data['flag']}`\n\n"
-            f"{how}"
-            "## Recover the answer (`organizer/extractor.py`)\n\n"
-            "```\n"
-            f"python organizer/extractor.py evidence/{_log_name(data)}\n"
-            "```\n\n"
-            "```python\n"
-            f"{data.get('extractor_code', '')}\n"
-            "```\n"
-        )
+        return "\n".join(parts)
     if data.get("challenge_kind") == "check":
         recover = (
             f"**Secret input:** `{data['flag']}`\n\n"
@@ -820,138 +817,110 @@ def _run_python(script: Path, args: list[str], timeout: float = 20.0) -> tuple[b
     return result.returncode == 0, result.stdout, result.stderr.strip()
 
 
+_DECOY_LOG = (
+    "2026-01-01 00:00:00 sshd[1]: Accepted password for svc from 192.0.2.254 port 2200 ssh2\n"
+    "2026-01-01 00:00:01 kernel: nothing of interest here\n"
+    "2026-01-01 00:00:02 web: GET /health 200 from 192.0.2.254\n"
+) * 4
+
+
+def _verify_tasks_against_log(base_dir: Path, data: dict[str, Any], log_path: Path) -> AttemptResult:
+    """Shared check for log challenges: every task's extractor must recover its
+    answer from the log, deterministically; extractive answers must be grounded
+    at the cited line; and no extractor may hardcode its answer (decoy test)."""
+    org = base_dir / "organizer"
+    org.mkdir(parents=True, exist_ok=True)
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    lines = log_text.splitlines()
+
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return AttemptResult(0, False, "no-tasks", "tasks must be a non-empty list.")
+
+    decoy = base_dir / "evidence" / "_decoy.log"
+    decoy.write_text(_DECOY_LOG, encoding="utf-8")
+    try:
+        for i, task in enumerate(tasks, 1):
+            answer = _clean_answer(str(task.get("answer", "")))
+            task["answer"] = answer
+            etype = str(task.get("type", "extractive")).strip().lower()
+            ext = org / f"extractor_{i}.py"
+            ext.write_text(_strip_code_fences(str(task.get("extractor_code", ""))), encoding="utf-8")
+
+            try:
+                ok, out, err = _run_python(ext, [str(log_path)])
+                ok2, out2, _ = _run_python(ext, [str(log_path)])
+            except subprocess.TimeoutExpired:
+                return AttemptResult(0, False, "extractor-timeout", f"task {i}: extractor did not finish in 20s.")
+            if not ok or not ok2:
+                return AttemptResult(0, False, "extractor-crash", f"task {i}: extractor failed:\n{err[:300]}")
+            if out.strip() != out2.strip():
+                return AttemptResult(0, False, "nondeterministic", f"task {i}: extractor is not deterministic.")
+            if out.strip() != answer:
+                return AttemptResult(
+                    0, False, "answer-mismatch",
+                    f"task {i}: extractor printed {out.strip()[:120]!r} but the declared answer is {answer!r}.",
+                )
+
+            if etype == "extractive":
+                if answer not in log_text:
+                    return AttemptResult(0, False, "not-grounded",
+                                         f"task {i}: extractive answer {answer!r} is not present verbatim in the log.")
+                try:
+                    ln = int(task.get("evidence_line", 0))
+                except (TypeError, ValueError):
+                    ln = 0
+                if not (1 <= ln <= len(lines)) or answer not in lines[ln - 1]:
+                    return AttemptResult(0, False, "bad-evidence",
+                                         f"task {i}: evidence_line must be the 1-based line containing {answer!r}.")
+
+            try:
+                _ok, decoy_out, _e = _run_python(ext, [str(decoy)])
+                if decoy_out.strip() == answer:
+                    return AttemptResult(0, False, "hardcoded-answer",
+                                         f"task {i}: extractor prints the answer on an unrelated log — do not hardcode it.")
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        decoy.unlink(missing_ok=True)
+
+    return AttemptResult(0, True, "passed", f"{len(tasks)} task(s) verified")
+
+
 def _verify_log_challenge(base_dir: Path, data: dict[str, Any], compiler: str | None = None) -> AttemptResult:
-    """Build and self-check a log challenge: run the generator to plant the
-    answer in a synthetic log, run the extractor to recover it, and confirm the
-    extractor reads the evidence (does not hardcode the answer)."""
-    answer = data["flag"]
+    """Synthesis: run the generator to produce the log, then verify all tasks."""
     org = base_dir / "organizer"
     ev = base_dir / "evidence"
     org.mkdir(parents=True, exist_ok=True)
     ev.mkdir(parents=True, exist_ok=True)
 
     gen = org / "generator.py"
-    ext = org / "extractor.py"
-    gen.write_text(data.get("generator_code", ""), encoding="utf-8")
-    ext.write_text(data.get("extractor_code", ""), encoding="utf-8")
-
+    gen.write_text(_strip_code_fences(str(data.get("generator_code", ""))), encoding="utf-8")
     log_path = ev / f"{base_dir.name}.log"
     data["log_file"] = log_path.name
     try:
-        ok, _out, err = _run_python(gen, [answer, str(log_path)])
+        ok, _out, err = _run_python(gen, [str(log_path)])
     except subprocess.TimeoutExpired:
         return AttemptResult(0, False, "generator-timeout", "generator.py did not finish within 20s.")
     if not ok:
         return AttemptResult(0, False, "generator-crash", f"generator.py failed:\n{err[:300]}")
     if not log_path.exists() or log_path.stat().st_size == 0:
-        return AttemptResult(0, False, "no-log", "generator.py did not write a non-empty log file to its argv[2].")
-
-    try:
-        ok, out, err = _run_python(ext, [str(log_path)])
-    except subprocess.TimeoutExpired:
-        return AttemptResult(0, False, "extractor-timeout", "extractor.py did not finish within 20s.")
-    if not ok:
-        return AttemptResult(0, False, "extractor-crash", f"extractor.py failed:\n{err[:300]}")
-    if out.strip() != answer:
-        return AttemptResult(
-            0, False, "answer-mismatch",
-            f"extractor.py printed {out.strip()[:120]!r} but the declared answer is {answer!r}. "
-            "Make the generator plant the answer and the extractor recover exactly it.",
-        )
-
-    # Anti-hardcode: on an unrelated log, the extractor must NOT print the answer.
-    decoy = ev / "_decoy.log"
-    decoy.write_text(
-        "2026-01-01 00:00:00 sshd[1]: Accepted password for root from 192.0.2.1 port 2222\n"
-        "2026-01-01 00:00:01 kernel: nothing to see here\n" * 5,
-        encoding="utf-8",
-    )
-    try:
-        _ok, decoy_out, _err = _run_python(ext, [str(decoy)])
-        if decoy_out.strip() == answer:
-            return AttemptResult(
-                0, False, "hardcoded-answer",
-                "extractor.py printed the answer even for an unrelated log — it must "
-                "derive the answer from the log, not hardcode it.",
-            )
-    except subprocess.TimeoutExpired:
-        pass
-    finally:
-        decoy.unlink(missing_ok=True)
-
-    return AttemptResult(0, True, "passed", f"log answer recovered: {answer}")
+        return AttemptResult(0, False, "no-log", "generator.py did not write a non-empty log to its argv[1].")
+    return _verify_tasks_against_log(base_dir, data, log_path)
 
 
 def _verify_log_analysis(base_dir: Path, data: dict[str, Any], provided_log: Path) -> AttemptResult:
-    """Verify a challenge derived from a PROVIDED log: the extractor must recover
-    exactly the claimed answer from the real log, the answer must be grounded at
-    the cited line, and the extractor must not hardcode it."""
-    answer = data["flag"]
-    org = base_dir / "organizer"
+    """Analysis: copy the provided log in, then verify all tasks against it."""
     ev = base_dir / "evidence"
-    org.mkdir(parents=True, exist_ok=True)
     ev.mkdir(parents=True, exist_ok=True)
-
-    # Player receives the same log; copy it in.
-    log_path = ev / provided_log.name
     try:
         log_text = provided_log.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return AttemptResult(0, False, "no-input", f"could not read the provided log: {exc}")
+    log_path = ev / provided_log.name
     log_path.write_text(log_text, encoding="utf-8")
     data["log_file"] = log_path.name
-
-    # Grounding: the answer must actually appear in the log.
-    if answer not in log_text:
-        return AttemptResult(
-            0, False, "not-grounded",
-            f"the answer {answer!r} does not appear verbatim in the log. Pick a value "
-            "that is literally present and copy it exactly.",
-        )
-    # Grounding: the cited line must exist and contain the answer.
-    lines = log_text.splitlines()
-    try:
-        ln = int(data.get("evidence_line", 0))
-    except (TypeError, ValueError):
-        ln = 0
-    if not (1 <= ln <= len(lines)) or answer not in lines[ln - 1]:
-        return AttemptResult(
-            0, False, "bad-evidence",
-            f"evidence_line must be the 1-based line number whose text contains {answer!r}. "
-            f"Line {ln} does not. Point to the exact line.",
-        )
-
-    ext = org / "extractor.py"
-    ext.write_text(data.get("extractor_code", ""), encoding="utf-8")
-    try:
-        ok, out, err = _run_python(ext, [str(log_path)])
-    except subprocess.TimeoutExpired:
-        return AttemptResult(0, False, "extractor-timeout", "extractor.py did not finish within 20s.")
-    if not ok:
-        return AttemptResult(0, False, "extractor-crash", f"extractor.py failed:\n{err[:300]}")
-    if out.strip() != answer:
-        return AttemptResult(
-            0, False, "answer-mismatch",
-            f"extractor.py printed {out.strip()[:120]!r} but the answer is {answer!r}.",
-        )
-
-    # Anti-hardcode: on an unrelated log the extractor must not print the answer.
-    decoy = ev / "_decoy.log"
-    decoy.write_text("just some unrelated lines\nnothing to find here\n" * 5, encoding="utf-8")
-    try:
-        _ok, decoy_out, _err = _run_python(ext, [str(decoy)])
-        if decoy_out.strip() == answer:
-            return AttemptResult(
-                0, False, "hardcoded-answer",
-                "extractor.py prints the answer even for an unrelated log — derive it "
-                "from the log instead of hardcoding it.",
-            )
-    except subprocess.TimeoutExpired:
-        pass
-    finally:
-        decoy.unlink(missing_ok=True)
-
-    return AttemptResult(0, True, "passed", f"grounded answer at line {ln}: {answer}")
+    return _verify_tasks_against_log(base_dir, data, log_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -1007,14 +976,14 @@ def generate_challenge(
         if not provided_log.is_file():
             raise GenerationError(f"--input log not found: {provided_log}")
         temperature = 0.0
-        schema, required = _SCHEMA_RULES_LOG_ANALYSIS, ("extractor_code",)
+        schema, required = _SCHEMA_RULES_LOG_ANALYSIS, ("tasks",)
         verify_fn = lambda b, d, c: _verify_log_analysis(b, d, provided_log)  # noqa: E731
         compiler = None
         numbered = _number_log(provided_log.read_text(encoding="utf-8", errors="replace"))
         user_prompt = (user_prompt.strip() + "\n\n" if user_prompt.strip() else "") + \
             "LOG TO TURN INTO A CHALLENGE (1-based line numbers):\n" + numbered
     elif genre == "log":
-        schema, required, verify_fn = _SCHEMA_RULES_LOG, ("generator_code", "extractor_code"), _verify_log_challenge
+        schema, required, verify_fn = _SCHEMA_RULES_LOG, ("generator_code", "tasks"), _verify_log_challenge
         compiler = None  # log challenges are Python, no C compiler needed
     else:
         schema, required, verify_fn = _SCHEMA_RULES, ("encoder_code", "challenge_code"), _verify_challenge
