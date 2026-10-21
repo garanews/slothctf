@@ -743,6 +743,11 @@ def generate_challenge(
             data["solution"] = _render_solution(data)
             _write_challenge_files(base_dir, data)
             report.success = True
+            try:  # best-effort: index into the catalog, never fail generation
+                from slothctf import catalog
+                catalog.record(base_dir, valid=True)
+            except Exception:
+                pass
             break
         feedback = result.detail
 

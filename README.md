@@ -92,6 +92,24 @@ generated/<name>/
 
 See [examples/](examples/) for a `decode` and a `check` sample.
 
+## Browse your challenges
+
+Every generated challenge is indexed in a small SQLite catalog
+(`generated/catalog.db`). List them from the CLI:
+
+```bash
+python main.py list                          # all challenges, as a table
+python main.py list --kind check --difficulty easy
+python main.py list --search xor --json
+```
+
+Or open the **web GUI** (standard library only — no extra install) to browse
+and filter by category, difficulty and kind in your browser:
+
+```bash
+python main.py web            # serves http://127.0.0.1:8000 and opens it
+```
+
 ## How a challenge is verified
 
 ```
@@ -114,11 +132,11 @@ python main.py install-toolchain             # attempt the install (Windows)
 
 ## Roadmap
 
-- A **GUI** with a small **database** of generated challenges (browse by
-  category, difficulty, kind; see available flags).
-- Support for the other classic CTF genres beyond reverse/crypto: **pcap /
-  network**, **memory dumps**, **disk forensics**, **log analysis**, **OSINT**,
-  stego, and more.
+- ✅ A small **database** of generated challenges + a **web GUI** to browse them
+  by category, difficulty and kind (`python main.py list` / `web`).
+- Support for the other classic CTF genres beyond reverse/crypto, each with its
+  own deterministic verifier: **log analysis** (next), then **stego**, **pcap /
+  network**, and later **memory dumps**, **disk forensics**, **OSINT**.
 
 ## Tests
 

@@ -60,6 +60,19 @@ def _build_parser() -> argparse.ArgumentParser:
     gui = subparsers.add_parser("gui", help="Launch the desktop GUI")
     gui.add_argument("--no-splash", action="store_true", help="Launch without the startup message")
 
+    lst = subparsers.add_parser("list", help="List generated challenges from the catalog")
+    lst.add_argument("--category", default=None, help="Filter by category")
+    lst.add_argument("--difficulty", choices=["easy", "medium", "hard"], default=None, help="Filter by difficulty")
+    lst.add_argument("--kind", choices=["decode", "check"], default=None, help="Filter by challenge kind")
+    lst.add_argument("--search", default=None, help="Free-text search over name/title/category")
+    lst.add_argument("--json", action="store_true", help="Output JSON instead of a table")
+    lst.add_argument("--no-scan", action="store_true", help="Do not rescan generated/ before listing")
+
+    web = subparsers.add_parser("web", help="Launch the web GUI to browse the catalog")
+    web.add_argument("--host", default="127.0.0.1", help="Host to bind")
+    web.add_argument("--port", type=int, default=8000, help="Port to bind")
+    web.add_argument("--no-browser", action="store_true", help="Do not open a browser automatically")
+
     return parser
 
 
@@ -113,6 +126,34 @@ def main() -> None:
             print("GUI mode requires tkinter, which is not available in this environment.", file=sys.stderr)
             raise SystemExit(1) from exc
         launch_gui(show_splash=not args.no_splash)
+        return
+
+    if args.command == "list":
+        from slothctf import catalog
+        if not args.no_scan:
+            catalog.index_generated()
+        rows = catalog.query(
+            category=args.category, difficulty=args.difficulty,
+            kind=args.kind, search=args.search,
+        )
+        if args.json:
+            import json as _json
+            print(_json.dumps(rows, indent=2))
+            return
+        if not rows:
+            print("No challenges found. Generate some with 'python main.py generate ...'.")
+            return
+        print(f"{'NAME':22} {'KIND':7} {'DIFF':7} {'CATEGORY':22} FLAG")
+        print("-" * 86)
+        for r in rows:
+            print(f"{r['name'][:22]:22} {r['kind']:7} {r['difficulty'][:7]:7} "
+                  f"{(r['category'] or '')[:22]:22} {r['flag']}")
+        print(f"\n{len(rows)} challenge(s).")
+        return
+
+    if args.command == "web":
+        from slothctf.web import launch_web
+        launch_web(host=args.host, port=args.port, open_browser=not args.no_browser)
         return
 
 
