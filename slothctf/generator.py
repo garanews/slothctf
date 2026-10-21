@@ -400,18 +400,22 @@ Return ONE JSON object (no prose, no fences) with EXACTLY these keys:
   "category"       : e.g. "Forensics" or "Log Analysis"
   "difficulty"     : "easy", "medium" or "hard"
   "description"    : 1-2 sentences the player sees (no spoiler)
-  "generator_code" : a Python 3 script, run as `python generator.py <outfile>`,
-                     that writes a realistic synthetic log (syslog / HTTP / SSH /
-                     firewall style) with plenty of plausible noise to <outfile>,
-                     is deterministic (use a fixed random seed), and prints nothing
+  "generator_code" : a Python 3 script, run as `python generator.py` (NO arguments),
+                     that PRINTS the entire realistic synthetic log (syslog / HTTP /
+                     SSH / firewall / JSON-lines style) with plenty of plausible
+                     noise to STDOUT. Deterministic (use a fixed random seed).
+                     Do NOT open or write any file; just print. Standard library only.
   "tasks"          : a list of 3 to 6 task objects (see below)
 
 %(tasks)s
 
-HARD REQUIREMENTS (breaking any is rejected): running the generator and then each
-task's extractor must reproduce EXACTLY that task's answer; each extractor must
-derive its answer from the log (no hardcoding); every question must be
-unambiguous.""" % {"tasks": _TASK_SPEC}
+CODE RULES: build each log line as a normal string and join with "\\n" — NEVER put
+a real line break inside a string literal (that is a syntax error). The generator
+must PRINT the log (not write a file); each extractor reads its log file argument.
+
+HARD REQUIREMENTS (breaking any is rejected): running the generator then each
+task's extractor must reproduce EXACTLY that task's answer; each extractor derives
+its answer from the log (no hardcoding); every question must be unambiguous.""" % {"tasks": _TASK_SPEC}
 
 
 _SCHEMA_RULES_LOG_ANALYSIS = """\
@@ -923,13 +927,16 @@ def _verify_log_challenge(base_dir: Path, data: dict[str, Any], compiler: str | 
     log_path = ev / f"{base_dir.name}.log"
     data["log_file"] = log_path.name
     try:
-        ok, _out, err = _run_python(gen, [str(log_path)])
+        # The generator PRINTS the log to stdout; we capture and save it. This
+        # avoids the model hardcoding an output filename / ignoring argv.
+        ok, out, err = _run_python(gen, [])
     except subprocess.TimeoutExpired:
         return AttemptResult(0, False, "generator-timeout", "generator.py did not finish within 20s.")
     if not ok:
         return AttemptResult(0, False, "generator-crash", f"generator.py failed:\n{err[:300]}")
-    if not log_path.exists() or log_path.stat().st_size == 0:
-        return AttemptResult(0, False, "no-log", "generator.py did not write a non-empty log to its argv[1].")
+    if not out.strip():
+        return AttemptResult(0, False, "no-log", "generator.py printed nothing; it must print the log to stdout.")
+    log_path.write_text(out, encoding="utf-8")
     return _verify_tasks_against_log(base_dir, data, log_path)
 
 

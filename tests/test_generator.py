@@ -197,11 +197,8 @@ class GenerationLoopTests(unittest.TestCase):
 class LogVerifyTests(unittest.TestCase):
     """Exercises the real multi-task log synthesis verifier (no model)."""
 
-    # Generator plants a known ALERT line plus noise; count is a computed task.
-    GOOD_GEN = (
-        "import sys\n"
-        "open(sys.argv[1],'w').write('noise\\nALERT from 10.0.0.9\\nhit\\nhit\\n')\n"
-    )
+    # Generator PRINTS a known ALERT line plus noise; count is a computed task.
+    GOOD_GEN = "print('noise\\nALERT from 10.0.0.9\\nhit\\nhit')\n"
     EXT_IP = ("import sys,re\n"
               "print(re.search(r'ALERT from (\\S+)', open(sys.argv[1]).read()).group(1))\n")
     EXT_COUNT = ("import sys\n"
@@ -234,8 +231,8 @@ class LogVerifyTests(unittest.TestCase):
         self.assertFalse(r.ok)
         self.assertEqual(r.stage, "hardcoded-answer")
 
-    def test_generator_must_write_log(self):
-        r = self._run({"generator_code": "import sys\n", "tasks": self._tasks()})
+    def test_generator_must_print_log(self):
+        r = self._run({"generator_code": "pass\n", "tasks": self._tasks()})
         self.assertFalse(r.ok)
         self.assertEqual(r.stage, "no-log")
 
