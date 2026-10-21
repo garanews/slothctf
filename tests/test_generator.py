@@ -221,5 +221,43 @@ class LogVerifyTests(unittest.TestCase):
         self.assertEqual(r.stage, "no-log")
 
 
+class LogAnalysisVerifyTests(unittest.TestCase):
+    """Exercises the provided-log analysis verifier."""
+
+    LOG = ("2026-03-01 sshd: Failed password from 10.0.0.2\n"
+           "2026-03-01 sshd: Accepted password from 10.0.0.42\n"
+           "2026-03-01 sshd: Failed password from 10.0.0.3\n")
+    EXT = ("import sys,re\n"
+           "print(re.search(r'Accepted password from (\\S+)', open(sys.argv[1]).read()).group(1))\n")
+
+    def _run(self, data):
+        with TemporaryDirectory() as tmp:
+            log = Path(tmp) / "provided.log"
+            log.write_text(self.LOG, encoding="utf-8")
+            return generator._verify_log_analysis(Path(tmp) / "c", data, log)
+
+    def test_passes_when_grounded(self):
+        r = self._run({"flag": "10.0.0.42", "evidence_line": 2,
+                       "evidence_text": "2026-03-01 sshd: Accepted password from 10.0.0.42",
+                       "extractor_code": self.EXT})
+        self.assertTrue(r.ok, r.detail)
+
+    def test_not_grounded(self):
+        r = self._run({"flag": "9.9.9.9", "evidence_line": 2, "extractor_code": self.EXT})
+        self.assertFalse(r.ok)
+        self.assertEqual(r.stage, "not-grounded")
+
+    def test_bad_evidence_line(self):
+        r = self._run({"flag": "10.0.0.42", "evidence_line": 1, "extractor_code": self.EXT})
+        self.assertFalse(r.ok)
+        self.assertEqual(r.stage, "bad-evidence")
+
+    def test_hardcoded_rejected(self):
+        hard = "import sys\nprint('10.0.0.42')\n"
+        r = self._run({"flag": "10.0.0.42", "evidence_line": 2, "extractor_code": hard})
+        self.assertFalse(r.ok)
+        self.assertEqual(r.stage, "hardcoded-answer")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -55,6 +55,16 @@ python main.py generate --name ssh_case --genre log \
   --model qwen2.5-coder:32b
 ```
 
+You can also point it at a **real log you already have** and let it build a
+question from the evidence. Here the model runs at temperature 0 and must cite
+the exact line; we check the answer appears at that line and that the extractor
+recovers it from the log (never hardcoded):
+
+```bash
+python main.py generate --name my_case --genre log --input /path/to/server.log \
+  --model qwen2.5-coder:32b
+```
+
 ## Requirements
 
 - **[Ollama](https://ollama.com)** running a capable **coding** model. A small

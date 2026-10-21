@@ -206,6 +206,7 @@ def _call_ollama(
     timeout: float = 600.0,
     retries: int = 2,
     base_url: str = DEFAULT_OLLAMA_URL,
+    temperature: float = 0.7,
 ) -> dict[str, Any]:
     """Call a local Ollama model and return the parsed JSON challenge.
 
@@ -224,7 +225,7 @@ def _call_ollama(
             "keep_alive": "10m",
             # Our prompt + expected output fit comfortably in 4k tokens; a
             # smaller context means a smaller KV cache and faster first token.
-            "options": {"temperature": 0.7, "num_ctx": 4096},
+            "options": {"temperature": temperature, "num_ctx": 4096},
         }
     ).encode("utf-8")
 
@@ -412,6 +413,46 @@ HARD REQUIREMENTS (breaking any is rejected and sent back to you):
    constant)."""
 
 
+_SCHEMA_RULES_LOG_ANALYSIS = """\
+You are SlothCTF turning a PROVIDED log into a forensics CTF question. The log
+is given below with 1-based line numbers. Pick ONE concrete, verifiable fact in
+it (an attacker IP, a leaked token, a suspicious username, a timestamp) and turn
+it into a challenge. GROUND every claim in the log — never invent a value.
+
+Return ONE JSON object (no prose, no fences) with EXACTLY these keys:
+  "title"         : short challenge name
+  "category"      : e.g. "Forensics" or "Log Analysis"
+  "difficulty"    : "easy", "medium" or "hard"
+  "description"   : 1-2 sentences the player sees (no spoiler)
+  "question"      : one line stating exactly what to find
+  "flag"          : the EXACT answer, copied VERBATIM from the log
+  "evidence_line" : the 1-based line number in the log that proves the answer
+  "evidence_text" : the exact text of that line, copied verbatim
+  "extractor_code": a Python 3 script, run as `python extractor.py <logfile>`,
+                    that reads the log, derives the answer, and prints ONLY it
+
+HARD REQUIREMENTS (breaking any is rejected):
+1. flag must appear verbatim somewhere in the log.
+2. evidence_line must be the line number that contains flag, and evidence_text
+   must equal that line's exact text.
+3. extractor_code must read the log and print exactly flag; do NOT hardcode the
+   answer string in it; Python 3, standard library only; print nothing else."""
+
+
+def _number_log(text: str, max_lines: int = 400, max_chars: int = 16000) -> str:
+    """Render a log with 1-based line numbers for the prompt, truncated if huge."""
+    lines = text.splitlines()
+    truncated = len(lines) > max_lines
+    shown = lines[:max_lines]
+    body = "\n".join(f"{i}: {ln}" for i, ln in enumerate(shown, 1))
+    if len(body) > max_chars:
+        body = body[:max_chars]
+        truncated = True
+    if truncated:
+        body += "\n… (log truncated for the prompt; the full log is on disk)"
+    return body
+
+
 def _build_generation_prompt(
     user_prompt: str,
     difficulty: str,
@@ -585,14 +626,26 @@ def _render_solution(data: dict[str, Any]) -> str:
     verified. Running the challenge binary prints the flag, and the encoder
     (organizer tool) documents exactly how the bytes were produced."""
     if data.get("challenge_kind") == "log":
+        if "generator_code" in data:  # synthesis mode
+            how = (
+                "This challenge was verified automatically: the generator planted the "
+                "answer in a synthetic log, the extractor below recovered exactly it, "
+                "and the extractor does not reproduce the answer on an unrelated log "
+                "(so it reads the evidence rather than hardcoding it).\n\n"
+            )
+        else:  # analysis of a provided log
+            ln = data.get("evidence_line", "?")
+            how = (
+                f"This challenge was built from a provided log. The answer is grounded "
+                f"at **line {ln}**:\n\n```\n{data.get('evidence_text', '')}\n```\n\n"
+                "It was verified automatically: the extractor below recovers exactly the "
+                "answer from the log and does not reproduce it on an unrelated log.\n\n"
+            )
         return (
             f"# Solution — {data['title']}\n\n"
             f"**Question:** {data.get('question', '')}\n\n"
             f"**Answer:** `{data['flag']}`\n\n"
-            "This challenge was verified automatically: the generator planted the "
-            "answer in a synthetic log, the extractor below recovered exactly it, "
-            "and the extractor does not reproduce the answer on an unrelated log "
-            "(so it reads the evidence rather than hardcoding it).\n\n"
+            f"{how}"
             "## Recover the answer (`organizer/extractor.py`)\n\n"
             "```\n"
             f"python organizer/extractor.py evidence/{_log_name(data)}\n"
@@ -829,6 +882,78 @@ def _verify_log_challenge(base_dir: Path, data: dict[str, Any], compiler: str | 
     return AttemptResult(0, True, "passed", f"log answer recovered: {answer}")
 
 
+def _verify_log_analysis(base_dir: Path, data: dict[str, Any], provided_log: Path) -> AttemptResult:
+    """Verify a challenge derived from a PROVIDED log: the extractor must recover
+    exactly the claimed answer from the real log, the answer must be grounded at
+    the cited line, and the extractor must not hardcode it."""
+    answer = data["flag"]
+    org = base_dir / "organizer"
+    ev = base_dir / "evidence"
+    org.mkdir(parents=True, exist_ok=True)
+    ev.mkdir(parents=True, exist_ok=True)
+
+    # Player receives the same log; copy it in.
+    log_path = ev / provided_log.name
+    try:
+        log_text = provided_log.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return AttemptResult(0, False, "no-input", f"could not read the provided log: {exc}")
+    log_path.write_text(log_text, encoding="utf-8")
+    data["log_file"] = log_path.name
+
+    # Grounding: the answer must actually appear in the log.
+    if answer not in log_text:
+        return AttemptResult(
+            0, False, "not-grounded",
+            f"the answer {answer!r} does not appear verbatim in the log. Pick a value "
+            "that is literally present and copy it exactly.",
+        )
+    # Grounding: the cited line must exist and contain the answer.
+    lines = log_text.splitlines()
+    try:
+        ln = int(data.get("evidence_line", 0))
+    except (TypeError, ValueError):
+        ln = 0
+    if not (1 <= ln <= len(lines)) or answer not in lines[ln - 1]:
+        return AttemptResult(
+            0, False, "bad-evidence",
+            f"evidence_line must be the 1-based line number whose text contains {answer!r}. "
+            f"Line {ln} does not. Point to the exact line.",
+        )
+
+    ext = org / "extractor.py"
+    ext.write_text(data.get("extractor_code", ""), encoding="utf-8")
+    try:
+        ok, out, err = _run_python(ext, [str(log_path)])
+    except subprocess.TimeoutExpired:
+        return AttemptResult(0, False, "extractor-timeout", "extractor.py did not finish within 20s.")
+    if not ok:
+        return AttemptResult(0, False, "extractor-crash", f"extractor.py failed:\n{err[:300]}")
+    if out.strip() != answer:
+        return AttemptResult(
+            0, False, "answer-mismatch",
+            f"extractor.py printed {out.strip()[:120]!r} but the answer is {answer!r}.",
+        )
+
+    # Anti-hardcode: on an unrelated log the extractor must not print the answer.
+    decoy = ev / "_decoy.log"
+    decoy.write_text("just some unrelated lines\nnothing to find here\n" * 5, encoding="utf-8")
+    try:
+        _ok, decoy_out, _err = _run_python(ext, [str(decoy)])
+        if decoy_out.strip() == answer:
+            return AttemptResult(
+                0, False, "hardcoded-answer",
+                "extractor.py prints the answer even for an unrelated log — derive it "
+                "from the log instead of hardcoding it.",
+            )
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        decoy.unlink(missing_ok=True)
+
+    return AttemptResult(0, True, "passed", f"grounded answer at line {ln}: {answer}")
+
+
 # --------------------------------------------------------------------------- #
 # Public entry point
 # --------------------------------------------------------------------------- #
@@ -875,7 +1000,20 @@ def generate_challenge(
         user_prompt = f"Surprise me with a {difficulty} challenge: {category}."
 
     # Per-genre configuration: schema, required JSON fields, and verifier.
-    if genre == "log":
+    temperature = 0.7
+    provided_log = Path(input_path) if input_path else None
+    if genre == "log" and provided_log is not None:
+        # Analysis mode: derive a challenge from a PROVIDED log (deterministic).
+        if not provided_log.is_file():
+            raise GenerationError(f"--input log not found: {provided_log}")
+        temperature = 0.0
+        schema, required = _SCHEMA_RULES_LOG_ANALYSIS, ("extractor_code",)
+        verify_fn = lambda b, d, c: _verify_log_analysis(b, d, provided_log)  # noqa: E731
+        compiler = None
+        numbered = _number_log(provided_log.read_text(encoding="utf-8", errors="replace"))
+        user_prompt = (user_prompt.strip() + "\n\n" if user_prompt.strip() else "") + \
+            "LOG TO TURN INTO A CHALLENGE (1-based line numbers):\n" + numbered
+    elif genre == "log":
         schema, required, verify_fn = _SCHEMA_RULES_LOG, ("generator_code", "extractor_code"), _verify_log_challenge
         compiler = None  # log challenges are Python, no C compiler needed
     else:
@@ -887,7 +1025,7 @@ def generate_challenge(
                 "and ensure gcc is on PATH — the self-verifying loop needs to compile."
             )
 
-    ask = caller or (lambda p, m: _call_ollama(p, m, base_url=ollama_url))
+    ask = caller or (lambda p, m: _call_ollama(p, m, base_url=ollama_url, temperature=temperature))
 
     report = GenerationReport(name=name, model=model, directory=str(base_dir), success=False)
     feedback: str | None = None
