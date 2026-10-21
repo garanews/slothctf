@@ -120,6 +120,18 @@ generated/<name>/
 
 See [examples/](examples/) for a `decode` and a `check` sample.
 
+## Generate a whole set at once
+
+[`tools/batch_logs.py`](tools/batch_logs.py) runs a broad set of log-analysis
+scenarios in one go (SSH, Nginx/Apache, WAF, DNS tunneling/DGA, firewall scans,
+Zeek, mail, Docker/Kubernetes, AWS/GCP/Okta, Sysmon, PowerShell, auditd, DB),
+printing a VALID/FAIL summary:
+
+```bash
+python tools/batch_logs.py --model qwen2.5-coder:32b --ollama-url https://your-ollama
+python tools/batch_logs.py --model qwen2.5-coder:32b --only dns_tunnel,cloudtrail_key
+```
+
 ## Browse your challenges
 
 Every generated challenge is indexed in a small SQLite catalog
