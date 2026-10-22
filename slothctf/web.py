@@ -14,14 +14,87 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
 
 from slothctf import catalog
+from slothctf.generator import (
+    DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MODEL,
+    DEFAULT_OLLAMA_URL,
+    generate_challenge,
+)
+from slothctf.validator import validate_challenge
 
 GENERATED = Path("generated")
+
+# In-memory job store for browser-triggered generations (they take minutes, so
+# the POST starts a worker thread and the page polls for the result).
+_JOBS: dict[str, dict] = {}
+_LOCK = threading.Lock()
+
+
+def _safe_name(name: str) -> str | None:
+    name = (name or "").strip()
+    if not name or "/" in name or "\\" in name or name in (".", "..") or len(name) > 64:
+        return None
+    return name
+
+
+def _build_generate_kwargs(payload: dict) -> dict:
+    """Map a browser form payload to generate_challenge kwargs (validated)."""
+    name = _safe_name(payload.get("name", ""))
+    if name is None:
+        raise ValueError("invalid or missing challenge name")
+    genre = "log" if str(payload.get("genre")) == "log" else "reverse"
+    difficulty = payload.get("difficulty") if payload.get("difficulty") in ("easy", "medium", "hard") else "easy"
+    try:
+        max_attempts = max(1, int(payload.get("max_attempts") or DEFAULT_MAX_ATTEMPTS))
+    except (TypeError, ValueError):
+        max_attempts = DEFAULT_MAX_ATTEMPTS
+    kwargs = {
+        "name": name,
+        "prompt": str(payload.get("prompt") or "").strip(),
+        "genre": genre,
+        "difficulty": difficulty,
+        "model": str(payload.get("model") or DEFAULT_MODEL).strip(),
+        "ollama_url": str(payload.get("ollama_url") or DEFAULT_OLLAMA_URL).strip(),
+        "max_attempts": max_attempts,
+        "surprise": bool(payload.get("surprise")),
+        "roundtrip": bool(payload.get("roundtrip")) and genre == "reverse",
+    }
+    if payload.get("category"):
+        kwargs["challenge_type"] = str(payload["category"]).strip()
+    return kwargs
+
+
+def _report_dict(rep) -> dict:
+    return {
+        "name": rep.name,
+        "success": rep.success,
+        "directory": rep.directory,
+        "attempts_used": rep.attempts_used,
+        "attempts": [{"index": a.index, "ok": a.ok, "stage": a.stage, "detail": a.detail} for a in rep.attempts],
+    }
+
+
+def _run_generate_job(job_id: str, payload: dict) -> None:
+    try:
+        kwargs = _build_generate_kwargs(payload)
+        rep = generate_challenge(return_report=True, **kwargs)
+        try:
+            catalog.record(rep.directory, valid=rep.success)
+        except Exception:
+            pass
+        with _LOCK:
+            _JOBS[job_id] = {"status": "done", "report": _report_dict(rep), "error": None}
+    except Exception as exc:
+        with _LOCK:
+            _JOBS[job_id] = {"status": "error", "report": None, "error": str(exc)}
 
 # Files that reveal the solution / how the challenge is built. Everything else
 # (the binary, the README, evidence the player receives) is player-facing.
@@ -114,13 +187,47 @@ _PAGE = """<!doctype html>
   .close { float:right; }
   pre { background:#000; border:1px solid var(--line); border-radius:8px; padding:12px; overflow:auto; max-height:360px; font-size:12.5px; }
   .filebtn { background:none; border:none; color:var(--accent); cursor:pointer; font:inherit; padding:0; margin:2px 12px 2px 0; }
+  .btn.primary { background:var(--accent); color:#06240a; border-color:var(--accent); font-weight:600; }
+  #newpanel { display:none; padding:16px 24px; border-bottom:1px solid var(--line); background:var(--card); }
+  #newpanel.open { display:block; }
+  #newpanel .row { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:10px; }
+  #newpanel label { display:flex; flex-direction:column; font-size:12px; color:var(--muted); gap:4px; }
+  #newpanel textarea { width:100%; min-height:64px; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:8px; font:inherit; }
+  #newpanel input, #newpanel select { min-width:150px; }
+  .genstatus { margin-top:8px; font-size:13px; color:var(--muted); white-space:pre-wrap; }
 </style>
 </head>
 <body>
 <header>
   <h1><span class="sloth">🦥</span> SlothCTF Catalog</h1>
   <span class="count" id="count"></span>
+  <button class="btn primary" id="newBtn" style="margin-left:auto" onclick="toggleNew()">＋ New challenge</button>
 </header>
+
+<div id="newpanel">
+  <div class="row">
+    <label>Name<input id="f_name" placeholder="my_challenge"></label>
+    <label>Genre<select id="f_genre"></select></label>
+    <label>Difficulty<select id="f_difficulty"></select></label>
+    <label>Category (optional)<input id="f_category" placeholder="e.g. cryptography"></label>
+    <label>Max attempts<input id="f_attempts" type="number" min="1" value="5" style="min-width:90px"></label>
+  </div>
+  <div class="row" style="flex-direction:column">
+    <label style="width:100%">Prompt<textarea id="f_prompt" placeholder="Describe the challenge…"></textarea></label>
+  </div>
+  <div class="row">
+    <label>Model<input id="f_model" style="min-width:220px"></label>
+    <label>Ollama URL<input id="f_url" style="min-width:320px"></label>
+    <label style="flex-direction:row; align-items:center; gap:6px; align-self:flex-end"><input type="checkbox" id="f_surprise"> surprise me</label>
+    <label id="f_rt_wrap" style="flex-direction:row; align-items:center; gap:6px; align-self:flex-end"><input type="checkbox" id="f_roundtrip"> round-trip gate</label>
+  </div>
+  <div class="row" style="align-items:center">
+    <button class="btn primary" id="genBtn" onclick="submitGen()">Generate</button>
+    <button class="btn" onclick="toggleNew()">Cancel</button>
+    <span class="genstatus" id="genstatus"></span>
+  </div>
+</div>
+
 <div class="controls">
   <select id="category"><option value="">All categories</option></select>
   <select id="difficulty"><option value="">All difficulties</option></select>
@@ -141,6 +248,54 @@ const sel = {category:document.getElementById('category'), difficulty:document.g
 
 function esc(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function fileUrl(name, path, dl){ return '/api/file?name='+encodeURIComponent(name)+'&path='+encodeURIComponent(path)+(dl?'&download=1':''); }
+
+// ---- New challenge form ----
+const F = id => document.getElementById(id);
+async function loadConfig(){
+  const c = await (await fetch('/api/config')).json();
+  for (const g of c.genres){ const o=document.createElement('option'); o.value=o.textContent=g; F('f_genre').appendChild(o); }
+  for (const d of c.difficulties){ const o=document.createElement('option'); o.value=o.textContent=d; F('f_difficulty').appendChild(o); }
+  F('f_difficulty').value='easy';
+  F('f_model').value=c.model; F('f_url').value=c.ollama_url; F('f_attempts').value=c.max_attempts;
+  F('f_genre').addEventListener('change', ()=>{ F('f_rt_wrap').style.display = F('f_genre').value==='reverse' ? 'flex':'none'; });
+}
+function toggleNew(){ F('newpanel').classList.toggle('open'); }
+async function submitGen(){
+  const body = {
+    name:F('f_name').value, genre:F('f_genre').value, difficulty:F('f_difficulty').value,
+    category:F('f_category').value, prompt:F('f_prompt').value, model:F('f_model').value,
+    ollama_url:F('f_url').value, max_attempts:F('f_attempts').value,
+    surprise:F('f_surprise').checked, roundtrip:F('f_roundtrip').checked,
+  };
+  if(!body.name.trim()){ F('genstatus').textContent='Please enter a name.'; return; }
+  F('genBtn').disabled=true; F('genstatus').textContent='Starting…';
+  let res;
+  try { res = await (await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json(); }
+  catch(e){ F('genBtn').disabled=false; F('genstatus').textContent='Request failed: '+e; return; }
+  const jid = res.job_id; let t0=Date.now();
+  const poll = setInterval(async ()=>{
+    const j = await (await fetch('/api/job/'+jid)).json();
+    const secs = Math.round((Date.now()-t0)/1000);
+    if(j.status==='running'){ F('genstatus').textContent=`Generating… ${secs}s (the model writes code, we compile & verify)`; return; }
+    clearInterval(poll); F('genBtn').disabled=false;
+    if(j.status==='done' && j.report){
+      const r=j.report;
+      F('genstatus').textContent = (r.success?'✅ VALID':'❌ FAILED')+` after ${r.attempts_used} attempt(s). `+
+        r.attempts.map(a=>`#${a.index}:${a.stage}`).join('  ');
+      await loadFacetsRefresh();
+      if(r.success) openDetail(r.name);
+    } else { F('genstatus').textContent='Error: '+(j.error||'unknown'); }
+  }, 1500);
+}
+async function loadFacetsRefresh(){ // rebuild filter options then refresh grid
+  for (const k of ['category','difficulty','kind']){ const s=sel[k]; s.innerHTML='<option value="">All '+k+'</option>'; }
+  await loadFacets(); await refresh();
+}
+async function validateChallenge(name){
+  const el=document.getElementById('valresult'); if(el) el.textContent='Validating…';
+  const r = await (await fetch('/api/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})})).json();
+  if(el) el.textContent = r.result || '(no result)';
+}
 
 async function loadFacets(){
   const f = await (await fetch('/api/facets')).json();
@@ -182,6 +337,7 @@ async function openDetail(name){
     <div class="sub"><code>${esc(d.name)}</code> · ${esc(d.category)} · ${esc(d.difficulty)} · ${esc(d.kind)}</div>
     <p>${esc(d.description)}</p>
     <div class="meta">flag: <code>${esc(d.flag)}</code>${d.success_marker?` · success marker: <code>${esc(d.success_marker)}</code>`:''}</div>
+    <div style="margin-top:8px"><button class="btn" onclick="validateChallenge('${esc(name)}')">Re-validate</button> <span class="genstatus" id="valresult"></span></div>
     ${(d.tasks&&d.tasks.length)?`<h4>Questions</h4><ol>${d.tasks.map(t=>`<li>${esc(t.question)} <span class="tag">${esc(t.type||'')}</span></li>`).join('')}</ol>`:''}
     <h4>Player files (download)</h4>
     <div class="files">${player.length? player.map(dl).join('') : '<span class="desc">none</span>'}</div>
@@ -204,6 +360,7 @@ overlay.addEventListener('click', e => { if (e.target===overlay) closeDetail(); 
 document.addEventListener('keydown', e => { if (e.key==='Escape') closeDetail(); });
 
 for (const k in sel) sel[k].addEventListener('input', refresh);
+loadConfig();
 loadFacets().then(refresh);
 </script>
 </body>
@@ -229,6 +386,18 @@ class _Handler(BaseHTTPRequestHandler):
         path, q = parsed.path, parse_qs(parsed.query)
         if path in ("/", "/index.html"):
             self._send(200, _PAGE.encode("utf-8"), "text/html; charset=utf-8")
+        elif path == "/api/config":
+            self._json({
+                "model": DEFAULT_MODEL,
+                "ollama_url": DEFAULT_OLLAMA_URL,
+                "genres": ["reverse", "log"],
+                "difficulties": ["easy", "medium", "hard"],
+                "max_attempts": DEFAULT_MAX_ATTEMPTS,
+            })
+        elif path.startswith("/api/job/"):
+            with _LOCK:
+                job = _JOBS.get(path[len("/api/job/"):])
+            self._json(job or {"status": "unknown"})
         elif path == "/api/facets":
             self._json(catalog.facets())
         elif path == "/api/challenges":
@@ -273,6 +442,29 @@ class _Handler(BaseHTTPRequestHandler):
                     ctype = "text/plain; charset=utf-8"
                 extra = None
             self._send(200, data, ctype, extra)
+        else:
+            self._send(404, b"not found", "text/plain")
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw or b"{}")
+        except Exception:
+            self._send(400, b"bad json", "text/plain"); return
+
+        if parsed.path == "/api/generate":
+            job_id = uuid4().hex
+            with _LOCK:
+                _JOBS[job_id] = {"status": "running", "report": None, "error": None}
+            threading.Thread(target=_run_generate_job, args=(job_id, payload), daemon=True).start()
+            self._json({"job_id": job_id})
+        elif parsed.path == "/api/validate":
+            d = _challenge_dir(_safe_name(payload.get("name", "")) or "")
+            if d is None:
+                self._send(404, b"not found", "text/plain"); return
+            self._json({"result": validate_challenge(d)})
         else:
             self._send(404, b"not found", "text/plain")
 

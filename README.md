@@ -161,12 +161,19 @@ python main.py list --kind check --difficulty easy
 python main.py list --search xor --json
 ```
 
-Or open the **web GUI** (standard library only — no extra install) to browse
-and filter by category, difficulty and kind in your browser:
+Or open the **web GUI** (standard library only — no extra install):
 
 ```bash
 python main.py web            # serves http://127.0.0.1:8000 and opens it
 ```
+
+From the browser you can: browse and filter by category / difficulty / kind;
+open a challenge to see its flag(s), download the player files, and reveal how
+it is built (C source / encoder / extractors); re-validate it; and **generate a
+new challenge** with the *＋ New challenge* form (pick genre, difficulty, prompt,
+model and Ollama URL — it runs the same self-verifying pipeline and streams the
+attempt status). The server binds to `127.0.0.1` and runs the model-written code
+locally, just like the CLI.
 
 ## How a challenge is verified
 

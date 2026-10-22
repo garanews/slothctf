@@ -6,6 +6,36 @@ from unittest import mock
 from slothctf import web
 
 
+class GenerateFormTests(unittest.TestCase):
+    def test_safe_name(self):
+        self.assertEqual(web._safe_name("my_challenge"), "my_challenge")
+        self.assertIsNone(web._safe_name(""))
+        self.assertIsNone(web._safe_name("a/b"))
+        self.assertIsNone(web._safe_name("..\\x"))
+        self.assertIsNone(web._safe_name("x" * 65))
+
+    def test_build_generate_kwargs(self):
+        k = web._build_generate_kwargs({
+            "name": "c1", "genre": "log", "difficulty": "hard", "prompt": "p",
+            "model": "m", "ollama_url": "http://h", "max_attempts": "7",
+            "category": "forensics", "roundtrip": True, "surprise": False,
+        })
+        self.assertEqual(k["name"], "c1")
+        self.assertEqual(k["genre"], "log")
+        self.assertEqual(k["difficulty"], "hard")
+        self.assertEqual(k["max_attempts"], 7)
+        self.assertEqual(k["challenge_type"], "forensics")
+        self.assertFalse(k["roundtrip"])  # roundtrip only applies to reverse
+
+    def test_build_generate_kwargs_defaults_and_validation(self):
+        with self.assertRaises(ValueError):
+            web._build_generate_kwargs({"name": "bad/name"})
+        k = web._build_generate_kwargs({"name": "c2", "genre": "reverse", "roundtrip": True, "difficulty": "nope"})
+        self.assertEqual(k["genre"], "reverse")
+        self.assertTrue(k["roundtrip"])
+        self.assertEqual(k["difficulty"], "easy")  # invalid -> default
+
+
 class ClassifyTests(unittest.TestCase):
     def test_author_vs_player(self):
         self.assertEqual(web._classify("organizer/encoder.c"), "author")
