@@ -55,6 +55,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="How many generate->compile->solve->fix rounds to allow before giving up "
         "(raise it on a bigger machine / larger model)",
     )
+    gen.add_argument(
+        "--roundtrip",
+        action="store_true",
+        help="(reverse genre) also require decode(encode(x))==x on random inputs, not just "
+        "the chosen flag — proves the transform is a true inverse in general",
+    )
 
     validate = subparsers.add_parser("validate", help="Validate a generated challenge")
     validate.add_argument("--dir", required=True, help="Challenge directory to validate")
@@ -101,6 +107,7 @@ def main() -> None:
                 max_attempts=args.max_attempts,
                 ollama_url=args.ollama_url,
                 genre=args.genre,
+                roundtrip=args.roundtrip,
                 return_report=True,
             )
         except GenerationError as exc:

@@ -157,7 +157,7 @@ class GenerationLoopTests(unittest.TestCase):
 
     def test_succeeds_on_first_attempt(self):
         good = {"encoder_code": "int main(){}", "challenge_code": "int main(){}", "flag": "sloth{x}"}
-        report = self._run([good], lambda b, d, c: AttemptResult(0, True, "passed", "flag recovered"))
+        report = self._run([good], lambda *a, **k: AttemptResult(0, True, "passed", "flag recovered"))
         self.assertTrue(report.success)
         self.assertEqual(report.attempts_used, 1)
 
@@ -167,7 +167,7 @@ class GenerationLoopTests(unittest.TestCase):
             AttemptResult(0, False, "challenge-compile", "gcc failed"),
             AttemptResult(0, True, "passed", "ok"),
         ])
-        report = self._run([payload, payload], lambda b, d, c: next(outcomes))
+        report = self._run([payload, payload], lambda *a, **k: next(outcomes))
         self.assertTrue(report.success)
         self.assertEqual(report.attempts_used, 2)
         self.assertEqual(report.attempts[0].stage, "challenge-compile")
@@ -176,7 +176,7 @@ class GenerationLoopTests(unittest.TestCase):
         payload = {"encoder_code": "e", "challenge_code": "c", "flag": "sloth{z}"}
         report = self._run(
             [payload],
-            lambda b, d, c: AttemptResult(0, False, "flag-mismatch", "nope"),
+            lambda *a, **k: AttemptResult(0, False, "flag-mismatch", "nope"),
             max_attempts=3,
         )
         self.assertFalse(report.success)
@@ -184,7 +184,7 @@ class GenerationLoopTests(unittest.TestCase):
 
     def test_missing_schema_field_is_fed_back(self):
         bad = {"encoder_code": "e"}  # no challenge_code
-        report = self._run([bad], lambda b, d, c: AttemptResult(0, True, "passed"), max_attempts=2)
+        report = self._run([bad], lambda *a, **k: AttemptResult(0, True, "passed"), max_attempts=2)
         self.assertFalse(report.success)
         self.assertEqual(report.attempts[0].stage, "bad-schema")
 

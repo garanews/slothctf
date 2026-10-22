@@ -106,6 +106,13 @@ Other flags: `--category <hint>`, `--difficulty easy|medium|hard`,
 (raise it on a bigger machine). `SLOTHCTF_OLLAMA_URL` sets the endpoint for the
 whole shell.
 
+`--roundtrip` (reverse genre) adds a stronger correctness gate: after the chosen
+flag verifies, the pipeline re-runs encode→inject→compile→decode on several
+random inputs and requires `decode(encode(x)) == x` for each. This catches a
+transform that only inverts the chosen flag but isn't a true inverse in general
+(byte overflow, signed/unsigned or modulo edges) — the classic "perfect-looking
+function, constant off by one" bug.
+
 ## What gets generated
 
 ```text

@@ -732,15 +732,20 @@ def _parse_encoder_output(text: str) -> str | None:
     return ", ".join(t.lower() for t in tokens)
 
 
-def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str) -> AttemptResult:
+def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str, roundtrip: bool = False) -> AttemptResult:
     """Build and self-check a challenge using the model's own encoder.
 
     Pipeline: compile+run the encoder on the flag to get the exact encoded
     bytes (the machine does the arithmetic the LLM is bad at), inject them into
     challenge_code, compile+run the challenge, and confirm it prints the flag
     and does not leak it. Each failure returns actionable feedback for the model.
+
+    With `roundtrip`, after the instance passes we re-run the whole pipeline on
+    several random inputs and require decode(encode(x)) == x for each — proving
+    the transform is a true inverse in general, not just for this one flag.
     """
     expected = data["flag"]
+    template = str(data.get("challenge_code", ""))  # pre-injection, for round-trip
     src_dir = base_dir / "src"
     bin_dir = base_dir / "bin"
     org_dir = base_dir / "organizer"
@@ -838,7 +843,70 @@ def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str) -> At
             "encoded/target array must be embedded; do not keep the secret as a literal.",
         )
 
-    return AttemptResult(0, True, "passed", f"{kind} verified: {expected}")
+    # 7. Optional: prove the transform is a true inverse for MANY inputs, not
+    #    just this flag — re-run encode→inject→compile→decode on random inputs.
+    if roundtrip:
+        rt = _roundtrip_check(base_dir, template, encoder_bin, compiler, kind,
+                              str(data.get("success_marker", "")).strip())
+        if rt is not None:
+            return rt
+
+    return AttemptResult(0, True, "passed", f"{kind} verified: {expected}"
+                         + (" (+round-trip)" if roundtrip else ""))
+
+
+def _roundtrip_check(base_dir: Path, template: str, encoder_bin: Path, compiler: str,
+                     kind: str, marker: str, n: int = 4) -> AttemptResult | None:
+    """Re-run the pipeline on random inputs; return a failure AttemptResult if
+    decode(encode(x)) != x for any, else None. Reuses the real encoder and the
+    challenge template (no extra model code), so it tests the actual transform."""
+    import random
+    import string
+    src_dir = base_dir / "src"
+    bin_dir = base_dir / "bin"
+    rt_src = src_dir / "_roundtrip.c"
+    alphabet = string.ascii_letters + string.digits + "_-"
+    try:
+        for _ in range(n):
+            inner = "".join(random.choice(alphabet) for _ in range(random.randint(3, 20)))
+            x = f"sloth{{{inner}}}"
+            try:
+                ran, out, _ = _run_binary(encoder_bin, [x])
+            except subprocess.TimeoutExpired:
+                return AttemptResult(0, False, "roundtrip", "encoder timed out on a random input.")
+            body = _parse_encoder_output(out)
+            if not ran or not body:
+                return AttemptResult(0, False, "roundtrip",
+                                     f"encoder produced no bytes for random input {x!r}.")
+            rt_src.write_text(template.replace(ENCODED_PLACEHOLDER, body), encoding="utf-8")
+            ok, stderr, rt_bin = _compile_binary(rt_src, bin_dir / "_roundtrip", compiler)
+            if not ok:
+                return AttemptResult(0, False, "roundtrip",
+                                     f"challenge did not compile for random input {x!r}:\n{stderr[:200]}")
+            try:
+                if kind == "check":
+                    _, good, _ = _run_binary(rt_bin, stdin_text=x + "\n")
+                    if marker not in good:
+                        return AttemptResult(
+                            0, False, "roundtrip",
+                            f"random input {x!r} is NOT accepted — your transform is not a true "
+                            "inverse for all inputs (it only works for the chosen flag). Check for "
+                            "byte overflow / signed-unsigned / modulo edges.")
+                else:
+                    _, o, _ = _run_binary(rt_bin)
+                    if o.strip() != x:
+                        return AttemptResult(
+                            0, False, "roundtrip",
+                            f"decode(encode({x!r})) = {o.strip()[:80]!r} != {x!r} — your transform "
+                            "is not a true inverse for all inputs (byte overflow / signed-unsigned / "
+                            "modulo edges), it only happens to work for the chosen flag.")
+            except subprocess.TimeoutExpired:
+                return AttemptResult(0, False, "roundtrip", f"challenge timed out on random input {x!r}.")
+        return None
+    finally:
+        rt_src.unlink(missing_ok=True)
+        for ext in ("", ".exe"):
+            (bin_dir / f"_roundtrip{ext}").unlink(missing_ok=True)
 
 
 def _run_python(script: Path, args: list[str], timeout: float = 20.0) -> tuple[bool, str, str]:
@@ -986,6 +1054,7 @@ def generate_challenge(
     ollama_url: str = DEFAULT_OLLAMA_URL,
     target_platform: str | None = None,
     genre: str = "reverse",
+    roundtrip: bool = False,
     *,
     caller: Callable[[str, str], dict[str, Any]] | None = None,
     return_report: bool = False,
@@ -1033,7 +1102,8 @@ def generate_challenge(
         schema, required, verify_fn = _SCHEMA_RULES_LOG, ("generator_code", "tasks"), _verify_log_challenge
         compiler = None  # log challenges are Python, no C compiler needed
     else:
-        schema, required, verify_fn = _SCHEMA_RULES, ("encoder_code", "challenge_code"), _verify_challenge
+        schema, required = _SCHEMA_RULES, ("encoder_code", "challenge_code")
+        verify_fn = lambda b, d, c: _verify_challenge(b, d, c, roundtrip=roundtrip)  # noqa: E731
         compiler = _find_compiler()
         if compiler is None:
             raise GenerationError(
