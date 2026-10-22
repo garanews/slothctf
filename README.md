@@ -106,12 +106,23 @@ Other flags: `--category <hint>`, `--difficulty easy|medium|hard`,
 (raise it on a bigger machine). `SLOTHCTF_OLLAMA_URL` sets the endpoint for the
 whole shell.
 
-`--roundtrip` (reverse genre) adds a stronger correctness gate: after the chosen
-flag verifies, the pipeline re-runs encode→inject→compile→decode on several
-random inputs and requires `decode(encode(x)) == x` for each. This catches a
-transform that only inverts the chosen flag but isn't a true inverse in general
-(byte overflow, signed/unsigned or modulo edges) — the classic "perfect-looking
-function, constant off by one" bug.
+### Round-trip correctness gate (`--roundtrip`)
+
+For reverse challenges, after the chosen flag verifies, `--roundtrip` re-runs the
+real pipeline (encode → inject → compile → decode) on several **random** inputs
+and requires `decode(encode(x)) == x` for each:
+
+```bash
+python main.py generate --name xor_demo --roundtrip \
+  --prompt "Create an easy reverse engineering challenge with XOR encryption" \
+  --model qwen2.5-coder:32b
+```
+
+This catches a transform that only inverts the chosen flag but isn't a true
+inverse in general (byte overflow, signed/unsigned or modulo edges) — the classic
+"perfect-looking function, constant off by one" bug. It reuses the model's actual
+encoder and challenge (no model-written test), so it checks the real transform.
+([Idea from a reader on the write-up.](https://dev.to/garanews/i-was-too-lazy-to-write-ctf-challenges-so-i-built-a-local-ai-that-writes-compiles-and-checks-its-1927))
 
 ## What gets generated
 
