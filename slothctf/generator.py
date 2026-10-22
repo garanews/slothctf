@@ -543,10 +543,14 @@ def _write_challenge_files(base_dir: Path, data: dict[str, Any]) -> None:
     if data.get("challenge_kind") == "check":
         meta["success_marker"] = data.get("success_marker", "Access Granted")
     if data.get("challenge_kind") == "log":
+        kept = data.get("tasks", [])
         meta["tasks"] = [
             {k: t.get(k) for k in ("question", "answer", "type", "evidence_line") if k in t}
-            for t in data.get("tasks", [])
+            for t in kept
         ]
+        # The flag summary must reflect the tasks actually KEPT (after per-task
+        # acceptance dropped the broken ones), not the count the model proposed.
+        meta["flag"] = f"{len(kept)} task(s)"
     if data.get("generation"):
         meta["generation"] = data["generation"]
     (base_dir / "challenge.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
