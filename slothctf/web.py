@@ -190,7 +190,7 @@ def _safe_file(name: str, rel: str) -> Path | None:
     return target if target.is_file() else None
 
 
-_PAGE = """<!doctype html>
+_PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
