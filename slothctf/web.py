@@ -187,6 +187,15 @@ _PAGE = """<!doctype html>
   .close { float:right; }
   pre { background:#000; border:1px solid var(--line); border-radius:8px; padding:12px; overflow:auto; max-height:360px; font-size:12.5px; }
   .filebtn { background:none; border:none; color:var(--accent); cursor:pointer; font:inherit; padding:0; margin:2px 12px 2px 0; }
+  .panels { display:flex; flex-direction:column; gap:8px; }
+  details.fp { border:1px solid var(--line); border-radius:8px; background:var(--card); overflow:hidden; }
+  details.fp > summary { cursor:pointer; padding:8px 12px; font-size:13px; color:var(--fg); user-select:none; list-style:none; }
+  details.fp > summary::-webkit-details-marker { display:none; }
+  details.fp > summary::before { content:'▸ '; color:var(--muted); }
+  details.fp[open] > summary::before { content:'▾ '; }
+  details.fp > summary a { color:var(--accent); font-size:12px; margin-left:8px; }
+  details.fp .fpbody { margin:0; border:0; border-top:1px solid var(--line); border-radius:0; max-height:420px; }
+  a.dlrow { color:var(--accent); display:block; padding:6px 0; }
   .btn.primary { background:var(--accent); color:#06240a; border-color:var(--accent); font-weight:600; }
   #newpanel { display:none; padding:16px 24px; border-bottom:1px solid var(--line); background:var(--card); }
   #newpanel.open { display:block; }
@@ -323,14 +332,26 @@ async function refresh(){
   }
 }
 
+// An embedded file viewer: text files open inline in their own panel (lazy
+// loaded), binaries show a download link.
+function filePanel(name, f, open){
+  if(!f.text) return `<a class="dlrow" href="${fileUrl(name,f.path,1)}">⬇ ${esc(f.path)} (${f.size} B)</a>`;
+  return `<details class="fp" data-name="${esc(name)}" data-path="${esc(f.path)}" ${open?'open':''}>
+    <summary>${esc(f.path)} <a href="${fileUrl(name,f.path,1)}" onclick="event.stopPropagation()">download</a></summary>
+    <pre class="fpbody">loading…</pre></details>`;
+}
+async function loadPanel(p){
+  if(p.dataset.loaded) return; p.dataset.loaded='1';
+  const body=p.querySelector('.fpbody');
+  try { body.textContent = await (await fetch(fileUrl(p.dataset.name,p.dataset.path,0))).text(); }
+  catch(e){ body.textContent='(failed to load)'; }
+}
 async function openDetail(name){
   const d = await (await fetch('/api/challenge/'+encodeURIComponent(name))).json();
   const player = d.files.filter(f=>f.group==='player');
   const author = d.files.filter(f=>f.group==='author');
-  const dl = f => `<a href="${fileUrl(name,f.path,1)}">${esc(f.path)}</a>`;
-  const view = f => f.text
-      ? `<button class="filebtn" onclick="viewFile('${esc(name)}','${esc(f.path)}')">${esc(f.path)}</button>`
-      : `<a href="${fileUrl(name,f.path,1)}">${esc(f.path)} (download)</a>`;
+  // open the main artifacts by default: README and the evidence log / binary note
+  const preferOpen = f => /(^|\/)(README\.md)$/i.test(f.path) || /\.log$/i.test(f.path);
   modal.innerHTML = `
     <button class="btn close" onclick="closeDetail()">✕ close</button>
     <h2>${esc(d.title)}</h2>
@@ -339,22 +360,22 @@ async function openDetail(name){
     <div class="meta">flag: <code>${esc(d.flag)}</code>${d.success_marker?` · success marker: <code>${esc(d.success_marker)}</code>`:''}</div>
     <div style="margin-top:8px"><button class="btn" onclick="validateChallenge('${esc(name)}')">Re-validate</button> <span class="genstatus" id="valresult"></span></div>
     ${(d.tasks&&d.tasks.length)?`<h4>Questions</h4><ol>${d.tasks.map(t=>`<li>${esc(t.question)} <span class="tag">${esc(t.type||'')}</span></li>`).join('')}</ol>`:''}
-    <h4>Player files (download)</h4>
-    <div class="files">${player.length? player.map(dl).join('') : '<span class="desc">none</span>'}</div>
+    <h4>Player files</h4>
+    <div class="panels">${player.length? player.map(f=>filePanel(name,f,preferOpen(f))).join('') : '<span class="desc">none</span>'}</div>
     <h4>How the flag is built <button class="btn" id="revealBtn" onclick="toggleReveal()">reveal ▸</button></h4>
     <div id="reveal" style="display:none">
       ${(d.tasks&&d.tasks.length)?`<p>Answers:</p><ul>${d.tasks.map((t,i)=>`<li><b>${i+1}.</b> <code>${esc(t.answer)}</code> <span class="tag">${esc(t.type||'')}</span>${t.evidence_line?` · line ${esc(String(t.evidence_line))}`:''}</li>`).join('')}</ul>`:''}
-      <div class="files">${author.map(view).join('')}</div>
-      <pre id="viewer" style="display:none"></pre>
+      <div class="panels">${author.map(f=>filePanel(name,f,false)).join('')}</div>
     </div>`;
+  // wire lazy loading + load the ones opened by default
+  modal.querySelectorAll('details.fp').forEach(p=>{
+    p.addEventListener('toggle',()=>{ if(p.open) loadPanel(p); });
+    if(p.open) loadPanel(p);
+  });
   overlay.classList.add('open');
 }
 function toggleReveal(){ const r=document.getElementById('reveal'); const b=document.getElementById('revealBtn');
   const open = r.style.display==='none'; r.style.display=open?'block':'none'; b.textContent=open?'hide ▾':'reveal ▸'; }
-async function viewFile(name, path){
-  const txt = await (await fetch(fileUrl(name,path,0))).text();
-  const v = document.getElementById('viewer'); v.style.display='block'; v.textContent = txt; v.scrollIntoView({behavior:'smooth',block:'nearest'});
-}
 function closeDetail(){ overlay.classList.remove('open'); }
 overlay.addEventListener('click', e => { if (e.target===overlay) closeDetail(); });
 document.addEventListener('keydown', e => { if (e.key==='Escape') closeDetail(); });
