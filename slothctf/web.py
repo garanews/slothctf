@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import shutil
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -196,7 +197,9 @@ _PAGE = """<!doctype html>
 <title>SlothCTF Catalog</title>
 <style>
   :root { color-scheme: light dark; --bg:#0f1115; --card:#1a1d24; --fg:#e8eaed;
-          --muted:#9aa0aa; --accent:#8bd450; --line:#2a2e37; }
+          --muted:#9aa0aa; --accent:#8bd450; --line:#2a2e37; --codebg:#000; --codefg:#e8eaed; }
+  :root[data-theme="light"] { color-scheme: light; --bg:#f5f7fa; --card:#ffffff; --fg:#1b1f24;
+          --muted:#5b6673; --accent:#2e7d32; --line:#dfe3e8; --codebg:#0f172a; --codefg:#e8eaed; }
   * { box-sizing: border-box; }
   body { margin:0; font:15px/1.5 system-ui,Segoe UI,sans-serif; background:var(--bg); color:var(--fg); }
   header { padding:20px 24px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
@@ -216,20 +219,20 @@ _PAGE = """<!doctype html>
   .meta { margin-top:10px; font-size:12px; color:var(--muted); }
   .hit { font-size:12px; margin:4px 0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .hit .hitloc { color:var(--accent); margin-right:6px; }
-  code { background:#000; padding:1px 5px; border-radius:5px; font-size:12px; }
+  code { background:var(--codebg); color:var(--codefg); padding:1px 5px; border-radius:5px; font-size:12px; }
   .empty { color:var(--muted); padding:40px 24px; }
   /* modal */
   .overlay { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:flex-start; justify-content:center; padding:40px 16px; overflow:auto; }
   .overlay.open { display:flex; }
-  .modal { background:var(--bg); border:1px solid var(--line); border-radius:14px; max-width:860px; width:100%; padding:22px 24px; }
+  .modal { background:var(--bg); border:1px solid var(--line); border-radius:14px; max-width:min(1200px,96vw); width:100%; padding:22px 24px; }
   .modal h2 { margin:0 0 4px; } .modal .sub { color:var(--muted); margin-bottom:14px; }
   .modal h4 { margin:18px 0 8px; border-bottom:1px solid var(--line); padding-bottom:4px; }
   .files a { color:var(--accent); display:inline-block; margin:2px 12px 2px 0; }
   .btn { background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:6px 12px; cursor:pointer; font:inherit; }
   .close { float:right; }
-  pre { background:#000; border:1px solid var(--line); border-radius:8px; padding:12px; overflow:auto; max-height:360px; font-size:12.5px; }
+  pre { background:var(--codebg); color:var(--codefg); border:1px solid var(--line); border-radius:8px; padding:12px; overflow:auto; max-height:360px; font-size:12.5px; }
   .filebtn { background:none; border:none; color:var(--accent); cursor:pointer; font:inherit; padding:0; margin:2px 12px 2px 0; }
-  .panels { display:flex; flex-direction:column; gap:8px; }
+  .panels { display:grid; grid-template-columns:repeat(auto-fill,minmax(460px,1fr)); gap:10px; align-items:start; }
   details.fp { border:1px solid var(--line); border-radius:8px; background:var(--card); overflow:hidden; }
   details.fp > summary { cursor:pointer; padding:8px 12px; font-size:13px; color:var(--fg); user-select:none; list-style:none; }
   details.fp > summary::-webkit-details-marker { display:none; }
@@ -252,7 +255,8 @@ _PAGE = """<!doctype html>
 <header>
   <h1><span class="sloth">🦥</span> SlothCTF Catalog</h1>
   <span class="count" id="count"></span>
-  <button class="btn primary" id="newBtn" style="margin-left:auto" onclick="toggleNew()">＋ New challenge</button>
+  <button class="btn" id="themeBtn" style="margin-left:auto" onclick="toggleTheme()">◐ theme</button>
+  <button class="btn primary" id="newBtn" onclick="toggleNew()">＋ New challenge</button>
 </header>
 
 <div id="newpanel">
@@ -283,6 +287,7 @@ _PAGE = """<!doctype html>
   <select id="category"><option value="">All categories</option></select>
   <select id="difficulty"><option value="">All difficulties</option></select>
   <select id="kind"><option value="">All kinds</option></select>
+  <select id="model"><option value="">All models</option></select>
   <select id="sort" title="Sort order">
     <option value="created_desc">Newest first</option>
     <option value="created_asc">Oldest first</option>
@@ -303,7 +308,12 @@ _PAGE = """<!doctype html>
 const grid = document.getElementById('grid'), count = document.getElementById('count');
 const overlay = document.getElementById('overlay'), modal = document.getElementById('modal');
 const sel = {category:document.getElementById('category'), difficulty:document.getElementById('difficulty'),
-             kind:document.getElementById('kind'), search:document.getElementById('search')};
+             kind:document.getElementById('kind'), model:document.getElementById('model'),
+             search:document.getElementById('search')};
+function toggleTheme(){ const r=document.documentElement;
+  const t = r.dataset.theme==='light' ? 'dark' : 'light'; r.dataset.theme=t;
+  try{ localStorage.setItem('sloththeme', t); }catch(e){} }
+try{ const saved=localStorage.getItem('sloththeme'); if(saved) document.documentElement.dataset.theme=saved; }catch(e){}
 
 function esc(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function fileUrl(name, path, dl){ return '/api/file?name='+encodeURIComponent(name)+'&path='+encodeURIComponent(path)+(dl?'&download=1':''); }
@@ -347,7 +357,8 @@ async function submitGen(){
   }, 1500);
 }
 async function loadFacetsRefresh(){ // rebuild filter options then refresh grid
-  for (const k of ['category','difficulty','kind']){ const s=sel[k]; s.innerHTML='<option value="">All '+k+'</option>'; }
+  const labels={category:'All categories',difficulty:'All difficulties',kind:'All kinds',model:'All models'};
+  for (const k of ['category','difficulty','kind','model']){ const v=sel[k].value; sel[k].innerHTML='<option value="">'+labels[k]+'</option>'; }
   await loadFacets(); await refresh();
 }
 async function validateChallenge(name){
@@ -355,11 +366,17 @@ async function validateChallenge(name){
   const r = await (await fetch('/api/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})})).json();
   if(el) el.textContent = r.result || '(no result)';
 }
+async function deleteChallenge(name){
+  if(!confirm('Delete challenge "'+name+'"? This removes its folder from disk and cannot be undone.')) return;
+  const r = await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  if(r.ok){ closeDetail(); await loadFacetsRefresh(); }
+  else { const el=document.getElementById('valresult'); if(el) el.textContent='Delete failed.'; }
+}
 
 async function loadFacets(){
   const f = await (await fetch('/api/facets')).json();
-  for (const key of ['category','difficulty','kind'])
-    for (const v of f[key]) { const o=document.createElement('option'); o.value=v; o.textContent=v; sel[key].appendChild(o); }
+  for (const key of ['category','difficulty','kind','model'])
+    for (const v of (f[key]||[])) { const o=document.createElement('option'); o.value=v; o.textContent=v; sel[key].appendChild(o); }
 }
 function fmtDate(ts){ try{ return ts? new Date(ts*1000).toLocaleString() : ''; }catch(e){ return ''; } }
 
@@ -369,7 +386,7 @@ async function refresh(){
     return refreshCode(term);
   }
   const q = new URLSearchParams();
-  for (const k of ['category','difficulty','kind','search']) if (sel[k].value) q.set(k, sel[k].value);
+  for (const k of ['category','difficulty','kind','model','search']) if (sel[k].value) q.set(k, sel[k].value);
   q.set('sort', document.getElementById('sort').value);
   const rows = await (await fetch('/api/challenges?'+q)).json();
   count.textContent = rows.length + ' challenge' + (rows.length===1?'':'s');
@@ -381,6 +398,7 @@ async function refresh(){
         <span class="tag kind">${esc(r.kind)}</span>
         <span class="tag">${esc(r.category)}</span>
         <span class="tag">${esc(r.difficulty)}</span>
+        ${r.model? '<span class="tag" title="model">'+esc(r.model)+'</span>':''}
         ${r.built? '<span class="tag">built</span>':''}
       </div>
       <div class="desc"><code>${esc(r.name)}</code></div>
@@ -428,7 +446,9 @@ async function openDetail(name){
     <div class="sub"><code>${esc(d.name)}</code> · ${esc(d.category)} · ${esc(d.difficulty)} · ${esc(d.kind)}</div>
     <p>${esc(d.description)}</p>
     <div class="meta">flag: <code>${esc(d.flag)}</code>${d.success_marker?` · success marker: <code>${esc(d.success_marker)}</code>`:''}</div>
-    <div style="margin-top:8px"><button class="btn" onclick="validateChallenge('${esc(name)}')">Re-validate</button> <span class="genstatus" id="valresult"></span></div>
+    <div style="margin-top:8px"><button class="btn" onclick="validateChallenge('${esc(name)}')">Re-validate</button>
+      <button class="btn" style="border-color:#b4433a;color:#e07a72" onclick="deleteChallenge('${esc(name)}')">🗑 Delete</button>
+      <span class="genstatus" id="valresult"></span></div>
     ${(d.generation&&d.generation.prompt!==undefined)?`<h4>Generated from</h4>
       <pre style="max-height:160px">${esc(d.generation.prompt||'(none)')}</pre>
       <div class="meta">genre: <code>${esc(d.generation.genre||'')}</code> · model: <code>${esc(d.generation.model||'')}</code> · difficulty: <code>${esc(d.generation.difficulty||'')}</code>${d.generation.roundtrip?' · round-trip':''}${d.generation.surprise?' · surprise':''}${d.generation.input?` · input: <code>${esc(d.generation.input)}</code>`:''}</div>`:''}
@@ -503,6 +523,7 @@ class _Handler(BaseHTTPRequestHandler):
                 kind=(q.get("kind") or [None])[0],
                 search=(q.get("search") or [None])[0],
                 sort=(q.get("sort") or [None])[0],
+                model=(q.get("model") or [None])[0],
             ))
         elif path == "/api/search_code":
             self._json(_search_code((q.get("q") or [""])[0]))
@@ -565,6 +586,16 @@ class _Handler(BaseHTTPRequestHandler):
             if d is None:
                 self._send(404, b"not found", "text/plain"); return
             self._json({"result": validate_challenge(d)})
+        elif parsed.path == "/api/delete":
+            d = _challenge_dir(_safe_name(payload.get("name", "")) or "")
+            if d is None:
+                self._send(404, b"not found", "text/plain"); return
+            try:
+                shutil.rmtree(d)
+                catalog.index_generated()  # prune the row
+                self._json({"ok": True})
+            except Exception as exc:
+                self._send(500, str(exc).encode(), "text/plain")
         else:
             self._send(404, b"not found", "text/plain")
 

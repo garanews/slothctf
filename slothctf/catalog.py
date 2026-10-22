@@ -24,12 +24,16 @@ CREATE TABLE IF NOT EXISTS challenges (
     flag           TEXT,
     success_marker TEXT,
     path           TEXT,
+    model          TEXT,               -- model that generated it (from challenge.json)
     built          INTEGER,            -- 1 if a compiled binary is present
     valid          INTEGER,            -- 1/0 if known-good/bad, NULL if unknown
     created_at     REAL,
     indexed_at     REAL
 );
 """
+
+# Columns added after the first release, applied to existing DBs on connect.
+_MIGRATIONS = [("model", "TEXT")]
 
 
 def connect(db_path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
@@ -38,6 +42,11 @@ def connect(db_path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute(_SCHEMA)
+    for col, typ in _MIGRATIONS:
+        try:
+            conn.execute(f"ALTER TABLE challenges ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass  # already there
     conn.commit()
     return conn
 
@@ -64,6 +73,7 @@ def _row_from_dir(challenge_dir: Path) -> dict[str, Any] | None:
         "flag": meta.get("flag", ""),
         "success_marker": meta.get("success_marker", ""),
         "path": str(challenge_dir),
+        "model": (meta.get("generation") or {}).get("model", ""),
         "built": 1 if _binary_present(challenge_dir) else 0,
         "created_at": meta_path.stat().st_mtime,
     }
@@ -74,15 +84,15 @@ def _upsert(conn: sqlite3.Connection, row: dict[str, Any], valid: int | None) ->
         """
         INSERT INTO challenges
             (name, title, category, difficulty, kind, flag, success_marker,
-             path, built, valid, created_at, indexed_at)
+             path, model, built, valid, created_at, indexed_at)
         VALUES
             (:name, :title, :category, :difficulty, :kind, :flag, :success_marker,
-             :path, :built, :valid, :created_at, :indexed_at)
+             :path, :model, :built, :valid, :created_at, :indexed_at)
         ON CONFLICT(name) DO UPDATE SET
             title=excluded.title, category=excluded.category,
             difficulty=excluded.difficulty, kind=excluded.kind, flag=excluded.flag,
             success_marker=excluded.success_marker, path=excluded.path,
-            built=excluded.built, created_at=excluded.created_at,
+            model=excluded.model, built=excluded.built, created_at=excluded.created_at,
             indexed_at=excluded.indexed_at,
             -- keep a known valid/invalid verdict unless a new one is given
             valid=COALESCE(excluded.valid, challenges.valid)
@@ -150,6 +160,7 @@ def query(
     valid: bool | None = None,
     search: str | None = None,
     sort: str | None = None,
+    model: str | None = None,
     db_path: str | Path = DEFAULT_DB,
 ) -> list[dict[str, Any]]:
     conn = connect(db_path)
@@ -162,6 +173,8 @@ def query(
             sql += " AND lower(difficulty) = lower(?)"; params.append(difficulty)
         if kind:
             sql += " AND kind = ?"; params.append(kind)
+        if model:
+            sql += " AND model = ?"; params.append(model)
         if valid is not None:
             sql += " AND valid = ?"; params.append(int(valid))
         if search:
@@ -183,6 +196,7 @@ def facets(db_path: str | Path = DEFAULT_DB) -> dict[str, list[str]]:
                 f"SELECT DISTINCT {name} AS v FROM challenges WHERE {name} <> '' ORDER BY v"
             ).fetchall()
             return [r["v"] for r in rows]
-        return {"category": col("category"), "difficulty": col("difficulty"), "kind": col("kind")}
+        return {"category": col("category"), "difficulty": col("difficulty"),
+                "kind": col("kind"), "model": col("model")}
     finally:
         conn.close()

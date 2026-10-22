@@ -78,6 +78,21 @@ class CatalogTests(unittest.TestCase):
         by_diff = [r["difficulty"] for r in catalog.query(sort="difficulty", db_path=self.db)]
         self.assertEqual(by_diff, ["easy", "medium", "hard"])
 
+    def test_model_column_and_filter(self):
+        import json
+        d = self.base / "withmodel"
+        (d / "bin").mkdir(parents=True)
+        (d / "challenge.json").write_text(json.dumps({
+            "title": "m", "category": "Reverse Engineering", "difficulty": "easy",
+            "flag": "sloth{x}", "challenge_kind": "decode",
+            "generation": {"model": "qwen2.5-coder:32b"},
+        }), encoding="utf-8")
+        _make_challenge(self.base, "nomodel")
+        catalog.index_generated(self.base, self.db)
+        rows = catalog.query(model="qwen2.5-coder:32b", db_path=self.db)
+        self.assertEqual([r["name"] for r in rows], ["withmodel"])
+        self.assertIn("qwen2.5-coder:32b", catalog.facets(self.db)["model"])
+
     def test_facets(self):
         _make_challenge(self.base, "a", category="Reverse Engineering", difficulty="easy")
         _make_challenge(self.base, "b", category="Cryptography", difficulty="hard", challenge_kind="check")
