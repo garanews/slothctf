@@ -3,7 +3,21 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from slothctf import validator
 from slothctf.validator import _flag_leaks, validate_challenge
+
+_HAS_GCC = validator._find_compiler() is not None
+
+
+def _make_reverse(base: Path, challenge_c: str, flag: str):
+    (base / "src").mkdir(parents=True)
+    (base / "src" / "challenge.c").write_text(challenge_c, encoding="utf-8")
+    (base / "README.md").write_text("r", encoding="utf-8")
+    (base / "solution.md").write_text("s", encoding="utf-8")
+    (base / "challenge.json").write_text(json.dumps({
+        "title": "t", "category": "Reverse Engineering", "difficulty": "easy",
+        "flag": flag, "challenge_kind": "decode",
+    }), encoding="utf-8")
 
 
 class LeakCheckTests(unittest.TestCase):
@@ -17,6 +31,30 @@ class LeakCheckTests(unittest.TestCase):
             b = Path(tmp) / "bin"
             b.write_bytes(b"\xde\xad\xbe\xef only encoded bytes here")
             self.assertFalse(_flag_leaks(b, "sloth{hidden}"))
+
+    def test_flag_leaks_raises_when_unreadable(self):
+        with TemporaryDirectory() as tmp:
+            self.assertRaises(OSError, _flag_leaks, Path(tmp) / "nope", "sloth{x}")
+
+    @unittest.skipUnless(_HAS_GCC, "needs a C compiler")
+    def test_validate_full_path_catches_leak(self):
+        # A binary that embeds the plaintext flag as a literal must be rejected
+        # by the whole validate_challenge pipeline, not just the helper.
+        with TemporaryDirectory() as tmp:
+            d = Path(tmp) / "leaky"
+            _make_reverse(d, '#include <stdio.h>\nint main(){printf("sloth{leaky}\\n");}\n', "sloth{leaky}")
+            self.assertIn("strings leak", validate_challenge(d))
+
+    @unittest.skipUnless(_HAS_GCC, "needs a C compiler")
+    def test_validate_full_path_passes_clean(self):
+        with TemporaryDirectory() as tmp:
+            d = Path(tmp) / "clean"
+            flag = "sloth{easy_reverse}"
+            arr = ",".join(str(ord(c) ^ 0x42) for c in flag)  # bytes derived from the flag
+            src = (f"#include <stdio.h>\nint main(){{unsigned char d[]={{{arr}}};"
+                   f"for(int i=0;i<{len(flag)};i++)putchar(d[i]^0x42);putchar(10);}}\n")
+            _make_reverse(d, src, flag)
+            self.assertIn("Validation successful", validate_challenge(d))
 
 
 def _make_log_challenge(base: Path, answer: str, extractor: str):

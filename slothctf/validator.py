@@ -11,11 +11,12 @@ from pathlib import Path
 
 def _flag_leaks(binary_path: Path, flag: str) -> bool:
     """True if the plaintext flag (or its inner secret) is readable in the binary
-    — the same `strings`-style check the generator applies, re-run at validate."""
-    try:
-        blob = binary_path.read_bytes()
-    except OSError:
-        return False
+    — the same `strings`-style check the generator applies, re-run at validate.
+
+    Raises OSError if the binary can't be read: a security check that cannot run
+    must fail closed (the caller reports a validation failure), never silently
+    pass."""
+    blob = binary_path.read_bytes()
     needles = {flag}
     m = re.match(r"sloth\{(.*)\}$", flag)
     if m and m.group(1):
@@ -78,6 +79,7 @@ def _compile_binary(challenge_dir: Path) -> tuple[bool, str, str]:
 
     source_path = challenge_dir / "src" / "challenge.c"
     binary_path = challenge_dir / "bin" / "challenge"
+    binary_path.parent.mkdir(parents=True, exist_ok=True)  # bin/ may have been cleaned
     result = subprocess.run(
         [compiler, "-O2", "-s", "-o", str(binary_path), str(source_path)],
         capture_output=True,
@@ -120,7 +122,11 @@ def _evidence_log(challenge_dir: Path) -> Path | None:
 
 def _validate_log(challenge_dir: Path, metadata: dict) -> str:
     """Re-run each task's extractor against the evidence log and confirm its
-    declared answer — the real on-disk re-verification for log challenges."""
+    declared answer — the real on-disk re-verification for log challenges.
+
+    Note: the anti-hardcode decoy test (extractor must NOT reproduce the answer
+    on an unrelated log) runs at generation time, not here; validate re-checks
+    correctness against the real log only."""
     log = _evidence_log(challenge_dir)
     if log is None:
         return "Validation failed: no evidence log found"
@@ -183,8 +189,13 @@ def validate_challenge(challenge_dir: Path) -> str:
             return "Validation failed: invalid challenge.json"
 
         # Re-run the strings-style leak check: the plaintext secret must not be
-        # readable in the compiled binary.
-        if _flag_leaks(_resolve_binary(challenge_dir), expected_flag):
+        # readable in the compiled binary. If we can't read the binary, the check
+        # couldn't run — fail closed rather than silently pass.
+        try:
+            leaked = _flag_leaks(_resolve_binary(challenge_dir), expected_flag)
+        except OSError as exc:
+            return f"Validation failed: could not read the compiled binary for the leak check\n{exc}"
+        if leaked:
             return "Validation failed: the plaintext secret is readable in the binary (strings leak)"
 
         if kind == "check":

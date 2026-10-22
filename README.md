@@ -213,7 +213,11 @@ model → encoder.c + challenge.c (with placeholder)
       ↺ on any failure, the exact error is fed back for another attempt
 ```
 
-`python main.py validate --dir <dir>` re-runs this check independently.
+`python main.py validate --dir <dir>` re-runs this check independently: it
+recompiles, runs, and re-checks the `strings` leak for reverse challenges, and
+re-runs each extractor against the log for log challenges. It does **not** re-run
+the generation-only gates (`--roundtrip`, `--adversary`) or the log anti-hardcode
+decoy test — those run when the challenge is generated.
 
 ## Missing compiler
 
