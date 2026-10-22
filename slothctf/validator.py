@@ -92,6 +92,46 @@ def _run_challenge(challenge_dir: Path, stdin_text: str | None = None) -> tuple[
     return result.returncode == 0, result.stdout, result.stderr.strip()
 
 
+def _evidence_log(challenge_dir: Path) -> Path | None:
+    ev = challenge_dir / "evidence"
+    if not ev.is_dir():
+        return None
+    logs = [p for p in sorted(ev.glob("*.log")) if p.name != "_decoy.log"]
+    named = ev / f"{challenge_dir.name}.log"
+    if named in logs:
+        return named
+    return logs[0] if logs else None
+
+
+def _validate_log(challenge_dir: Path, metadata: dict) -> str:
+    """Re-run each task's extractor against the evidence log and confirm its
+    declared answer — the real on-disk re-verification for log challenges."""
+    log = _evidence_log(challenge_dir)
+    if log is None:
+        return "Validation failed: no evidence log found"
+    tasks = metadata.get("tasks") or []
+    if not tasks:
+        return "Validation failed: challenge.json has no tasks"
+    ok = 0
+    for i, task in enumerate(tasks, 1):
+        ext = challenge_dir / "organizer" / f"extractor_{i}.py"
+        if not ext.exists():
+            return f"Validation failed: missing organizer/extractor_{i}.py"
+        try:
+            res = subprocess.run(["python", "-I", str(ext), str(log)],
+                                 capture_output=True, text=True, timeout=20)
+        except Exception as exc:
+            return f"Validation failed: task {i} extractor did not run\n{exc}"
+        if res.returncode != 0:
+            return f"Validation failed: task {i} extractor crashed\n{res.stderr.strip()[:200]}"
+        if res.stdout.strip() != str(task.get("answer", "")).strip():
+            return (f"Validation failed: task {i} answer mismatch\n"
+                    f"Expected: {task.get('answer')!r}  Got: {res.stdout.strip()!r}")
+        ok += 1
+    return (f"Validation successful: {ok}/{len(tasks)} task(s) re-extracted the expected "
+            f"answer from {log.name}.\nDir: {challenge_dir}")
+
+
 def validate_challenge(challenge_dir: Path) -> str:
     challenge_dir = Path(challenge_dir)
     required = [
@@ -103,6 +143,14 @@ def validate_challenge(challenge_dir: Path) -> str:
     for required_file in required:
         if not required_file.exists():
             return f"Validation failed: missing {required_file.name}"
+
+    try:
+        metadata = json.loads((challenge_dir / "challenge.json").read_text(encoding="utf-8"))
+    except Exception:
+        return "Validation failed: invalid challenge.json"
+
+    if metadata.get("challenge_kind") == "log":
+        return _validate_log(challenge_dir, metadata)
 
     src_c = challenge_dir / "src" / "challenge.c"
     if src_c.exists():
