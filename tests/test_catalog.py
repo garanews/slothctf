@@ -47,6 +47,17 @@ class CatalogTests(unittest.TestCase):
         found = catalog.query(search="xor", db_path=self.db)
         self.assertEqual(found[0]["name"], "xor_one")
 
+    def test_reindex_prunes_deleted_challenges(self):
+        import shutil
+        _make_challenge(self.base, "keep")
+        _make_challenge(self.base, "gone")
+        catalog.index_generated(self.base, self.db)
+        self.assertEqual(len(catalog.query(db_path=self.db)), 2)
+        shutil.rmtree(self.base / "gone")  # user deletes a challenge folder
+        catalog.index_generated(self.base, self.db)
+        names = [r["name"] for r in catalog.query(db_path=self.db)]
+        self.assertEqual(names, ["keep"])  # the deleted one is pruned
+
     def test_reindex_is_idempotent_and_keeps_valid(self):
         _make_challenge(self.base, "c1")
         catalog.index_generated(self.base, self.db)

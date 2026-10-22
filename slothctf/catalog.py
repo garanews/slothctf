@@ -96,6 +96,7 @@ def index_generated(base_dir: str | Path = "generated", db_path: str | Path = DE
     base = Path(base_dir)
     conn = connect(db_path)
     count = 0
+    seen: list[str] = []
     try:
         if base.exists():
             for child in sorted(base.iterdir()):
@@ -105,7 +106,13 @@ def index_generated(base_dir: str | Path = "generated", db_path: str | Path = DE
                 if row is None:
                     continue
                 _upsert(conn, row, valid=None)
+                seen.append(row["name"])
                 count += 1
+        # Prune rows whose challenge folder no longer exists on disk.
+        existing = [r["name"] for r in conn.execute("SELECT name FROM challenges").fetchall()]
+        stale = [n for n in existing if n not in seen]
+        if stale:
+            conn.executemany("DELETE FROM challenges WHERE name = ?", [(n,) for n in stale])
         conn.commit()
     finally:
         conn.close()
