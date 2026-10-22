@@ -359,6 +359,9 @@ async function openDetail(name){
     <p>${esc(d.description)}</p>
     <div class="meta">flag: <code>${esc(d.flag)}</code>${d.success_marker?` · success marker: <code>${esc(d.success_marker)}</code>`:''}</div>
     <div style="margin-top:8px"><button class="btn" onclick="validateChallenge('${esc(name)}')">Re-validate</button> <span class="genstatus" id="valresult"></span></div>
+    ${(d.generation&&d.generation.prompt!==undefined)?`<h4>Generated from</h4>
+      <pre style="max-height:160px">${esc(d.generation.prompt||'(none)')}</pre>
+      <div class="meta">genre: <code>${esc(d.generation.genre||'')}</code> · model: <code>${esc(d.generation.model||'')}</code> · difficulty: <code>${esc(d.generation.difficulty||'')}</code>${d.generation.roundtrip?' · round-trip':''}${d.generation.surprise?' · surprise':''}${d.generation.input?` · input: <code>${esc(d.generation.input)}</code>`:''}</div>`:''}
     ${(d.tasks&&d.tasks.length)?`<h4>Questions</h4><ol>${d.tasks.map(t=>`<li>${esc(t.question)} <span class="tag">${esc(t.type||'')}</span></li>`).join('')}</ol>`:''}
     <h4>Player files</h4>
     <div class="panels">${player.length? player.map(f=>filePanel(name,f,preferOpen(f))).join('') : '<span class="desc">none</span>'}</div>
@@ -444,6 +447,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "success_marker": meta.get("success_marker", ""),
                 "description": meta.get("description", ""),
                 "tasks": meta.get("tasks", []),
+                "generation": meta.get("generation", {}),
                 "files": _list_files(d),
             })
         elif path == "/api/file":

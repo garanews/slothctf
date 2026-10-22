@@ -547,6 +547,8 @@ def _write_challenge_files(base_dir: Path, data: dict[str, Any]) -> None:
             {k: t.get(k) for k in ("question", "answer", "type", "evidence_line") if k in t}
             for t in data.get("tasks", [])
         ]
+    if data.get("generation"):
+        meta["generation"] = data["generation"]
     (base_dir / "challenge.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
@@ -1084,6 +1086,16 @@ def generate_challenge(
         category = random.choice(SURPRISE_CATEGORIES)
         user_prompt = f"Surprise me with a {difficulty} challenge: {category}."
 
+    # Record how this challenge was asked for (saved into challenge.json), so the
+    # original prompt is always recoverable. For log-analysis mode the provided
+    # log is appended to user_prompt below, so capture the clean prompt here.
+    gen_meta: dict[str, Any] = {
+        "prompt": user_prompt, "genre": genre, "model": model,
+        "difficulty": difficulty, "roundtrip": bool(roundtrip), "surprise": bool(surprise),
+    }
+    if input_path:
+        gen_meta["input"] = Path(input_path).name
+
     # Per-genre configuration: schema, required JSON fields, and verifier.
     temperature = 0.7
     provided_log = Path(input_path) if input_path else None
@@ -1141,6 +1153,7 @@ def generate_challenge(
             # prose, rendered locally so it costs no extra model time.
             data["readme"] = _render_readme(data)
             data["solution"] = _render_solution(data)
+            data["generation"] = gen_meta
             _write_challenge_files(base_dir, data)
             report.success = True
             try:  # best-effort: index into the catalog, never fail generation
