@@ -59,6 +59,16 @@ class PromptBuildTests(unittest.TestCase):
         self.assertIn("previous attempt failed", text.lower())
         self.assertIn("missing semicolon", text)
 
+    def test_default_flag_policy(self):
+        from slothctf.generator import _random_flag
+        rf = _random_flag()
+        self.assertTrue(rf.startswith("sloth{") and rf.endswith("}"))
+        text = _build_generation_prompt("x", "easy", None, None, default_flag=rf)
+        self.assertIn("FLAG POLICY", text)
+        self.assertIn(rf, text)
+        # without a default flag, no policy line
+        self.assertNotIn("FLAG POLICY", _build_generation_prompt("x", "easy", None, None))
+
     def test_difficulty_rubric_in_prompt(self):
         from slothctf.generator import _SCHEMA_RULES_LOG
         hard = _build_generation_prompt("x", "hard", None, None)

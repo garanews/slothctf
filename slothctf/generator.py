@@ -475,6 +475,14 @@ _DIFFICULTY_RUBRIC = {
 }
 
 
+def _random_flag() -> str:
+    """A non-guessable default flag used when the prompt doesn't specify one."""
+    import random
+    import string
+    token = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(12))
+    return f"sloth{{{token}}}"
+
+
 def _build_generation_prompt(
     user_prompt: str,
     difficulty: str,
@@ -482,8 +490,16 @@ def _build_generation_prompt(
     feedback: str | None,
     target_platform: str | None = None,
     schema: str = _SCHEMA_RULES,
+    default_flag: str | None = None,
 ) -> str:
     parts = [schema, ""]
+    if default_flag:
+        parts.append(
+            "FLAG POLICY: if the challenge request below specifies a concrete value to use "
+            "(a flag, a password, an XOR key, a target string, etc.), use EXACTLY that value. "
+            f"Otherwise, set the flag to exactly {default_flag} — do NOT invent a guessable "
+            "word like 'password' or 'easy_peasy'."
+        )
     if schema is _SCHEMA_RULES:
         parts.append(
             "BUILD TARGET — both C programs are compiled and run on: "
@@ -1128,12 +1144,15 @@ def generate_challenge(
             )
 
     ask = caller or (lambda p, m: _call_ollama(p, m, base_url=ollama_url, temperature=temperature))
+    # Reverse challenges get a random default flag (used only if the prompt does
+    # not specify one), so unspecified secrets aren't guessable model clichés.
+    default_flag = _random_flag() if genre == "reverse" else None
 
     report = GenerationReport(name=name, model=model, directory=str(base_dir), success=False)
     feedback: str | None = None
 
     for attempt in range(1, max_attempts + 1):
-        full_prompt = _build_generation_prompt(user_prompt, difficulty, category, feedback, target_platform, schema)
+        full_prompt = _build_generation_prompt(user_prompt, difficulty, category, feedback, target_platform, schema, default_flag)
         try:
             raw = ask(full_prompt, model)
         except GenerationError as exc:
