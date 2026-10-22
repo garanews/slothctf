@@ -133,12 +133,23 @@ def record(challenge_dir: str | Path, valid: bool | None = None, db_path: str | 
         conn.close()
 
 
+_SORTS = {
+    "created_desc": "created_at DESC",
+    "created_asc": "created_at ASC",
+    "name": "name ASC",
+    "title": "lower(title) ASC",
+    "difficulty": "CASE lower(difficulty) WHEN 'easy' THEN 0 WHEN 'medium' THEN 1 "
+                  "WHEN 'hard' THEN 2 ELSE 3 END ASC, created_at DESC",
+}
+
+
 def query(
     category: str | None = None,
     difficulty: str | None = None,
     kind: str | None = None,
     valid: bool | None = None,
     search: str | None = None,
+    sort: str | None = None,
     db_path: str | Path = DEFAULT_DB,
 ) -> list[dict[str, Any]]:
     conn = connect(db_path)
@@ -157,7 +168,7 @@ def query(
             like = f"%{search.lower()}%"
             sql += " AND (lower(name) LIKE ? OR lower(title) LIKE ? OR lower(category) LIKE ?)"
             params += [like, like, like]
-        sql += " ORDER BY created_at DESC"
+        sql += " ORDER BY " + _SORTS.get(sort or "created_desc", _SORTS["created_desc"])
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
     finally:
         conn.close()

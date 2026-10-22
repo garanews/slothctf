@@ -80,6 +80,14 @@ class SafeFileTests(unittest.TestCase):
     def test_missing_file(self):
         self.assertIsNone(web._safe_file("demo", "nope.txt"))
 
+    def test_search_code(self):
+        # the demo challenge's src/challenge.c contains "int main(){}"
+        res = web._search_code("int main")
+        self.assertTrue(any(r["name"] == "demo" for r in res))
+        hit = next(r for r in res if r["name"] == "demo")
+        self.assertTrue(any(m["path"] == "src/challenge.c" for m in hit["matches"]))
+        self.assertEqual(web._search_code("zzz_not_present"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

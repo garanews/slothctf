@@ -136,6 +136,46 @@ def _list_files(challenge_dir: Path) -> list[dict]:
     return out
 
 
+def _search_code(query: str, max_per: int = 6) -> list[dict]:
+    """Full-text search inside every challenge's text files (e.g. find 0x26 in
+    the sources). Returns per-challenge matches with file + line + snippet."""
+    q = (query or "").lower().strip()
+    out: list[dict] = []
+    if not q or not GENERATED.exists():
+        return out
+    for d in sorted(GENERATED.iterdir()):
+        meta_p = d / "challenge.json"
+        if not d.is_dir() or not meta_p.exists():
+            continue
+        matches: list[dict] = []
+        for p in sorted(d.rglob("*")):
+            if not p.is_file() or p.suffix.lower() not in _TEXT_EXT:
+                continue
+            rel = p.relative_to(d).as_posix()
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for i, line in enumerate(text.splitlines(), 1):
+                if q in line.lower():
+                    matches.append({"path": rel, "line": i, "text": line.strip()[:200],
+                                    "group": _classify(rel)})
+                    if len(matches) >= max_per:
+                        break
+            if len(matches) >= max_per:
+                break
+        if matches:
+            try:
+                meta = json.loads(meta_p.read_text(encoding="utf-8"))
+            except Exception:
+                meta = {}
+            out.append({"name": d.name, "title": meta.get("title", d.name),
+                        "kind": meta.get("challenge_kind", "decode"),
+                        "category": meta.get("category", ""), "difficulty": meta.get("difficulty", ""),
+                        "matches": matches})
+    return out
+
+
 def _safe_file(name: str, rel: str) -> Path | None:
     """Resolve rel inside the named challenge dir, rejecting path traversal."""
     base = _challenge_dir(name)
@@ -174,6 +214,8 @@ _PAGE = """<!doctype html>
   .tag.kind { color:var(--accent); border-color:var(--accent); }
   .desc { color:var(--muted); font-size:13px; }
   .meta { margin-top:10px; font-size:12px; color:var(--muted); }
+  .hit { font-size:12px; margin:4px 0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .hit .hitloc { color:var(--accent); margin-right:6px; }
   code { background:#000; padding:1px 5px; border-radius:5px; font-size:12px; }
   .empty { color:var(--muted); padding:40px 24px; }
   /* modal */
@@ -241,7 +283,15 @@ _PAGE = """<!doctype html>
   <select id="category"><option value="">All categories</option></select>
   <select id="difficulty"><option value="">All difficulties</option></select>
   <select id="kind"><option value="">All kinds</option></select>
+  <select id="sort" title="Sort order">
+    <option value="created_desc">Newest first</option>
+    <option value="created_asc">Oldest first</option>
+    <option value="name">Name A→Z</option>
+    <option value="title">Title A→Z</option>
+    <option value="difficulty">Difficulty</option>
+  </select>
   <input type="search" id="search" placeholder="Search name / title…">
+  <label style="display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px"><input type="checkbox" id="incode"> in code</label>
 </div>
 <main id="grid"></main>
 
@@ -311,12 +361,19 @@ async function loadFacets(){
   for (const key of ['category','difficulty','kind'])
     for (const v of f[key]) { const o=document.createElement('option'); o.value=v; o.textContent=v; sel[key].appendChild(o); }
 }
+function fmtDate(ts){ try{ return ts? new Date(ts*1000).toLocaleString() : ''; }catch(e){ return ''; } }
+
 async function refresh(){
+  const term = sel.search.value;
+  if (document.getElementById('incode').checked && term.trim()){
+    return refreshCode(term);
+  }
   const q = new URLSearchParams();
   for (const k of ['category','difficulty','kind','search']) if (sel[k].value) q.set(k, sel[k].value);
+  q.set('sort', document.getElementById('sort').value);
   const rows = await (await fetch('/api/challenges?'+q)).json();
   count.textContent = rows.length + ' challenge' + (rows.length===1?'':'s');
-  grid.innerHTML = rows.length ? '' : '<p class="empty">No challenges. Generate some with <code>python main.py generate</code>.</p>';
+  grid.innerHTML = rows.length ? '' : '<p class="empty">No challenges. Generate one with the <b>＋ New challenge</b> button.</p>';
   for (const r of rows){
     const el = document.createElement('div'); el.className='card'; el.onclick=()=>openDetail(r.name);
     el.innerHTML = `<h3>${esc(r.title)}</h3>
@@ -327,7 +384,20 @@ async function refresh(){
         ${r.built? '<span class="tag">built</span>':''}
       </div>
       <div class="desc"><code>${esc(r.name)}</code></div>
-      <div class="meta">flag: <code>${esc(r.flag)}</code></div>`;
+      <div class="meta">flag: <code>${esc(r.flag)}</code> · <span title="created">${fmtDate(r.created_at)}</span></div>`;
+    grid.appendChild(el);
+  }
+}
+async function refreshCode(term){
+  const rows = await (await fetch('/api/search_code?q='+encodeURIComponent(term))).json();
+  const n = rows.reduce((a,r)=>a+r.matches.length,0);
+  count.textContent = `${n} match${n===1?'':'es'} in ${rows.length} challenge${rows.length===1?'':'s'}`;
+  grid.innerHTML = rows.length ? '' : `<p class="empty">No file contains <code>${esc(term)}</code>.</p>`;
+  for (const r of rows){
+    const el = document.createElement('div'); el.className='card'; el.onclick=()=>openDetail(r.name);
+    el.innerHTML = `<h3>${esc(r.title)}</h3>
+      <div class="tags"><span class="tag kind">${esc(r.kind)}</span><span class="tag">${esc(r.difficulty)}</span><code>${esc(r.name)}</code></div>
+      ${r.matches.map(m=>`<div class="hit"><span class="hitloc">${esc(m.path)}:${m.line}</span> <code>${esc(m.text)}</code></div>`).join('')}`;
     grid.appendChild(el);
   }
 }
@@ -384,6 +454,8 @@ overlay.addEventListener('click', e => { if (e.target===overlay) closeDetail(); 
 document.addEventListener('keydown', e => { if (e.key==='Escape') closeDetail(); });
 
 for (const k in sel) sel[k].addEventListener('input', refresh);
+document.getElementById('sort').addEventListener('change', refresh);
+document.getElementById('incode').addEventListener('change', refresh);
 loadConfig();
 loadFacets().then(refresh);
 </script>
@@ -430,7 +502,10 @@ class _Handler(BaseHTTPRequestHandler):
                 difficulty=(q.get("difficulty") or [None])[0],
                 kind=(q.get("kind") or [None])[0],
                 search=(q.get("search") or [None])[0],
+                sort=(q.get("sort") or [None])[0],
             ))
+        elif path == "/api/search_code":
+            self._json(_search_code((q.get("q") or [""])[0]))
         elif path.startswith("/api/challenge/"):
             name = path[len("/api/challenge/"):]
             d = _challenge_dir(name)

@@ -68,6 +68,16 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["valid"], 1)
 
+    def test_sort(self):
+        _make_challenge(self.base, "bravo", difficulty="hard")
+        _make_challenge(self.base, "alpha", difficulty="easy")
+        _make_challenge(self.base, "charlie", difficulty="medium")
+        catalog.index_generated(self.base, self.db)
+        by_name = [r["name"] for r in catalog.query(sort="name", db_path=self.db)]
+        self.assertEqual(by_name, ["alpha", "bravo", "charlie"])
+        by_diff = [r["difficulty"] for r in catalog.query(sort="difficulty", db_path=self.db)]
+        self.assertEqual(by_diff, ["easy", "medium", "hard"])
+
     def test_facets(self):
         _make_challenge(self.base, "a", category="Reverse Engineering", difficulty="easy")
         _make_challenge(self.base, "b", category="Cryptography", difficulty="hard", challenge_kind="check")
