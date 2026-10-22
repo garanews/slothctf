@@ -2,10 +2,25 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+
+def _flag_leaks(binary_path: Path, flag: str) -> bool:
+    """True if the plaintext flag (or its inner secret) is readable in the binary
+    — the same `strings`-style check the generator applies, re-run at validate."""
+    try:
+        blob = binary_path.read_bytes()
+    except OSError:
+        return False
+    needles = {flag}
+    m = re.match(r"sloth\{(.*)\}$", flag)
+    if m and m.group(1):
+        needles.add(m.group(1))
+    return any(len(n) >= 4 and n.encode("utf-8") in blob for n in needles)
 
 
 def install_toolchain_windows(dry_run: bool = False) -> str:
@@ -167,6 +182,11 @@ def validate_challenge(challenge_dir: Path) -> str:
         except Exception:
             return "Validation failed: invalid challenge.json"
 
+        # Re-run the strings-style leak check: the plaintext secret must not be
+        # readable in the compiled binary.
+        if _flag_leaks(_resolve_binary(challenge_dir), expected_flag):
+            return "Validation failed: the plaintext secret is readable in the binary (strings leak)"
+
         if kind == "check":
             marker = str(metadata.get("success_marker", "")).strip()
             if not marker:
@@ -181,8 +201,8 @@ def validate_challenge(challenge_dir: Path) -> str:
             if marker in bad_out:
                 return "Validation failed: a wrong input was also accepted"
             return (
-                "Validation successful: challenge compiled; the secret is accepted and "
-                f"wrong input is rejected.\nDir: {challenge_dir}"
+                "Validation successful: challenge compiled; the secret is accepted, wrong "
+                f"input is rejected, and strings does not leak it.\nDir: {challenge_dir}"
             )
 
         run_ok, out, run_err = _run_challenge(challenge_dir)
@@ -192,7 +212,8 @@ def validate_challenge(challenge_dir: Path) -> str:
             return f"Validation failed: incorrect flag\nExpected: {expected_flag}\nGot: {out.strip()}"
 
         return (
-            "Validation successful: challenge compiled, ran, and printed the expected flag.\n"
+            "Validation successful: challenge compiled, ran, printed the expected flag, and "
+            "strings does not leak it.\n"
             f"Dir: {challenge_dir}"
         )
 

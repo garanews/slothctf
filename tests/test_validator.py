@@ -3,7 +3,20 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from slothctf.validator import validate_challenge
+from slothctf.validator import _flag_leaks, validate_challenge
+
+
+class LeakCheckTests(unittest.TestCase):
+    def test_flag_leaks(self):
+        with TemporaryDirectory() as tmp:
+            b = Path(tmp) / "bin"
+            b.write_bytes(b"\x00\x01sloth{visible_secret}\x02padding")
+            self.assertTrue(_flag_leaks(b, "sloth{visible_secret}"))
+            self.assertTrue(_flag_leaks(b, "visible_secret"))  # inner secret too
+        with TemporaryDirectory() as tmp:
+            b = Path(tmp) / "bin"
+            b.write_bytes(b"\xde\xad\xbe\xef only encoded bytes here")
+            self.assertFalse(_flag_leaks(b, "sloth{hidden}"))
 
 
 def _make_log_challenge(base: Path, answer: str, extractor: str):

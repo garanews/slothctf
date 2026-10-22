@@ -109,8 +109,8 @@ whole shell.
 ### Round-trip correctness gate (`--roundtrip`)
 
 For reverse challenges, after the chosen flag verifies, `--roundtrip` re-runs the
-real pipeline (encode → inject → compile → decode) on several **random** inputs
-and requires `decode(encode(x)) == x` for each:
+real pipeline (encode → inject → compile → decode) on a handful of **random**
+inputs and requires `decode(encode(x)) == x` for each:
 
 ```bash
 python main.py generate --name xor_demo --roundtrip \
@@ -118,21 +118,31 @@ python main.py generate --name xor_demo --roundtrip \
   --model qwen2.5-coder:32b
 ```
 
-This catches a transform that only inverts the chosen flag but isn't a true
-inverse in general (byte overflow, signed/unsigned or modulo edges) — the classic
-"perfect-looking function, constant off by one" bug. It reuses the model's actual
-encoder and challenge (no model-written test), so it checks the real transform.
+This gives **additional confidence that the transform is invertible across
+different inputs** — not just the chosen flag — so it catches overflow /
+signed-unsigned / modulo-edge bugs that happen to work for one flag. It is a
+property-based check over a few random samples (currently 4, short ASCII), **not
+a proof** that the transform inverts every possible input. It reuses the model's
+actual encoder and challenge (no model-written test), so it checks the real code.
 ([Idea from a reader on the write-up.](https://dev.to/garanews/i-was-too-lazy-to-write-ctf-challenges-so-i-built-a-local-ai-that-writes-compiles-and-checks-its-1927))
 
 ### Reference-attacker gate (`--adversary`)
 
 Correctness is not difficulty. `--adversary` runs a budgeted reference attacker
 against `check` challenges — a dictionary of common secrets plus a short
-brute-force — and **rejects a medium/hard challenge that it cracks** (it's too
-easy for its label). `decode` challenges solve by being run, so the gate doesn't
-apply to them. This turns "too easy to brute-force" into a measurable property
-instead of a guess — again by making an automated attacker try, not by asking
-the model. ([Idea from a reader on the write-up.](https://dev.to/garanews/i-was-too-lazy-to-write-ctf-challenges-so-i-built-a-local-ai-that-writes-compiles-and-checks-its-1927))
+brute-force (≤1600 tries / ~15s) — and **rejects a medium/hard challenge that it
+cracks** (it's too easy for its label). `decode` challenges solve by being run,
+so the gate doesn't apply to them.
+
+This is a **first automatic filter against trivially guessable secrets, not a
+global difficulty assessment**: it only measures resistance to *this* attacker.
+A challenge with a random 20-char secret passes the gate yet could still be
+reversed in seconds by reading the binary — judging true reversing difficulty is
+out of scope. ([Idea from a reader on the write-up.](https://dev.to/garanews/i-was-too-lazy-to-write-ctf-challenges-so-i-built-a-local-ai-that-writes-compiles-and-checks-its-1927))
+
+**Both gates are opt-in and run only at generation time** — `python main.py
+validate` re-checks compile / behaviour / strings-leak, but does **not** re-run
+`--roundtrip` or `--adversary`.
 
 ## What gets generated
 
@@ -204,6 +214,17 @@ model → encoder.c + challenge.c (with placeholder)
 python main.py install-toolchain --dry-run   # print MinGW/MSYS2 steps
 python main.py install-toolchain             # attempt the install (Windows)
 ```
+
+## Security note
+
+SlothCTF **compiles and runs code written by the model** (C programs, and Python
+generators/extractors for the log genre), and the web GUI can trigger that from
+the browser. There is no sandbox: steps run as your user with ordinary process
+timeouts, not resource/syscall isolation. That's fine for local, single-user use
+with a trusted local model, which is the intended setup. If you expose it to
+others or run untrusted prompts/models, run it inside a container or VM with CPU,
+memory, filesystem and network limits. The web server binds to `127.0.0.1` by
+default; don't expose it on an untrusted network.
 
 ## Roadmap
 
