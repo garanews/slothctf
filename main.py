@@ -58,8 +58,8 @@ def _build_parser() -> argparse.ArgumentParser:
     gen.add_argument(
         "--roundtrip",
         action="store_true",
-        help="(reverse genre) also require decode(encode(x))==x on random inputs, not just "
-        "the chosen flag — proves the transform is a true inverse in general",
+        help="(reverse genre) also re-check decode(encode(x))==x on a few random inputs, not "
+        "just the chosen flag — a property check over samples for added confidence, not a proof",
     )
     gen.add_argument(
         "--adversary",
@@ -112,12 +112,17 @@ def main() -> None:
         input_path = Path(args.input) if args.input else None
         adv_budget = None
         if args.adversary_budget:
+            import math as _math
             try:
-                a, s = args.adversary_budget.split(",")
-                adv_budget = (int(a), float(s))
+                a_str, s_str = args.adversary_budget.split(",")
+                a, s = int(a_str), float(s_str)
             except ValueError:
                 print("--adversary-budget must be 'ATTEMPTS,SECONDS' (e.g. 2000,20)", file=sys.stderr)
                 raise SystemExit(2)
+            if a < 1 or not _math.isfinite(s) or s <= 0:
+                print("--adversary-budget needs attempts>=1 and seconds>0 (finite)", file=sys.stderr)
+                raise SystemExit(2)
+            adv_budget = (a, s)
         try:
             report = generate_challenge(
                 args.name,
@@ -152,6 +157,8 @@ def main() -> None:
             print(result)
         result = validate_challenge(Path(args.dir))
         print(result)
+        if not result.success:
+            raise SystemExit(1)
         return
 
     if args.command == "install-toolchain":

@@ -43,7 +43,9 @@ class LeakCheckTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             d = Path(tmp) / "leaky"
             _make_reverse(d, '#include <stdio.h>\nint main(){printf("sloth{leaky}\\n");}\n', "sloth{leaky}")
-            self.assertIn("strings leak", validate_challenge(d))
+            r = validate_challenge(d)
+            self.assertFalse(r.success)
+            self.assertEqual(r.stage, "flag-leak")
 
     @unittest.skipUnless(_HAS_GCC, "needs a C compiler")
     def test_validate_full_path_passes_clean(self):
@@ -54,7 +56,8 @@ class LeakCheckTests(unittest.TestCase):
             src = (f"#include <stdio.h>\nint main(){{unsigned char d[]={{{arr}}};"
                    f"for(int i=0;i<{len(flag)};i++)putchar(d[i]^0x42);putchar(10);}}\n")
             _make_reverse(d, src, flag)
-            self.assertIn("Validation successful", validate_challenge(d))
+            r = validate_challenge(d)
+            self.assertTrue(r.success, str(r))
 
 
 def _make_log_challenge(base: Path, answer: str, extractor: str):
@@ -80,20 +83,26 @@ class ValidateLogTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             d = Path(tmp) / "case"
             _make_log_challenge(d, "10.0.0.9", self.GOOD)
-            self.assertIn("Validation successful", validate_challenge(d))
+            r = validate_challenge(d)
+            self.assertTrue(r.success)
+            self.assertEqual(r.stage, "ok")
 
     def test_log_validate_mismatch(self):
         with TemporaryDirectory() as tmp:
             d = Path(tmp) / "case"
             _make_log_challenge(d, "9.9.9.9", self.GOOD)  # declared answer != extracted
-            self.assertIn("answer mismatch", validate_challenge(d))
+            r = validate_challenge(d)
+            self.assertFalse(r.success)
+            self.assertEqual(r.stage, "answer-mismatch")
 
     def test_log_validate_no_log(self):
         with TemporaryDirectory() as tmp:
             d = Path(tmp) / "case"
             _make_log_challenge(d, "10.0.0.9", self.GOOD)
             (d / "evidence" / "case.log").unlink()
-            self.assertIn("no evidence log", validate_challenge(d))
+            r = validate_challenge(d)
+            self.assertFalse(r.success)
+            self.assertEqual(r.stage, "no-log")
 
 
 if __name__ == "__main__":

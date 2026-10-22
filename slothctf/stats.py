@@ -122,4 +122,8 @@ def render(s: dict[str, Any]) -> str:
         fmt = lambda t: datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")
         L.append("")
         L.append(f"Created between {fmt(s['created_oldest'])} and {fmt(s['created_newest'])}")
+    L.append("")
+    L.append("Note: this counts only challenges that made it to disk (survivors). It does not "
+             "include failed generation runs — attempts, failure stages and pass-rate need a "
+             "tracked generation campaign.")
     return "\n".join(L)

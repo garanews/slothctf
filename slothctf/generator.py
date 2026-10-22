@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import random
@@ -167,11 +168,11 @@ def _normalize_flag(flag: str) -> str:
 
 def _flag_leaks_in_binary(binary_path: Path, flag: str) -> bool:
     """True if the plaintext flag (or its inner secret) is trivially visible in
-    the compiled binary — i.e. a `strings` run would give the answer away."""
-    try:
-        blob = binary_path.read_bytes()
-    except OSError:
-        return False
+    the compiled binary — i.e. a `strings` run would give the answer away.
+
+    Raises OSError if the binary can't be read: a security check that could not
+    run must never be reported as passed (fail closed)."""
+    blob = binary_path.read_bytes()
     candidates = {flag}
     m = re.match(r"sloth\{(.*)\}$", flag)
     if m and m.group(1):
@@ -859,8 +860,14 @@ def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str,
                 "transform — fix one of them so decoding the encoded flag yields the flag.",
             )
 
-    # 6. The plaintext secret must not be readable in the binary.
-    if _flag_leaks_in_binary(challenge_bin, expected):
+    # 6. The plaintext secret must not be readable in the binary (fail closed:
+    #    if we can't read the binary, the check didn't run → treat as a failure).
+    try:
+        leaked = _flag_leaks_in_binary(challenge_bin, expected)
+    except OSError as exc:
+        return AttemptResult(0, False, "leak-check-failed",
+                             f"could not read the challenge binary for the leak check: {exc}")
+    if leaked:
         return AttemptResult(
             0, False, "flag-leak",
             "The plaintext secret is readable inside the challenge binary. Only the "
@@ -1175,6 +1182,10 @@ def generate_challenge(
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
+    if adversary_budget is not None:
+        a, s = adversary_budget
+        if not (isinstance(a, int) and a >= 1) or not (isinstance(s, (int, float)) and math.isfinite(s) and s > 0):
+            raise ValueError("adversary_budget must be (attempts>=1, seconds>0 and finite)")
 
     base_dir = Path("generated") / name
     base_dir.mkdir(parents=True, exist_ok=True)

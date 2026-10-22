@@ -589,7 +589,8 @@ class _Handler(BaseHTTPRequestHandler):
             d = _challenge_dir(_safe_name(payload.get("name", "")) or "")
             if d is None:
                 self._send(404, b"not found", "text/plain"); return
-            self._json({"result": validate_challenge(d)})
+            res = validate_challenge(d)
+            self._json({"result": str(res), "success": res.success, "stage": res.stage})
         elif parsed.path == "/api/delete":
             d = _challenge_dir(_safe_name(payload.get("name", "")) or "")
             if d is None:

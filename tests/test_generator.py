@@ -39,6 +39,11 @@ class FlagHelperTests(unittest.TestCase):
             self.assertTrue(_flag_leaks_in_binary(binary, "sloth{visible_secret}"))
             self.assertTrue(_flag_leaks_in_binary(binary, "visible_secret"))
 
+    def test_flag_leaks_raises_when_unreadable(self):
+        from slothctf.generator import _flag_leaks_in_binary
+        with TemporaryDirectory() as tmp:
+            self.assertRaises(OSError, _flag_leaks_in_binary, Path(tmp) / "nope", "sloth{x}")
+
     def test_flag_leak_detection_negative(self):
         with TemporaryDirectory() as tmp:
             binary = Path(tmp) / "challenge"
@@ -209,6 +214,43 @@ class GenerationLoopTests(unittest.TestCase):
         with mock.patch.object(generator, "_find_compiler", return_value=None):
             with self.assertRaises(GenerationError):
                 generate_challenge("x", caller=lambda p, m: {}, return_report=True)
+
+
+class AdversaryBudgetTests(unittest.TestCase):
+    def test_invalid_budgets_raise(self):
+        for bad in [(0, 0), (-10, -5), (100, float("nan")), (5, 0), (5, float("inf"))]:
+            with self.assertRaises(ValueError):
+                generate_challenge("x", adversary_budget=bad, return_report=True)
+
+    def test_default_budget_scales_with_difficulty(self):
+        from slothctf.generator import _ADVERSARY_BUDGET
+        self.assertLess(_ADVERSARY_BUDGET["medium"][0], _ADVERSARY_BUDGET["hard"][0])
+        self.assertLess(_ADVERSARY_BUDGET["medium"][1], _ADVERSARY_BUDGET["hard"][1])
+
+    @unittest.skipUnless(generator._find_compiler() is not None, "needs a C compiler")
+    def test_budget_is_a_real_knob(self):
+        import tempfile
+        enc = ('#include <stdio.h>\nint main(int c,char**v){for(char*p=v[1];*p;++p)'
+               'printf("0x%02x,",(unsigned char)(*p^0x37));}')
+        ch = ('#include <stdio.h>\n#include <string.h>\nstatic unsigned char t[]={ '
+              '/*__ENCODED_ARRAY__*/ };\nint main(void){char b[128];if(!fgets(b,sizeof b,stdin))'
+              'return 1;size_t n=strlen(b);if(n&&b[n-1]==10)b[--n]=0;if(n!=sizeof t)'
+              '{printf("Denied\\n");return 0;}for(size_t i=0;i<n;i++)'
+              'if(((unsigned char)b[i]^0x37)!=t[i]){printf("Denied\\n");return 0;}'
+              'printf("Access Granted\\n");return 0;}')
+        comp = generator._find_compiler()
+
+        def mk():
+            return generator._normalize_challenge(
+                {"title": "B", "category": "Reverse Engineering", "difficulty": "hard",
+                 "flag": "sloth{z9}", "challenge_kind": "check", "success_marker": "Access Granted",
+                 "encoder_code": enc, "challenge_code": ch}, "hard", None, "reverse")
+
+        with tempfile.TemporaryDirectory() as t1, tempfile.TemporaryDirectory() as t2:
+            small = generator._verify_challenge(Path(t1), mk(), comp, adversary=True, adversary_budget=(900, 60))
+            large = generator._verify_challenge(Path(t2), mk(), comp, adversary=True, adversary_budget=(1500, 60))
+        self.assertTrue(small.ok)            # small budget doesn't reach it
+        self.assertEqual(large.stage, "too-easy")  # larger budget cracks it
 
 
 class LogVerifyTests(unittest.TestCase):

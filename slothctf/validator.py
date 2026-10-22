@@ -6,7 +6,28 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+
+
+@dataclass
+class ValidationResult:
+    """Structured outcome so callers can branch on success / stage instead of
+    parsing a string (and set a proper exit code)."""
+    success: bool
+    stage: str
+    message: str
+
+    def __str__(self) -> str:  # keep existing string usages working
+        return self.message
+
+
+def _ok(stage: str, message: str) -> ValidationResult:
+    return ValidationResult(True, stage, message)
+
+
+def _fail(stage: str, message: str) -> ValidationResult:
+    return ValidationResult(False, stage, "Validation failed: " + message)
 
 
 def _flag_leaks(binary_path: Path, flag: str) -> bool:
@@ -120,7 +141,7 @@ def _evidence_log(challenge_dir: Path) -> Path | None:
     return logs[0] if logs else None
 
 
-def _validate_log(challenge_dir: Path, metadata: dict) -> str:
+def _validate_log(challenge_dir: Path, metadata: dict) -> ValidationResult:
     """Re-run each task's extractor against the evidence log and confirm its
     declared answer — the real on-disk re-verification for log challenges.
 
@@ -129,31 +150,31 @@ def _validate_log(challenge_dir: Path, metadata: dict) -> str:
     correctness against the real log only."""
     log = _evidence_log(challenge_dir)
     if log is None:
-        return "Validation failed: no evidence log found"
+        return _fail("no-log", "no evidence log found")
     tasks = metadata.get("tasks") or []
     if not tasks:
-        return "Validation failed: challenge.json has no tasks"
+        return _fail("no-tasks", "challenge.json has no tasks")
     ok = 0
     for i, task in enumerate(tasks, 1):
         ext = challenge_dir / "organizer" / f"extractor_{i}.py"
         if not ext.exists():
-            return f"Validation failed: missing organizer/extractor_{i}.py"
+            return _fail("missing-extractor", f"missing organizer/extractor_{i}.py")
         try:
             res = subprocess.run(["python", "-I", str(ext), str(log)],
                                  capture_output=True, text=True, timeout=20)
         except Exception as exc:
-            return f"Validation failed: task {i} extractor did not run\n{exc}"
+            return _fail("extractor-error", f"task {i} extractor did not run\n{exc}")
         if res.returncode != 0:
-            return f"Validation failed: task {i} extractor crashed\n{res.stderr.strip()[:200]}"
+            return _fail("extractor-crash", f"task {i} extractor crashed\n{res.stderr.strip()[:200]}")
         if res.stdout.strip() != str(task.get("answer", "")).strip():
-            return (f"Validation failed: task {i} answer mismatch\n"
-                    f"Expected: {task.get('answer')!r}  Got: {res.stdout.strip()!r}")
+            return _fail("answer-mismatch", f"task {i} answer mismatch\n"
+                         f"Expected: {task.get('answer')!r}  Got: {res.stdout.strip()!r}")
         ok += 1
-    return (f"Validation successful: {ok}/{len(tasks)} task(s) re-extracted the expected "
-            f"answer from {log.name}.\nDir: {challenge_dir}")
+    return _ok("ok", f"Validation successful: {ok}/{len(tasks)} task(s) re-extracted the expected "
+               f"answer from {log.name}.\nDir: {challenge_dir}")
 
 
-def validate_challenge(challenge_dir: Path) -> str:
+def validate_challenge(challenge_dir: Path) -> ValidationResult:
     challenge_dir = Path(challenge_dir)
     required = [
         challenge_dir / "README.md",
@@ -163,12 +184,12 @@ def validate_challenge(challenge_dir: Path) -> str:
 
     for required_file in required:
         if not required_file.exists():
-            return f"Validation failed: missing {required_file.name}"
+            return _fail("missing-file", f"missing {required_file.name}")
 
     try:
         metadata = json.loads((challenge_dir / "challenge.json").read_text(encoding="utf-8"))
     except Exception:
-        return "Validation failed: invalid challenge.json"
+        return _fail("invalid-json", "invalid challenge.json")
 
     if metadata.get("challenge_kind") == "log":
         return _validate_log(challenge_dir, metadata)
@@ -178,66 +199,55 @@ def validate_challenge(challenge_dir: Path) -> str:
         compile_ok, compile_out, compile_err = _compile_binary(challenge_dir)
         if not compile_ok:
             if "GCC compiler not found" in compile_err:
-                return compile_err
-            return f"Validation failed: compile error\n{compile_err}"
+                return _fail("no-compiler", compile_err)
+            return _fail("compile-error", f"compile error\n{compile_err}")
 
         try:
-            metadata = json.loads((challenge_dir / "challenge.json").read_text(encoding="utf-8"))
             expected_flag = metadata["flag"]
             kind = metadata.get("challenge_kind", "decode")
         except Exception:
-            return "Validation failed: invalid challenge.json"
+            return _fail("invalid-json", "invalid challenge.json")
 
-        # Re-run the strings-style leak check: the plaintext secret must not be
-        # readable in the compiled binary. If we can't read the binary, the check
-        # couldn't run — fail closed rather than silently pass.
+        # Fail closed: a leak check that can't read the binary is not a pass.
         try:
             leaked = _flag_leaks(_resolve_binary(challenge_dir), expected_flag)
         except OSError as exc:
-            return f"Validation failed: could not read the compiled binary for the leak check\n{exc}"
+            return _fail("leak-check-failed", f"could not read the compiled binary for the leak check\n{exc}")
         if leaked:
-            return "Validation failed: the plaintext secret is readable in the binary (strings leak)"
+            return _fail("flag-leak", "the plaintext secret is readable in the binary (strings leak)")
 
         if kind == "check":
             marker = str(metadata.get("success_marker", "")).strip()
             if not marker:
-                return "Validation failed: check challenge missing success_marker"
+                return _fail("no-marker", "check challenge missing success_marker")
             try:
                 _, good_out, _ = _run_challenge(challenge_dir, stdin_text=expected_flag + "\n")
                 _, bad_out, _ = _run_challenge(challenge_dir, stdin_text="definitely_wrong_" + expected_flag + "\n")
             except Exception as exc:
-                return f"Validation failed: challenge did not run\n{exc}"
+                return _fail("run-error", f"challenge did not run\n{exc}")
             if marker not in good_out:
-                return f"Validation failed: correct secret rejected (expected marker {marker!r})"
+                return _fail("check-reject", f"correct secret rejected (expected marker {marker!r})")
             if marker in bad_out:
-                return "Validation failed: a wrong input was also accepted"
-            return (
-                "Validation successful: challenge compiled; the secret is accepted, wrong "
-                f"input is rejected, and strings does not leak it.\nDir: {challenge_dir}"
-            )
+                return _fail("check-accept-wrong", "a wrong input was also accepted")
+            return _ok("ok", "Validation successful: challenge compiled; the secret is accepted, "
+                       f"wrong input is rejected, and strings does not leak it.\nDir: {challenge_dir}")
 
         run_ok, out, run_err = _run_challenge(challenge_dir)
         if not run_ok:
-            return f"Validation failed: challenge did not run\n{run_err}"
+            return _fail("run-error", f"challenge did not run\n{run_err}")
         if out.strip() != expected_flag:
-            return f"Validation failed: incorrect flag\nExpected: {expected_flag}\nGot: {out.strip()}"
+            return _fail("flag-mismatch", f"incorrect flag\nExpected: {expected_flag}\nGot: {out.strip()}")
 
-        return (
-            "Validation successful: challenge compiled, ran, printed the expected flag, and "
-            "strings does not leak it.\n"
-            f"Dir: {challenge_dir}"
-        )
+        return _ok("ok", "Validation successful: challenge compiled, ran, printed the expected flag, "
+                   f"and strings does not leak it.\nDir: {challenge_dir}")
 
     try:
-        metadata = json.loads((challenge_dir / "challenge.json").read_text(encoding="utf-8"))
         expected_flag = metadata["flag"]
         title = metadata["title"]
         if not expected_flag or not title:
             raise ValueError("Invalid metadata")
     except Exception:
-        return "Validation failed: invalid challenge.json or missing required metadata"
+        return _fail("invalid-json", "invalid challenge.json or missing required metadata")
 
-    return (
-        "Validation successful: evidence-based challenge generated and metadata verified.\n"
-        f"Dir: {challenge_dir}"
-    )
+    return _ok("ok", "Validation successful: evidence-based challenge generated and metadata "
+               f"verified.\nDir: {challenge_dir}")
