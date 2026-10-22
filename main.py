@@ -93,6 +93,9 @@ def _build_parser() -> argparse.ArgumentParser:
     lst.add_argument("--json", action="store_true", help="Output JSON instead of a table")
     lst.add_argument("--no-scan", action="store_true", help="Do not rescan generated/ before listing")
 
+    st = subparsers.add_parser("stats", help="Show offline metrics over the generated challenges")
+    st.add_argument("--json", action="store_true", help="Output JSON instead of a report")
+
     web = subparsers.add_parser("web", help="Launch the web GUI to browse the catalog")
     web.add_argument("--host", default="127.0.0.1", help="Host to bind")
     web.add_argument("--port", type=int, default=8000, help="Port to bind")
@@ -186,6 +189,16 @@ def main() -> None:
             print(f"{r['name'][:22]:22} {r['kind']:7} {r['difficulty'][:7]:7} "
                   f"{(r['category'] or '')[:22]:22} {r['flag']}")
         print(f"\n{len(rows)} challenge(s).")
+        return
+
+    if args.command == "stats":
+        from slothctf import stats
+        data = stats.collect()
+        if args.json:
+            import json as _json
+            print(_json.dumps(data, indent=2))
+        else:
+            print(stats.render(data))
         return
 
     if args.command == "web":

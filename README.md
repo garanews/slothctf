@@ -191,6 +191,11 @@ python main.py list --kind check --difficulty easy
 python main.py list --search xor --json
 ```
 
+`python main.py stats` prints an offline metrics snapshot of the corpus — counts
+by genre / difficulty / kind / model, how many have a compiled binary, log
+richness (questions per log, extractive vs computed), and which optional gates
+were used at generation (`--json` for the raw numbers).
+
 Or open the **web GUI** (standard library only — no extra install):
 
 ```bash
