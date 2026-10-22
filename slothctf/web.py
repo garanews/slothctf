@@ -67,6 +67,7 @@ def _build_generate_kwargs(payload: dict) -> dict:
         "max_attempts": max_attempts,
         "surprise": bool(payload.get("surprise")),
         "roundtrip": bool(payload.get("roundtrip")) and genre == "reverse",
+        "adversary": bool(payload.get("adversary")) and genre == "reverse",
     }
     if payload.get("category"):
         kwargs["challenge_type"] = str(payload["category"]).strip()
@@ -275,6 +276,7 @@ _PAGE = """<!doctype html>
     <label>Ollama URL<input id="f_url" style="min-width:320px"></label>
     <label style="flex-direction:row; align-items:center; gap:6px; align-self:flex-end"><input type="checkbox" id="f_surprise"> surprise me</label>
     <label id="f_rt_wrap" style="flex-direction:row; align-items:center; gap:6px; align-self:flex-end"><input type="checkbox" id="f_roundtrip"> round-trip gate</label>
+    <label id="f_adv_wrap" style="flex-direction:row; align-items:center; gap:6px; align-self:flex-end" title="reject medium/hard 'check' challenges a baseline attacker can crack"><input type="checkbox" id="f_adversary"> adversary gate</label>
   </div>
   <div class="row" style="align-items:center">
     <button class="btn primary" id="genBtn" onclick="submitGen()">Generate</button>
@@ -326,7 +328,8 @@ async function loadConfig(){
   for (const d of c.difficulties){ const o=document.createElement('option'); o.value=o.textContent=d; F('f_difficulty').appendChild(o); }
   F('f_difficulty').value='easy';
   F('f_model').value=c.model; F('f_url').value=c.ollama_url; F('f_attempts').value=c.max_attempts;
-  F('f_genre').addEventListener('change', ()=>{ F('f_rt_wrap').style.display = F('f_genre').value==='reverse' ? 'flex':'none'; });
+  F('f_genre').addEventListener('change', ()=>{ const rev = F('f_genre').value==='reverse';
+    F('f_rt_wrap').style.display = rev?'flex':'none'; F('f_adv_wrap').style.display = rev?'flex':'none'; });
 }
 function toggleNew(){ F('newpanel').classList.toggle('open'); }
 async function submitGen(){
@@ -335,6 +338,7 @@ async function submitGen(){
     category:F('f_category').value, prompt:F('f_prompt').value, model:F('f_model').value,
     ollama_url:F('f_url').value, max_attempts:F('f_attempts').value,
     surprise:F('f_surprise').checked, roundtrip:F('f_roundtrip').checked,
+    adversary:F('f_adversary').checked,
   };
   if(!body.name.trim()){ F('genstatus').textContent='Please enter a name.'; return; }
   F('genBtn').disabled=true; F('genstatus').textContent='Starting…';
