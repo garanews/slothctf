@@ -42,6 +42,9 @@ Reverse / crypto (`--genre reverse`, the default) come in two kinds:
   not printed*.
 
 Both are also checked so the plaintext secret is **not** readable via `strings`.
+That check means the plaintext is not present as readable bytes in the binary —
+it is **not** a proof that a reverse engineer can't recover the secret, and not a
+measure of how strong the obfuscation is.
 
 Log analysis (`--genre log`) produces a forensics challenge: one log with
 **several questions**. The model writes a Python **generator** (builds a
