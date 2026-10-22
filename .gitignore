@@ -16,3 +16,4 @@ InstallationLog.txt
 tmp_hello.c
 pytest_results.txt
 verification_status.txt
+runs.jsonl

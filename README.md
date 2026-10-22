@@ -194,7 +194,24 @@ python main.py list --search xor --json
 `python main.py stats` prints an offline metrics snapshot of the corpus — counts
 by genre / difficulty / kind / model, how many have a compiled binary, log
 richness (questions per log, extractive vs computed), and which optional gates
-were used at generation (`--json` for the raw numbers).
+were used at generation (`--json` for the raw numbers). Note it only counts
+challenges that made it to disk (survivors), not failed generation runs.
+
+For an unbiased measurement, [`tools/run_campaign.py`](tools/run_campaign.py)
+runs a **frozen** set of scenarios (repeated N times) and logs one JSON record
+per run — **including failures** — to `runs.jsonl`, then aggregates honest
+metrics:
+
+```bash
+python tools/run_campaign.py --model qwen2.5-coder:32b --ollama-url URL --repeats 3
+python tools/run_campaign.py --report runs.jsonl
+```
+
+It reports, per `genre/difficulty/gates` group: success rate, first-attempt
+success, attempts and seconds to converge (on successful runs only), failure
+frequency by stage, and gate-rejection count — always as numerator/denominator.
+Gates are separate OFF/ON comparisons per challenge kind; disabling a gate means
+it was *not evaluated*, not that the run would have passed it.
 
 Or open the **web GUI** (standard library only — no extra install):
 
