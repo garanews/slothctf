@@ -61,6 +61,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="(reverse genre) also require decode(encode(x))==x on random inputs, not just "
         "the chosen flag — proves the transform is a true inverse in general",
     )
+    gen.add_argument(
+        "--adversary",
+        action="store_true",
+        help="(reverse 'check' challenges) run a budgeted reference attacker (dictionary + "
+        "short brute force); a medium/hard challenge it cracks is rejected as too easy",
+    )
 
     validate = subparsers.add_parser("validate", help="Validate a generated challenge")
     validate.add_argument("--dir", required=True, help="Challenge directory to validate")
@@ -108,6 +114,7 @@ def main() -> None:
                 ollama_url=args.ollama_url,
                 genre=args.genre,
                 roundtrip=args.roundtrip,
+                adversary=args.adversary,
                 return_report=True,
             )
         except GenerationError as exc:

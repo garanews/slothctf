@@ -124,6 +124,16 @@ inverse in general (byte overflow, signed/unsigned or modulo edges) — the clas
 encoder and challenge (no model-written test), so it checks the real transform.
 ([Idea from a reader on the write-up.](https://dev.to/garanews/i-was-too-lazy-to-write-ctf-challenges-so-i-built-a-local-ai-that-writes-compiles-and-checks-its-1927))
 
+### Reference-attacker gate (`--adversary`)
+
+Correctness is not difficulty. `--adversary` runs a budgeted reference attacker
+against `check` challenges — a dictionary of common secrets plus a short
+brute-force — and **rejects a medium/hard challenge that it cracks** (it's too
+easy for its label). `decode` challenges solve by being run, so the gate doesn't
+apply to them. This turns "too easy to brute-force" into a measurable property
+instead of a guess — again by making an automated attacker try, not by asking
+the model. ([Idea from a reader on the write-up.](https://dev.to/garanews/i-was-too-lazy-to-write-ctf-challenges-so-i-built-a-local-ai-that-writes-compiles-and-checks-its-1927))
+
 ## What gets generated
 
 ```text

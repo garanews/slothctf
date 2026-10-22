@@ -754,7 +754,8 @@ def _parse_encoder_output(text: str) -> str | None:
     return ", ".join(t.lower() for t in tokens)
 
 
-def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str, roundtrip: bool = False) -> AttemptResult:
+def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str,
+                      roundtrip: bool = False, adversary: bool = False) -> AttemptResult:
     """Build and self-check a challenge using the model's own encoder.
 
     Pipeline: compile+run the encoder on the flag to get the exact encoded
@@ -873,8 +874,16 @@ def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str, round
         if rt is not None:
             return rt
 
+    # 8. Optional: a reference attacker must not crack a medium/hard challenge.
+    if adversary:
+        adv = _adversary_check(challenge_bin, kind, str(data.get("success_marker", "")).strip(),
+                               str(data.get("difficulty", "easy")))
+        if adv is not None:
+            return adv
+
+    extras = ("+round-trip" if roundtrip else "") + (" +adversary" if adversary else "")
     return AttemptResult(0, True, "passed", f"{kind} verified: {expected}"
-                         + (" (+round-trip)" if roundtrip else ""))
+                         + (f" ({extras.strip()})" if extras.strip() else ""))
 
 
 def _roundtrip_check(base_dir: Path, template: str, encoder_bin: Path, compiler: str,
@@ -929,6 +938,64 @@ def _roundtrip_check(base_dir: Path, template: str, encoder_bin: Path, compiler:
         rt_src.unlink(missing_ok=True)
         for ext in ("", ".exe"):
             (bin_dir / f"_roundtrip{ext}").unlink(missing_ok=True)
+
+
+_COMMON_SECRETS = [
+    "password", "passw0rd", "p@ssw0rd", "pass", "admin", "administrator", "root",
+    "secret", "letmein", "welcome", "qwerty", "123456", "12345678", "111111",
+    "test", "guest", "login", "changeme", "default", "master", "flag", "ctf",
+    "easy", "easy_peasy", "sloth", "hunter2", "dragon", "monkey", "superman",
+    "iloveyou", "abc123", "football", "princess", "shadow", "michael", "666666",
+    "whatever", "trustno1", "access", "securepass", "s3cr3t", "god", "money",
+]
+
+
+def _adversary_check(challenge_bin: Path, kind: str, marker: str, difficulty: str,
+                     budget_attempts: int = 1600, budget_time: float = 15.0) -> AttemptResult | None:
+    """A reference attacker with a budget. For `check` challenges it tries a
+    dictionary of common secrets plus a short brute-force; if a medium/hard
+    challenge is cracked within budget it is too easy. decode challenges solve by
+    being run, so the gate does not apply to them."""
+    import itertools
+    import string
+    import time
+
+    if kind != "check" or not marker:
+        return None  # not applicable (decode = run-to-solve)
+
+    def cracked_by(candidate: str) -> bool:
+        try:
+            _, out, _ = _run_binary(challenge_bin, stdin_text=candidate + "\n", timeout=3.0)
+        except subprocess.TimeoutExpired:
+            return False
+        return marker in out
+
+    # Candidates: common secrets (bare and wrapped) then short brute force.
+    def candidates():
+        for w in _COMMON_SECRETS:
+            yield w
+            yield f"sloth{{{w}}}"
+        alpha = string.ascii_lowercase + string.digits
+        for n in (1, 2):
+            for combo in itertools.product(alpha, repeat=n):
+                s = "".join(combo)
+                yield f"sloth{{{s}}}"
+
+    start = time.monotonic()
+    tried = 0
+    for cand in candidates():
+        if tried >= budget_attempts or time.monotonic() - start > budget_time:
+            break
+        tried += 1
+        if cracked_by(cand):
+            if difficulty in ("medium", "hard"):
+                return AttemptResult(
+                    0, False, "too-easy",
+                    f"a baseline attacker cracked the secret within budget (found "
+                    f"{cand!r} in {tried} tries) — too weak for a '{difficulty}' challenge. "
+                    "Use a longer, non-dictionary secret.")
+            return None  # easy: being guessable is acceptable
+    return None
 
 
 def _run_python(script: Path, args: list[str], timeout: float = 20.0) -> tuple[bool, str, str]:
@@ -1077,6 +1144,7 @@ def generate_challenge(
     target_platform: str | None = None,
     genre: str = "reverse",
     roundtrip: bool = False,
+    adversary: bool = False,
     *,
     caller: Callable[[str, str], dict[str, Any]] | None = None,
     return_report: bool = False,
@@ -1111,7 +1179,8 @@ def generate_challenge(
     # log is appended to user_prompt below, so capture the clean prompt here.
     gen_meta: dict[str, Any] = {
         "prompt": user_prompt, "genre": genre, "model": model,
-        "difficulty": difficulty, "roundtrip": bool(roundtrip), "surprise": bool(surprise),
+        "difficulty": difficulty, "roundtrip": bool(roundtrip),
+        "adversary": bool(adversary), "surprise": bool(surprise),
     }
     if input_path:
         gen_meta["input"] = Path(input_path).name
@@ -1135,7 +1204,7 @@ def generate_challenge(
         compiler = None  # log challenges are Python, no C compiler needed
     else:
         schema, required = _SCHEMA_RULES, ("encoder_code", "challenge_code")
-        verify_fn = lambda b, d, c: _verify_challenge(b, d, c, roundtrip=roundtrip)  # noqa: E731
+        verify_fn = lambda b, d, c: _verify_challenge(b, d, c, roundtrip=roundtrip, adversary=adversary)  # noqa: E731
         compiler = _find_compiler()
         if compiler is None:
             raise GenerationError(

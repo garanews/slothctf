@@ -59,6 +59,13 @@ class PromptBuildTests(unittest.TestCase):
         self.assertIn("previous attempt failed", text.lower())
         self.assertIn("missing semicolon", text)
 
+    def test_adversary_not_applicable_to_decode(self):
+        from slothctf.generator import _adversary_check, _COMMON_SECRETS
+        self.assertIn("password", _COMMON_SECRETS)
+        # decode / missing marker -> gate does not apply (returns None, no run)
+        self.assertIsNone(_adversary_check(Path("nope"), "decode", "", "hard"))
+        self.assertIsNone(_adversary_check(Path("nope"), "check", "", "hard"))
+
     def test_default_flag_policy(self):
         from slothctf.generator import _random_flag
         rf = _random_flag()
