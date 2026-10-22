@@ -755,7 +755,8 @@ def _parse_encoder_output(text: str) -> str | None:
 
 
 def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str,
-                      roundtrip: bool = False, adversary: bool = False) -> AttemptResult:
+                      roundtrip: bool = False, adversary: bool = False,
+                      adversary_budget: tuple[int, float] | None = None) -> AttemptResult:
     """Build and self-check a challenge using the model's own encoder.
 
     Pipeline: compile+run the encoder on the flag to get the exact encoded
@@ -877,7 +878,7 @@ def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str,
     # 8. Optional: a reference attacker must not crack a medium/hard challenge.
     if adversary:
         adv = _adversary_check(challenge_bin, kind, str(data.get("success_marker", "")).strip(),
-                               str(data.get("difficulty", "easy")))
+                               str(data.get("difficulty", "easy")), budget=adversary_budget)
         if adv is not None:
             return adv
 
@@ -950,12 +951,21 @@ _COMMON_SECRETS = [
 ]
 
 
+# Default attacker budget per difficulty: a HARD challenge must resist a stronger
+# attacker than a MEDIUM one. The dictionary is kept deliberately small (a lazy
+# first-guess attacker, not a determined reverser) so the gate doesn't reject
+# challenges that are actually fine for humans. Override with --adversary-budget.
+_ADVERSARY_BUDGET = {"medium": (800, 8.0), "hard": (2000, 20.0)}
+
+
 def _adversary_check(challenge_bin: Path, kind: str, marker: str, difficulty: str,
-                     budget_attempts: int = 1600, budget_time: float = 15.0) -> AttemptResult | None:
+                     budget: tuple[int, float] | None = None) -> AttemptResult | None:
     """A reference attacker with a budget. For `check` challenges it tries a
     dictionary of common secrets plus a short brute-force; if a medium/hard
     challenge is cracked within budget it is too easy. decode challenges solve by
-    being run, so the gate does not apply to them."""
+    being run, so the gate does not apply to them. The budget scales with the
+    declared difficulty unless an explicit one is given."""
+    budget_attempts, budget_time = budget or _ADVERSARY_BUDGET.get(difficulty, (1000, 10.0))
     import itertools
     import string
     import time
@@ -1145,6 +1155,7 @@ def generate_challenge(
     genre: str = "reverse",
     roundtrip: bool = False,
     adversary: bool = False,
+    adversary_budget: tuple[int, float] | None = None,
     *,
     caller: Callable[[str, str], dict[str, Any]] | None = None,
     return_report: bool = False,
@@ -1204,7 +1215,8 @@ def generate_challenge(
         compiler = None  # log challenges are Python, no C compiler needed
     else:
         schema, required = _SCHEMA_RULES, ("encoder_code", "challenge_code")
-        verify_fn = lambda b, d, c: _verify_challenge(b, d, c, roundtrip=roundtrip, adversary=adversary)  # noqa: E731
+        verify_fn = lambda b, d, c: _verify_challenge(  # noqa: E731
+            b, d, c, roundtrip=roundtrip, adversary=adversary, adversary_budget=adversary_budget)
         compiler = _find_compiler()
         if compiler is None:
             raise GenerationError(

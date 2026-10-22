@@ -67,6 +67,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="(reverse 'check' challenges) run a budgeted reference attacker (dictionary + "
         "short brute force); a medium/hard challenge it cracks is rejected as too easy",
     )
+    gen.add_argument(
+        "--adversary-budget",
+        default=None,
+        metavar="ATTEMPTS,SECONDS",
+        help="override the attacker budget (e.g. '2000,20'); default scales with difficulty "
+        "(medium=800/8s, hard=2000/20s)",
+    )
 
     validate = subparsers.add_parser("validate", help="Validate a generated challenge")
     validate.add_argument("--dir", required=True, help="Challenge directory to validate")
@@ -100,6 +107,14 @@ def main() -> None:
 
     if args.command == "generate":
         input_path = Path(args.input) if args.input else None
+        adv_budget = None
+        if args.adversary_budget:
+            try:
+                a, s = args.adversary_budget.split(",")
+                adv_budget = (int(a), float(s))
+            except ValueError:
+                print("--adversary-budget must be 'ATTEMPTS,SECONDS' (e.g. 2000,20)", file=sys.stderr)
+                raise SystemExit(2)
         try:
             report = generate_challenge(
                 args.name,
@@ -115,6 +130,7 @@ def main() -> None:
                 genre=args.genre,
                 roundtrip=args.roundtrip,
                 adversary=args.adversary,
+                adversary_budget=adv_budget,
                 return_report=True,
             )
         except GenerationError as exc:

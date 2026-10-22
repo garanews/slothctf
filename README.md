@@ -130,9 +130,16 @@ actual encoder and challenge (no model-written test), so it checks the real code
 
 Correctness is not difficulty. `--adversary` runs a budgeted reference attacker
 against `check` challenges — a dictionary of common secrets plus a short
-brute-force (≤1600 tries / ~15s) — and **rejects a medium/hard challenge that it
-cracks** (it's too easy for its label). `decode` challenges solve by being run,
-so the gate doesn't apply to them.
+brute-force — and **rejects a medium/hard challenge that it cracks** (it's too
+easy for its label). `decode` challenges solve by being run, so the gate doesn't
+apply to them.
+
+The budget **scales with the declared difficulty** (a `hard` challenge must
+resist a stronger attacker than a `medium` one — defaults: medium 800 tries/8s,
+hard 2000/20s) and is tunable with `--adversary-budget ATTEMPTS,SECONDS`. The
+dictionary is kept deliberately small — a lazy first-guess attacker, not a
+determined reverser — so the gate flags *trivially guessable* secrets without
+rejecting challenges that are genuinely fine for humans.
 
 This is a **first automatic filter against trivially guessable secrets, not a
 global difficulty assessment**: it only measures resistance to *this* attacker.
