@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "name": "recover-pilot",
+  "model": "qwen2.5-coder:32b",
+  "reps": 3,
+  "max_attempts": 3,
+  "note": "Frozen pilot: 2 targets x 3 difficulties x 3 reps = 18 runs. Prompts are deliberately NEUTRAL about the obfuscation technique (we are measuring what Qwen chooses, not steering it). Do not edit prompts/model/reps between runs of the same campaign; bump 'version' and start a new dataset instead.",
+  "scenarios": [
+    {
+      "id": "elf-easy",
+      "target": "elf",
+      "difficulty": "easy",
+      "prompt": "Create an easy 'recover' reverse-engineering challenge. The binary must read one line from stdin, accept only the correct flag (print a success marker) and reject anything else, and it must NOT print the flag. The flag has to be recoverable by static analysis of the binary."
+    },
+    {
+      "id": "elf-medium",
+      "target": "elf",
+      "difficulty": "medium",
+      "prompt": "Create a medium 'recover' reverse-engineering challenge. The binary must read one line from stdin, accept only the correct flag (print a success marker) and reject anything else, and it must NOT print the flag. The flag has to be recoverable by static analysis of the binary."
+    },
+    {
+      "id": "elf-hard",
+      "target": "elf",
+      "difficulty": "hard",
+      "prompt": "Create a hard 'recover' reverse-engineering challenge. The binary must read one line from stdin, accept only the correct flag (print a success marker) and reject anything else, and it must NOT print the flag. The flag has to be recoverable by static analysis of the binary."
+    },
+    {
+      "id": "pe-easy",
+      "target": "pe",
+      "difficulty": "easy",
+      "prompt": "Create an easy 'recover' reverse-engineering challenge. The binary must read one line from stdin, accept only the correct flag (print a success marker) and reject anything else, and it must NOT print the flag. The flag has to be recoverable by static analysis of the binary."
+    },
+    {
+      "id": "pe-medium",
+      "target": "pe",
+      "difficulty": "medium",
+      "prompt": "Create a medium 'recover' reverse-engineering challenge. The binary must read one line from stdin, accept only the correct flag (print a success marker) and reject anything else, and it must NOT print the flag. The flag has to be recoverable by static analysis of the binary."
+    },
+    {
+      "id": "pe-hard",
+      "target": "pe",
+      "difficulty": "hard",
+      "prompt": "Create a hard 'recover' reverse-engineering challenge. The binary must read one line from stdin, accept only the correct flag (print a success marker) and reject anything else, and it must NOT print the flag. The flag has to be recoverable by static analysis of the binary."
+    }
+  ]
+}
