@@ -187,14 +187,66 @@ class NativeBackendRealTests(unittest.TestCase):
             self.assertTrue(r.ok)
             self.assertIn("sloth{ok}", r.stdout)
 
+
+class _EofPipe:
+    """A pipe that is already at EOF — read() always yields no bytes."""
+    def read(self, _n):
+        return b""
+
+    def close(self):
+        pass
+
+
+class _HangingProc:
+    """Stands in for a child that never exits on its own: wait() times out once,
+    then returns after it is killed. Lets the timeout path be tested without a
+    real long-running process or a compiler."""
+    def __init__(self):
+        self.stdout = _EofPipe()
+        self.stderr = _EofPipe()
+        self.stdin = None
+        self.returncode = None
+        self._waits = 0
+
+    def wait(self, timeout=None):
+        self._waits += 1
+        if self._waits == 1:
+            raise ex.subprocess.TimeoutExpired(cmd="x", timeout=timeout)
+        self.returncode = -9
+        return -9
+
+    def kill(self):
+        self.returncode = -9
+
+
+class CappedCaptureTests(unittest.TestCase):
+    """The bounded-capture runner used by both backends: a timeout is reported
+    cleanly, and output is capped in memory, not buffered whole then trimmed."""
+
     def test_run_timeout_is_clean(self):
         b = NativeBackend()
-        with TemporaryDirectory() as tmp, \
-             mock.patch.object(ex.subprocess, "run",
-                               side_effect=ex.subprocess.TimeoutExpired("x", 1)):
-            r = b.run_binary(Path(tmp), "bin/c", host_native_target())
-            self.assertFalse(r.ok)
-            self.assertTrue(r.timed_out)
+        with mock.patch.object(ex.subprocess, "Popen", return_value=_HangingProc()):
+            r = b.run_binary(Path("."), "bin/c", host_native_target())
+        self.assertFalse(r.ok)
+        self.assertTrue(r.timed_out)
+
+    def test_native_output_memory_is_bounded(self):
+        # The process prints ~16 MB but we keep at most output_bytes of it: the
+        # retained string must stay tiny, proving output_bytes caps real memory
+        # during the run rather than trimming an already-buffered flood.
+        b = NativeBackend()
+        with TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            (ws / "spew.py").write_text(
+                "import sys\n"
+                "chunk=b'A'*65536\n"
+                "for _ in range(256):\n"       # ~16 MB total
+                "    sys.stdout.buffer.write(chunk)\n", encoding="utf-8")
+            r = b.run_python(ws, "spew.py", limits=ResourceLimits(output_bytes=1000))
+        self.assertTrue(r.truncated)
+        self.assertFalse(r.timed_out)
+        # capped bytes (1000) + a short truncation marker, and never the 16 MB.
+        self.assertLessEqual(len(r.stdout.encode("utf-8")), 1000 + 128)
 
 
 if __name__ == "__main__":

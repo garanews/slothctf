@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import threading
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -47,7 +48,9 @@ class ResourceLimits:
     pids: int = 256
     compile_timeout: float = 60.0
     run_timeout: float = 15.0
-    output_bytes: int = 1_000_000  # captured stdout/stderr is truncated past this
+    output_bytes: int = 1_000_000  # hard cap on bytes of stdout/stderr retained in
+    #                                memory during a run; the excess is drained and
+    #                                discarded, not buffered then trimmed.
 
 
 @dataclass
@@ -65,6 +68,117 @@ def _truncate(s: str, limit: int) -> tuple[str, bool]:
     if len(s) <= limit:
         return s, False
     return s[:limit] + f"\n...[output truncated at {limit} bytes]", True
+
+
+_READ_CHUNK = 65536  # bytes pulled from a pipe per read
+
+
+def _drain(stream, limit: int, sink: list) -> None:
+    """Read a child's pipe to EOF, keeping at most ``limit`` bytes.
+
+    Runs in its own thread so stdout and stderr are consumed concurrently — a
+    child can fill either pipe without the parent deadlocking. Bytes past the cap
+    are read and DISCARDED (never buffered), so a process that prints gigabytes
+    costs the host a bounded amount of memory, not its whole output. ``sink`` is
+    ``[bytearray, truncated_flag]``; the flag is set once anything is dropped.
+    """
+    buf: bytearray = sink[0]
+    try:
+        while True:
+            chunk = stream.read(_READ_CHUNK)
+            if not chunk:
+                break
+            room = limit - len(buf)
+            if room > 0:
+                buf.extend(chunk[:room])
+            if len(chunk) > max(room, 0):
+                sink[1] = True
+    except (OSError, ValueError):
+        pass  # pipe closed under us (e.g. the process was killed) — stop draining
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _kill(proc: subprocess.Popen) -> None:
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def _run_capped(argv: list[str], *, timeout: float, output_bytes: int,
+                stdin_text: str | None = None, cwd: str | None = None,
+                on_timeout=None) -> tuple[int | None, str, str, bool, bool]:
+    """Run ``argv`` with a wall-clock timeout and truly bounded output capture.
+
+    stdout and stderr are drained by two threads and each retained to at most
+    ``output_bytes`` *bytes* (not characters); the excess is discarded while the
+    process keeps running, so neither a full pipe nor a flood of output can
+    deadlock or exhaust the host. Decoding to text happens only after capping, as
+    UTF-8 with replacement. On timeout the process is killed and ``on_timeout`` (if
+    given) is invoked for extra cleanup (e.g. force-removing a container).
+
+    Returns ``(returncode, stdout, stderr, timed_out, truncated)``.
+    """
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=cwd,
+    )
+    out: list = [bytearray(), False]
+    err: list = [bytearray(), False]
+    t_out = threading.Thread(target=_drain, args=(proc.stdout, output_bytes, out), daemon=True)
+    t_err = threading.Thread(target=_drain, args=(proc.stderr, output_bytes, err), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    # stdin here is always small and trusted (a flag / candidate), so a plain
+    # write+close cannot block on a full pipe the way captured output could.
+    if stdin_text is not None and proc.stdin is not None:
+        try:
+            proc.stdin.write(stdin_text.encode("utf-8", "replace"))
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill(proc)
+        if on_timeout is not None:
+            on_timeout()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    # The kill (or normal exit) closes the pipes, so the drain threads reach EOF.
+    t_out.join(timeout=5)
+    t_err.join(timeout=5)
+
+    # Decode after capping, and normalise newlines the way the previous text-mode
+    # capture did (universal newlines) so a Windows child's CRLF output is treated
+    # identically to a container's LF — downstream code assumes '\n'-only text.
+    def _decode(b: bytearray) -> str:
+        return b.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+
+    out_s = _decode(out[0])
+    err_s = _decode(err[0])
+    if out[1]:
+        out_s += f"\n...[output truncated at {output_bytes} bytes]"
+    if err[1]:
+        err_s += f"\n...[output truncated at {output_bytes} bytes]"
+    return proc.returncode, out_s, err_s, timed_out, out[1] or err[1]
 
 
 # --------------------------------------------------------------------------- #
@@ -133,17 +247,14 @@ class NativeBackend(ExecutionBackend):
 
     def _run(self, argv: list[str], timeout: float, limits: ResourceLimits,
              workspace: Path, stdin_text: str | None = None) -> ExecResult:
-        try:
-            r = subprocess.run(
-                argv, input=stdin_text, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=timeout,
-                cwd=str(workspace),  # match the container's /work cwd, so relative args resolve the same
-            )
-        except subprocess.TimeoutExpired:
+        rc, out, err, timed_out, truncated = _run_capped(
+            argv, timeout=timeout, output_bytes=limits.output_bytes,
+            stdin_text=stdin_text,
+            cwd=str(workspace),  # match the container's /work cwd, so relative args resolve the same
+        )
+        if timed_out:
             return ExecResult(False, "", f"timed out after {timeout:.0f}s", timed_out=True)
-        out, t1 = _truncate(r.stdout or "", limits.output_bytes)
-        err, t2 = _truncate((r.stderr or "").strip(), limits.output_bytes)
-        return ExecResult(r.returncode == 0, out, err, exit_code=r.returncode, truncated=t1 or t2)
+        return ExecResult(rc == 0, out, err.strip(), exit_code=rc, truncated=truncated)
 
     def compile_c(self, workspace, source_rel, out_rel, target, limits=None):
         self._require_target(target)
@@ -227,18 +338,15 @@ class DockerLinuxBackend(ExecutionBackend):
         name = f"slothctf-{uuid.uuid4().hex[:12]}"
         argv = build_docker_run_argv(self.image, inner, workspace, limits, name,
                                      stdin=stdin_text is not None)
-        try:
-            r = subprocess.run(
-                argv, input=stdin_text, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            # The CLI was killed but the container may linger — force-remove it.
-            self._force_remove(name)
+        # On timeout the `docker run` CLI is killed but the container may linger —
+        # force-remove it by name so it never outlives the step.
+        rc, out, err, timed_out, truncated = _run_capped(
+            argv, timeout=timeout, output_bytes=limits.output_bytes,
+            stdin_text=stdin_text, on_timeout=lambda: self._force_remove(name),
+        )
+        if timed_out:
             return ExecResult(False, "", f"timed out after {timeout:.0f}s", timed_out=True)
-        out, t1 = _truncate(r.stdout or "", limits.output_bytes)
-        err, t2 = _truncate((r.stderr or "").strip(), limits.output_bytes)
-        return ExecResult(r.returncode == 0, out, err, exit_code=r.returncode, truncated=t1 or t2)
+        return ExecResult(rc == 0, out, err.strip(), exit_code=rc, truncated=truncated)
 
     @staticmethod
     def _force_remove(name: str) -> None:
