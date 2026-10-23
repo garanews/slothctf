@@ -6,6 +6,7 @@ native Docker) and `python main.py sandbox-build`, they prove the container real
 is isolated: no network, bounded time, read-only root fs with a writable /tmp, and
 truncated output. Run: python -m unittest tests.test_docker_backend
 """
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -92,6 +93,73 @@ class DockerIsolationTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             with self.assertRaises(SandboxUnavailable):
                 self.b.compile_c(Path(tmp), "src/c.c", "bin/c.exe", PE)  # ELF-only in Phase A
+
+
+@unittest.skipUnless(_READY, _SKIP)
+class EndToEndElfTests(unittest.TestCase):
+    """Full generate -> Docker compile/run -> validate path for an ELF challenge,
+    driven by a PRE-RECORDED model response (no Ollama). This is the integration
+    seam the unit tests stub out: here the model's C is really compiled and run in
+    the sandbox container, both while generating and again while validating. It is
+    NOT a substitute for a real end-to-end run with Qwen — it fixes the model's
+    output so the test is deterministic; a live-model run stays a separate check.
+    """
+
+    # A minimal, self-consistent decode challenge: the encoder XORs the flag with
+    # 0x5a and prints the bytes; the challenge embeds those bytes and XORs them back.
+    _FLAG = "sloth{elf_e2e}"
+    _RESPONSE = {
+        "title": "XOR E2E",
+        "category": "Reverse Engineering",
+        "difficulty": "easy",
+        "description": "Recover the flag printed by the binary.",
+        "flag": _FLAG,
+        "challenge_kind": "decode",
+        "encoder_code": (
+            "#include <stdio.h>\n"
+            "int main(int c,char**v){for(char*p=v[1];*p;++p)"
+            "printf(\"0x%02x,\",(unsigned char)(*p^0x5a));return 0;}\n"
+        ),
+        "challenge_code": (
+            "#include <stdio.h>\n"
+            "static unsigned char t[]={ /*__ENCODED_ARRAY__*/ };\n"
+            "int main(void){for(unsigned long i=0;i<sizeof t;i++)"
+            "putchar(t[i]^0x5a);return 0;}\n"
+        ),
+    }
+
+    def test_generate_then_validate_in_sandbox(self):
+        from slothctf.generator import generate_challenge
+        from slothctf.validator import validate_challenge
+
+        def fake_caller(prompt, model):
+            return dict(self._RESPONSE)
+
+        prev = os.getcwd()
+        with TemporaryDirectory() as tmp:
+            os.chdir(tmp)  # generate_challenge writes under ./generated/<name>
+            try:
+                report = generate_challenge(
+                    "elf_e2e",
+                    prompt="easy XOR reverse",
+                    caller=fake_caller,
+                    backend=DockerLinuxBackend(),   # real sandbox, no silent fallback
+                    target="elf",
+                    max_attempts=1,
+                    return_report=True,
+                )
+                self.assertTrue(report.success, report.as_text())
+                challenge_dir = Path("generated") / "elf_e2e"
+                # The ELF the container compiled is readable on the host mount.
+                self.assertTrue((challenge_dir / "bin" / "challenge").exists())
+                for name in ("challenge.json", "README.md", "solution.md"):
+                    self.assertTrue((challenge_dir / name).exists(), name)
+
+                # Re-validate from scratch through the same sandbox.
+                result = validate_challenge(challenge_dir, backend=DockerLinuxBackend())
+                self.assertTrue(result.success, str(result))
+            finally:
+                os.chdir(prev)
 
 
 if __name__ == "__main__":

@@ -287,7 +287,22 @@ class AdversaryBudgetTests(unittest.TestCase):
 
     @unittest.skipUnless(generator._find_compiler() is not None, "needs a C compiler")
     def test_budget_is_a_real_knob(self):
+        # Deterministic, machine-speed-independent check that the attempt budget is
+        # a real gate. The reference attacker tries each common secret first as the
+        # bare word and then wrapped as sloth{word} (generator._adversary_check over
+        # _COMMON_SECRETS). For a flag whose secret is the FIRST common secret:
+        #   candidate #1 = bare word  -> wrong length -> "Denied"
+        #   candidate #2 = sloth{word} -> the exact flag -> "Access Granted" (cracked)
+        # So an attempt budget of 1 never reaches the crack; a budget of 2 does.
+        # We pass an effectively infinite TIME budget so only the attempt count
+        # decides — the earlier version used a 60s wall-clock budget, which made the
+        # verdict depend on how fast the host spawned ~1000 real subprocesses (flaky
+        # under load). The production adversary is untouched; only the test's
+        # explicit budget differs, and this runs ~2 subprocesses instead of ~1800.
         import tempfile
+        from slothctf.generator import _COMMON_SECRETS
+        secret = _COMMON_SECRETS[0]
+        flag = f"sloth{{{secret}}}"
         enc = ('#include <stdio.h>\nint main(int c,char**v){for(char*p=v[1];*p;++p)'
                'printf("0x%02x,",(unsigned char)(*p^0x37));}')
         ch = ('#include <stdio.h>\n#include <string.h>\nstatic unsigned char t[]={ '
@@ -300,17 +315,21 @@ class AdversaryBudgetTests(unittest.TestCase):
         from slothctf.targets import host_native_target
         be, tg = NativeBackend(), host_native_target()
 
+        NO_TIME_LIMIT = 10 ** 9  # seconds; the attempt count is the only real bound
+
         def mk():
             return generator._normalize_challenge(
                 {"title": "B", "category": "Reverse Engineering", "difficulty": "hard",
-                 "flag": "sloth{z9}", "challenge_kind": "check", "success_marker": "Access Granted",
+                 "flag": flag, "challenge_kind": "check", "success_marker": "Access Granted",
                  "encoder_code": enc, "challenge_code": ch}, "hard", None, "reverse")
 
         with tempfile.TemporaryDirectory() as t1, tempfile.TemporaryDirectory() as t2:
-            small = generator._verify_challenge(Path(t1), mk(), be, tg, adversary=True, adversary_budget=(900, 60))
-            large = generator._verify_challenge(Path(t2), mk(), be, tg, adversary=True, adversary_budget=(1500, 60))
-        self.assertTrue(small.ok)            # small budget doesn't reach it
-        self.assertEqual(large.stage, "too-easy")  # larger budget cracks it
+            small = generator._verify_challenge(Path(t1), mk(), be, tg, adversary=True,
+                                                adversary_budget=(1, NO_TIME_LIMIT))
+            large = generator._verify_challenge(Path(t2), mk(), be, tg, adversary=True,
+                                                adversary_budget=(2, NO_TIME_LIMIT))
+        self.assertTrue(small.ok, small.detail)      # 1 attempt: never reaches sloth{word}
+        self.assertEqual(large.stage, "too-easy")    # 2 attempts: the dictionary cracks it
 
 
 class LogVerifyTests(unittest.TestCase):
