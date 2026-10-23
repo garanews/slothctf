@@ -34,6 +34,15 @@ class Target:
     native_compilers: tuple[str, ...]  # host compilers that emit this format directly
     mingw_cross: str = ""           # Linux cross-compiler that emits this (pe only), for Phase B
 
+    @property
+    def exe_suffix(self) -> str:
+        return ".exe" if self.name == "pe" else ""
+
+    def artifact(self, stem: str) -> str:
+        """Filename for an auxiliary binary of this target, e.g. artifact('encoder')
+        -> 'encoder.exe' for PE, 'encoder' for ELF."""
+        return f"{stem}{self.exe_suffix}"
+
     def matches_magic(self, head: bytes) -> bool:
         return any(head.startswith(sig) for sig in self.magic)
 

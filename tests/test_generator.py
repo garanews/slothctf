@@ -111,10 +111,13 @@ class PromptBuildTests(unittest.TestCase):
 
     def test_adversary_not_applicable_to_decode(self):
         from slothctf.generator import _adversary_check, _COMMON_SECRETS
+        from slothctf.execution import NativeBackend
+        from slothctf.targets import host_native_target
+        be, tg = NativeBackend(), host_native_target()
         self.assertIn("password", _COMMON_SECRETS)
         # decode / missing marker -> gate does not apply (returns None, no run)
-        self.assertIsNone(_adversary_check(Path("nope"), "decode", "", "hard"))
-        self.assertIsNone(_adversary_check(Path("nope"), "check", "", "hard"))
+        self.assertIsNone(_adversary_check(Path("nope"), "bin/x", be, tg, "decode", "", "hard"))
+        self.assertIsNone(_adversary_check(Path("nope"), "bin/x", be, tg, "check", "", "hard"))
 
     def test_default_flag_policy(self):
         from slothctf.generator import _random_flag
@@ -211,14 +214,15 @@ class GenerationLoopTests(unittest.TestCase):
             calls["n"] += 1
             return responses[min(idx, len(responses) - 1)]
 
-        with mock.patch.object(generator, "_find_compiler", return_value="gcc"), \
-             mock.patch.object(generator, "_write_challenge_files"), \
+        from slothctf.execution import NativeBackend
+        with mock.patch.object(generator, "_write_challenge_files"), \
              mock.patch.object(generator, "_verify_challenge", side_effect=verify_side_effect):
             return generate_challenge(
                 "unit_test_challenge",
                 prompt="make a challenge",
                 caller=fake_caller,
                 max_attempts=max_attempts,
+                backend=NativeBackend(),   # explicit: these tests mock verify, no real exec
                 return_report=True,
             )
 
@@ -255,10 +259,19 @@ class GenerationLoopTests(unittest.TestCase):
         self.assertFalse(report.success)
         self.assertEqual(report.attempts[0].stage, "bad-schema")
 
-    def test_raises_without_compiler(self):
-        with mock.patch.object(generator, "_find_compiler", return_value=None):
-            with self.assertRaises(GenerationError):
-                generate_challenge("x", caller=lambda p, m: {}, return_report=True)
+    def test_no_backend_without_docker_refuses(self):
+        # No backend + Docker unavailable => explicit error, never a silent native run.
+        from slothctf.execution import SandboxUnavailable
+        with mock.patch("slothctf.execution.docker_available", return_value=False):
+            with self.assertRaises(SandboxUnavailable):
+                generate_challenge("x", target="elf", caller=lambda p, m: {}, return_report=True)
+
+    def test_isolated_pe_refused_until_phase_b(self):
+        # PE has no isolated backend yet => explicit error, never converted to ELF.
+        from slothctf.execution import SandboxUnavailable
+        with mock.patch("slothctf.execution.docker_available", return_value=True):
+            with self.assertRaises(SandboxUnavailable):
+                generate_challenge("x", target="pe", caller=lambda p, m: {}, return_report=True)
 
 
 class AdversaryBudgetTests(unittest.TestCase):
@@ -283,7 +296,9 @@ class AdversaryBudgetTests(unittest.TestCase):
               '{printf("Denied\\n");return 0;}for(size_t i=0;i<n;i++)'
               'if(((unsigned char)b[i]^0x37)!=t[i]){printf("Denied\\n");return 0;}'
               'printf("Access Granted\\n");return 0;}')
-        comp = generator._find_compiler()
+        from slothctf.execution import NativeBackend
+        from slothctf.targets import host_native_target
+        be, tg = NativeBackend(), host_native_target()
 
         def mk():
             return generator._normalize_challenge(
@@ -292,8 +307,8 @@ class AdversaryBudgetTests(unittest.TestCase):
                  "encoder_code": enc, "challenge_code": ch}, "hard", None, "reverse")
 
         with tempfile.TemporaryDirectory() as t1, tempfile.TemporaryDirectory() as t2:
-            small = generator._verify_challenge(Path(t1), mk(), comp, adversary=True, adversary_budget=(900, 60))
-            large = generator._verify_challenge(Path(t2), mk(), comp, adversary=True, adversary_budget=(1500, 60))
+            small = generator._verify_challenge(Path(t1), mk(), be, tg, adversary=True, adversary_budget=(900, 60))
+            large = generator._verify_challenge(Path(t2), mk(), be, tg, adversary=True, adversary_budget=(1500, 60))
         self.assertTrue(small.ok)            # small budget doesn't reach it
         self.assertEqual(large.stage, "too-easy")  # larger budget cracks it
 
@@ -316,8 +331,9 @@ class LogVerifyTests(unittest.TestCase):
         ]
 
     def _run(self, data):
+        from slothctf.execution import NativeBackend
         with TemporaryDirectory() as tmp:
-            return generator._verify_log_challenge(Path(tmp) / "c", data)
+            return generator._verify_log_challenge(Path(tmp) / "c", data, NativeBackend())
 
     def test_passes_multi_task(self):
         data = {"generator_code": self.GOOD_GEN, "tasks": self._tasks()}
@@ -364,7 +380,8 @@ class LogAnalysisVerifyTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             log = Path(tmp) / "provided.log"
             log.write_text(self.LOG, encoding="utf-8")
-            return generator._verify_log_analysis(Path(tmp) / "c", {"tasks": tasks}, log)
+            from slothctf.execution import NativeBackend
+            return generator._verify_log_analysis(Path(tmp) / "c", {"tasks": tasks}, log, NativeBackend())
 
     def test_passes_when_grounded(self):
         r = self._run([{"type": "extractive", "answer": "10.0.0.42", "evidence_line": 2,

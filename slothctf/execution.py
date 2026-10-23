@@ -132,11 +132,12 @@ class NativeBackend(ExecutionBackend):
             f"(looked for: {', '.join(target.native_compilers)})")
 
     def _run(self, argv: list[str], timeout: float, limits: ResourceLimits,
-             stdin_text: str | None = None) -> ExecResult:
+             workspace: Path, stdin_text: str | None = None) -> ExecResult:
         try:
             r = subprocess.run(
                 argv, input=stdin_text, capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=timeout,
+                cwd=str(workspace),  # match the container's /work cwd, so relative args resolve the same
             )
         except subprocess.TimeoutExpired:
             return ExecResult(False, "", f"timed out after {timeout:.0f}s", timed_out=True)
@@ -148,22 +149,21 @@ class NativeBackend(ExecutionBackend):
         self._require_target(target)
         limits = limits or ResourceLimits()
         compiler = self._compiler_for(target)
-        src = workspace / source_rel
-        out = workspace / out_rel
-        out.parent.mkdir(parents=True, exist_ok=True)
-        return self._run([compiler, "-O2", "-s", "-o", str(out), str(src)],
-                         limits.compile_timeout, limits)
+        (workspace / out_rel).parent.mkdir(parents=True, exist_ok=True)
+        return self._run([compiler, "-O2", "-s", "-o", out_rel, source_rel],
+                         limits.compile_timeout, limits, workspace)
 
     def run_binary(self, workspace, binary_rel, target, args=None, stdin_text=None, limits=None):
         self._require_target(target)
         limits = limits or ResourceLimits()
-        return self._run([str(workspace / binary_rel), *(args or [])],
-                         limits.run_timeout, limits, stdin_text=stdin_text)
+        # Absolute path for the binary itself (not every OS resolves ./rel), cwd=workspace.
+        return self._run([str((workspace / binary_rel).resolve()), *(args or [])],
+                         limits.run_timeout, limits, workspace, stdin_text=stdin_text)
 
     def run_python(self, workspace, script_rel, args=None, stdin_text=None, limits=None):
         limits = limits or ResourceLimits()
-        return self._run(["python", "-I", str(workspace / script_rel), *(args or [])],
-                         limits.run_timeout, limits, stdin_text=stdin_text)
+        return self._run(["python", "-I", script_rel, *(args or [])],
+                         limits.run_timeout, limits, workspace, stdin_text=stdin_text)
 
 
 # --------------------------------------------------------------------------- #
