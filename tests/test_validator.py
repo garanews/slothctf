@@ -4,9 +4,16 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from slothctf import validator
+from slothctf.execution import NativeBackend
+from slothctf.targets import host_native_target
 from slothctf.validator import _flag_leaks, validate_challenge
 
 _HAS_GCC = validator._find_compiler() is not None
+
+
+def _nb():
+    """Explicit unsafe native backend: re-validate on the host (dev/test use)."""
+    return NativeBackend()
 
 
 def _make_reverse(base: Path, challenge_c: str, flag: str):
@@ -17,6 +24,7 @@ def _make_reverse(base: Path, challenge_c: str, flag: str):
     (base / "challenge.json").write_text(json.dumps({
         "title": "t", "category": "Reverse Engineering", "difficulty": "easy",
         "flag": flag, "challenge_kind": "decode",
+        "target": host_native_target().name,  # built with the host toolchain in tests
     }), encoding="utf-8")
 
 
@@ -43,7 +51,7 @@ class LeakCheckTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             d = Path(tmp) / "leaky"
             _make_reverse(d, '#include <stdio.h>\nint main(){printf("sloth{leaky}\\n");}\n', "sloth{leaky}")
-            r = validate_challenge(d)
+            r = validate_challenge(d, backend=_nb())
             self.assertFalse(r.success)
             self.assertEqual(r.stage, "flag-leak")
 
@@ -56,7 +64,7 @@ class LeakCheckTests(unittest.TestCase):
             src = (f"#include <stdio.h>\nint main(){{unsigned char d[]={{{arr}}};"
                    f"for(int i=0;i<{len(flag)};i++)putchar(d[i]^0x42);putchar(10);}}\n")
             _make_reverse(d, src, flag)
-            r = validate_challenge(d)
+            r = validate_challenge(d, backend=_nb())
             self.assertTrue(r.success, str(r))
 
 
@@ -83,7 +91,7 @@ class ValidateLogTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             d = Path(tmp) / "case"
             _make_log_challenge(d, "10.0.0.9", self.GOOD)
-            r = validate_challenge(d)
+            r = validate_challenge(d, backend=_nb())
             self.assertTrue(r.success)
             self.assertEqual(r.stage, "ok")
 
@@ -91,7 +99,7 @@ class ValidateLogTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             d = Path(tmp) / "case"
             _make_log_challenge(d, "9.9.9.9", self.GOOD)  # declared answer != extracted
-            r = validate_challenge(d)
+            r = validate_challenge(d, backend=_nb())
             self.assertFalse(r.success)
             self.assertEqual(r.stage, "answer-mismatch")
 
@@ -100,7 +108,7 @@ class ValidateLogTests(unittest.TestCase):
             d = Path(tmp) / "case"
             _make_log_challenge(d, "10.0.0.9", self.GOOD)
             (d / "evidence" / "case.log").unlink()
-            r = validate_challenge(d)
+            r = validate_challenge(d, backend=_nb())
             self.assertFalse(r.success)
             self.assertEqual(r.stage, "no-log")
 

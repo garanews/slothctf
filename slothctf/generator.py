@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib import request
 
+from .execution import ExecutionBackend, NativeBackend, ResourceLimits, resolve_backend
+from .targets import Target, get_target, DEFAULT_TARGET
+
 # Base URL of the Ollama server. Defaults to localhost but can point at a
 # remote machine (e.g. a beefy workstation reachable over WireGuard) via the
 # SLOTHCTF_OLLAMA_URL env var or the --ollama-url CLI flag.
@@ -114,6 +117,9 @@ def _find_compiler() -> str | None:
     return None
 
 
+_COMPILE_TIMEOUT = 60.0  # model-written C must compile fast; a hang is a failure, not a wait
+
+
 def _compile_binary(source_path: Path, binary_path: Path, compiler: str) -> tuple[bool, str, Path]:
     """Compile `source_path`. Returns (ok, stderr, actual_binary_path).
 
@@ -121,11 +127,20 @@ def _compile_binary(source_path: Path, binary_path: Path, compiler: str) -> tupl
     for the real artifact after a successful build instead of assuming the name.
     """
     binary_path.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        [compiler, "-O2", "-s", "-o", str(binary_path), str(source_path)],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [compiler, "-O2", "-s", "-o", str(binary_path), str(source_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_COMPILE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return (False,
+                f"compilation timed out after {_COMPILE_TIMEOUT:.0f}s "
+                "(possible pathological source from the model)",
+                binary_path)
     produced = binary_path
     if not produced.exists():
         exe = binary_path.with_suffix(".exe")
@@ -561,6 +576,7 @@ def _write_challenge_files(base_dir: Path, data: dict[str, Any]) -> None:
         "description": data["description"],
         "flag": data["flag"],
         "challenge_kind": data.get("challenge_kind", "decode"),
+        "target": data.get("target", DEFAULT_TARGET),
     }
     if data.get("challenge_kind") == "check":
         meta["success_marker"] = data.get("success_marker", "Access Granted")
@@ -760,8 +776,8 @@ def _parse_encoder_output(text: str) -> str | None:
     return ", ".join(t.lower() for t in tokens)
 
 
-def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str,
-                      roundtrip: bool = False, adversary: bool = False,
+def _verify_challenge(base_dir: Path, data: dict[str, Any], backend: "ExecutionBackend",
+                      target: "Target", roundtrip: bool = False, adversary: bool = False,
                       adversary_budget: tuple[int, float] | None = None) -> AttemptResult:
     """Build and self-check a challenge using the model's own encoder.
 
@@ -781,28 +797,29 @@ def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str,
     org_dir = base_dir / "organizer"
     for d in (src_dir, bin_dir, org_dir):
         d.mkdir(parents=True, exist_ok=True)
+    encoder_rel = f"bin/{target.artifact('encoder')}"
+    challenge_rel = f"bin/{target.artifact('challenge')}"
 
-    # 1. Encoder must compile.
-    encoder_src = org_dir / "encoder.c"
-    encoder_src.write_text(data.get("encoder_code", ""), encoding="utf-8")
-    ok, stderr, encoder_bin = _compile_binary(encoder_src, bin_dir / "encoder", compiler)
-    if not ok:
-        trimmed = "\n".join(stderr.splitlines()[:20])
+    # 1. Encoder must compile (organizer-only tool — still model-written, so it runs
+    #    through the same isolated backend).
+    (org_dir / "encoder.c").write_text(data.get("encoder_code", ""), encoding="utf-8")
+    res = backend.compile_c(base_dir, "organizer/encoder.c", encoder_rel, target)
+    if not res.ok:
+        trimmed = "\n".join(res.stderr.splitlines()[:20])
         return AttemptResult(0, False, "encoder-compile", f"encoder.c failed to compile:\n{trimmed}")
 
     # 2. Run encoder on the flag to get the exact encoded bytes.
-    try:
-        ran, out, err = _run_binary(encoder_bin, [expected])
-    except subprocess.TimeoutExpired:
-        return AttemptResult(0, False, "encoder-timeout", "encoder did not finish within 15s.")
-    if not ran:
-        return AttemptResult(0, False, "encoder-crash", f"encoder crashed: {err[:200]}")
-    array_body = _parse_encoder_output(out)
+    res = backend.run_binary(base_dir, encoder_rel, target, args=[expected])
+    if res.timed_out:
+        return AttemptResult(0, False, "encoder-timeout", "encoder did not finish within the time limit.")
+    if not res.ok:
+        return AttemptResult(0, False, "encoder-crash", f"encoder crashed: {res.stderr[:200]}")
+    array_body = _parse_encoder_output(res.stdout)
     if not array_body:
         return AttemptResult(
             0, False, "encoder-output",
             "The encoder must print the encoded flag as a comma-separated list of "
-            f"0xNN hex bytes and nothing else. It printed: {out[:120]!r}",
+            f"0xNN hex bytes and nothing else. It printed: {res.stdout[:120]!r}",
         )
 
     # 3. Inject the bytes into the challenge at the placeholder.
@@ -815,14 +832,14 @@ def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str,
         )
     injected = challenge_code.replace(ENCODED_PLACEHOLDER, array_body)
     data["challenge_code"] = injected  # persist the final, injected source
-    challenge_src = src_dir / "challenge.c"
-    challenge_src.write_text(injected, encoding="utf-8")
+    (src_dir / "challenge.c").write_text(injected, encoding="utf-8")
 
     # 4. Challenge must compile.
-    ok, stderr, challenge_bin = _compile_binary(challenge_src, bin_dir / "challenge", compiler)
-    if not ok:
-        trimmed = "\n".join(stderr.splitlines()[:20])
+    res = backend.compile_c(base_dir, "src/challenge.c", challenge_rel, target)
+    if not res.ok:
+        trimmed = "\n".join(res.stderr.splitlines()[:20])
         return AttemptResult(0, False, "challenge-compile", f"challenge.c failed to compile:\n{trimmed}")
+    challenge_bin = base_dir / challenge_rel  # host path, for the byte-level leak check
 
     # 5. Behaviour check — depends on the kind of challenge.
     kind = data.get("challenge_kind", "decode")
@@ -831,12 +848,13 @@ def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str,
         if not marker:
             return AttemptResult(0, False, "no-marker", "A 'check' challenge needs a non-empty success_marker.")
         # Correct secret must be accepted...
-        try:
-            _, good_out, _ = _run_binary(challenge_bin, stdin_text=expected + "\n")
-            # ...and an obviously wrong input must be rejected.
-            _, bad_out, _ = _run_binary(challenge_bin, stdin_text="definitely_wrong_" + expected + "\n")
-        except subprocess.TimeoutExpired:
-            return AttemptResult(0, False, "challenge-timeout", "challenge did not finish within 15s.")
+        good = backend.run_binary(base_dir, challenge_rel, target, stdin_text=expected + "\n")
+        # ...and an obviously wrong input must be rejected.
+        bad = backend.run_binary(base_dir, challenge_rel, target,
+                                 stdin_text="definitely_wrong_" + expected + "\n")
+        if good.timed_out or bad.timed_out:
+            return AttemptResult(0, False, "challenge-timeout", "challenge did not finish within the time limit.")
+        good_out, bad_out = good.stdout, bad.stdout
         if marker not in good_out:
             return AttemptResult(
                 0, False, "check-reject",
@@ -851,10 +869,10 @@ def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str,
                 "must only accept the exact secret.",
             )
     else:  # decode
-        try:
-            ran, stdout, err = _run_binary(challenge_bin)
-        except subprocess.TimeoutExpired:
-            return AttemptResult(0, False, "challenge-timeout", "challenge did not finish within 15s.")
+        res = backend.run_binary(base_dir, challenge_rel, target)
+        if res.timed_out:
+            return AttemptResult(0, False, "challenge-timeout", "challenge did not finish within the time limit.")
+        ran, stdout, err = res.ok, res.stdout, res.stderr
         if not ran:
             return AttemptResult(0, False, "challenge-crash", f"challenge crashed: {err[:200]}")
         if stdout.strip() != expected:
@@ -882,14 +900,15 @@ def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str,
     # 7. Optional: prove the transform is a true inverse for MANY inputs, not
     #    just this flag — re-run encode→inject→compile→decode on random inputs.
     if roundtrip:
-        rt = _roundtrip_check(base_dir, template, encoder_bin, compiler, kind,
+        rt = _roundtrip_check(base_dir, template, backend, target, kind,
                               str(data.get("success_marker", "")).strip())
         if rt is not None:
             return rt
 
     # 8. Optional: a reference attacker must not crack a medium/hard challenge.
     if adversary:
-        adv = _adversary_check(challenge_bin, kind, str(data.get("success_marker", "")).strip(),
+        adv = _adversary_check(base_dir, challenge_rel, backend, target, kind,
+                               str(data.get("success_marker", "")).strip(),
                                str(data.get("difficulty", "easy")), budget=adversary_budget)
         if adv is not None:
             return adv
@@ -899,59 +918,59 @@ def _verify_challenge(base_dir: Path, data: dict[str, Any], compiler: str,
                          + (f" ({extras.strip()})" if extras.strip() else ""))
 
 
-def _roundtrip_check(base_dir: Path, template: str, encoder_bin: Path, compiler: str,
-                     kind: str, marker: str, n: int = 4) -> AttemptResult | None:
+def _roundtrip_check(base_dir: Path, template: str, backend: "ExecutionBackend",
+                     target: "Target", kind: str, marker: str, n: int = 4) -> AttemptResult | None:
     """Re-run the pipeline on random inputs; return a failure AttemptResult if
     decode(encode(x)) != x for any, else None. Reuses the real encoder and the
     challenge template (no extra model code), so it tests the actual transform."""
     import random
     import string
-    src_dir = base_dir / "src"
-    bin_dir = base_dir / "bin"
-    rt_src = src_dir / "_roundtrip.c"
+    rt_src = base_dir / "src" / "_roundtrip.c"
+    encoder_rel = f"bin/{target.artifact('encoder')}"
+    rt_rel = f"bin/{target.artifact('_roundtrip')}"
     alphabet = string.ascii_letters + string.digits + "_-"
     try:
         for _ in range(n):
             inner = "".join(random.choice(alphabet) for _ in range(random.randint(3, 20)))
             x = f"sloth{{{inner}}}"
-            try:
-                ran, out, _ = _run_binary(encoder_bin, [x])
-            except subprocess.TimeoutExpired:
+            enc = backend.run_binary(base_dir, encoder_rel, target, args=[x])
+            if enc.timed_out:
                 return AttemptResult(0, False, "roundtrip", "encoder timed out on a random input.")
-            body = _parse_encoder_output(out)
-            if not ran or not body:
+            body = _parse_encoder_output(enc.stdout)
+            if not enc.ok or not body:
                 return AttemptResult(0, False, "roundtrip",
                                      f"encoder produced no bytes for random input {x!r}.")
             rt_src.write_text(template.replace(ENCODED_PLACEHOLDER, body), encoding="utf-8")
-            ok, stderr, rt_bin = _compile_binary(rt_src, bin_dir / "_roundtrip", compiler)
-            if not ok:
+            comp = backend.compile_c(base_dir, "src/_roundtrip.c", rt_rel, target)
+            if not comp.ok:
                 return AttemptResult(0, False, "roundtrip",
-                                     f"challenge did not compile for random input {x!r}:\n{stderr[:200]}")
-            try:
-                if kind == "check":
-                    _, good, _ = _run_binary(rt_bin, stdin_text=x + "\n")
-                    if marker not in (good or ""):
-                        return AttemptResult(
-                            0, False, "roundtrip",
-                            f"random input {x!r} is NOT accepted — your transform is not a true "
-                            "inverse for all inputs (it only works for the chosen flag). Check for "
-                            "byte overflow / signed-unsigned / modulo edges.")
-                else:
-                    _, o, _ = _run_binary(rt_bin)
-                    o = (o or "").strip()
-                    if o != x:
-                        return AttemptResult(
-                            0, False, "roundtrip",
-                            f"decode(encode({x!r})) = {o[:80]!r} != {x!r} — your transform "
-                            "is not a true inverse for all inputs (byte overflow / signed-unsigned / "
-                            "modulo edges), it only happens to work for the chosen flag.")
-            except subprocess.TimeoutExpired:
-                return AttemptResult(0, False, "roundtrip", f"challenge timed out on random input {x!r}.")
+                                     f"challenge did not compile for random input {x!r}:\n{comp.stderr[:200]}")
+            if kind == "check":
+                good = backend.run_binary(base_dir, rt_rel, target, stdin_text=x + "\n")
+                if good.timed_out:
+                    return AttemptResult(0, False, "roundtrip", f"challenge timed out on random input {x!r}.")
+                if marker not in (good.stdout or ""):
+                    return AttemptResult(
+                        0, False, "roundtrip",
+                        f"random input {x!r} is NOT accepted — your transform is not a true "
+                        "inverse for all inputs (it only works for the chosen flag). Check for "
+                        "byte overflow / signed-unsigned / modulo edges.")
+            else:
+                dec = backend.run_binary(base_dir, rt_rel, target)
+                if dec.timed_out:
+                    return AttemptResult(0, False, "roundtrip", f"challenge timed out on random input {x!r}.")
+                o = (dec.stdout or "").strip()
+                if o != x:
+                    return AttemptResult(
+                        0, False, "roundtrip",
+                        f"decode(encode({x!r})) = {o[:80]!r} != {x!r} — your transform "
+                        "is not a true inverse for all inputs (byte overflow / signed-unsigned / "
+                        "modulo edges), it only happens to work for the chosen flag.")
         return None
     finally:
         rt_src.unlink(missing_ok=True)
         for ext in ("", ".exe"):
-            (bin_dir / f"_roundtrip{ext}").unlink(missing_ok=True)
+            (base_dir / "bin" / f"_roundtrip{ext}").unlink(missing_ok=True)
 
 
 _COMMON_SECRETS = [
@@ -971,7 +990,8 @@ _COMMON_SECRETS = [
 _ADVERSARY_BUDGET = {"medium": (800, 8.0), "hard": (2000, 20.0)}
 
 
-def _adversary_check(challenge_bin: Path, kind: str, marker: str, difficulty: str,
+def _adversary_check(base_dir: Path, challenge_rel: str, backend: "ExecutionBackend",
+                     target: "Target", kind: str, marker: str, difficulty: str,
                      budget: tuple[int, float] | None = None) -> AttemptResult | None:
     """A reference attacker with a budget. For `check` challenges it tries a
     dictionary of common secrets plus a short brute-force; if a medium/hard
@@ -986,12 +1006,12 @@ def _adversary_check(challenge_bin: Path, kind: str, marker: str, difficulty: st
     if kind != "check" or not marker:
         return None  # not applicable (decode = run-to-solve)
 
+    attacker_limits = ResourceLimits(run_timeout=3.0)
+
     def cracked_by(candidate: str) -> bool:
-        try:
-            _, out, _ = _run_binary(challenge_bin, stdin_text=candidate + "\n", timeout=3.0)
-        except subprocess.TimeoutExpired:
-            return False
-        return marker in out
+        res = backend.run_binary(base_dir, challenge_rel, target,
+                                 stdin_text=candidate + "\n", limits=attacker_limits)
+        return (not res.timed_out) and (marker in res.stdout)
 
     # Candidates: common secrets (bare and wrapped) then short brute force.
     def candidates():
@@ -1021,14 +1041,7 @@ def _adversary_check(challenge_bin: Path, kind: str, marker: str, difficulty: st
     return None
 
 
-def _run_python(script: Path, args: list[str], timeout: float = 20.0) -> tuple[bool, str, str]:
-    """Run a generated Python script in isolated mode."""
-    result = subprocess.run(
-        ["python", "-I", str(script), *args],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    return result.returncode == 0, result.stdout, result.stderr.strip()
-
+_LOG_LIMITS = ResourceLimits(run_timeout=20.0)  # generators/extractors get a longer budget
 
 _DECOY_LOG = (
     "2026-01-01 00:00:00 sshd[1]: Accepted password for svc from 192.0.2.254 port 2200 ssh2\n"
@@ -1037,22 +1050,25 @@ _DECOY_LOG = (
 ) * 4
 
 
-def _check_one_task(task: dict[str, Any], ext: Path, log_path: Path, log_text: str,
-                    lines: list[str], decoy: Path) -> tuple[bool, str]:
-    """Verify a single task's extractor. Returns (ok, reason-if-failed)."""
+def _check_one_task(task: dict[str, Any], base_dir: Path, probe_rel: str, log_rel: str,
+                    log_text: str, lines: list[str], decoy_rel: str,
+                    backend: "ExecutionBackend") -> tuple[bool, str]:
+    """Verify a single task's extractor (run isolated). Returns (ok, reason)."""
     answer = _clean_answer(str(task.get("answer", "")))
     task["answer"] = answer
     etype = str(task.get("type", "extractive")).strip().lower()
-    ext.write_text(_strip_code_fences(str(task.get("extractor_code", ""))), encoding="utf-8")
-    try:
-        ok, out, err = _run_python(ext, [str(log_path)])
-        ok2, out2, _ = _run_python(ext, [str(log_path)])
-    except subprocess.TimeoutExpired:
+    (base_dir / probe_rel).write_text(
+        _strip_code_fences(str(task.get("extractor_code", ""))), encoding="utf-8")
+    r1 = backend.run_python(base_dir, probe_rel, [log_rel], limits=_LOG_LIMITS)
+    r2 = backend.run_python(base_dir, probe_rel, [log_rel], limits=_LOG_LIMITS)
+    if r1.timed_out or r2.timed_out:
         return False, "extractor timed out"
-    if not ok or not ok2:
+    if not r1.ok or not r2.ok:
+        err = r1.stderr
         return False, f"extractor crashed: {err.splitlines()[-1][:160] if err.strip() else 'error'}"
-    if out.strip() != out2.strip():
+    if r1.stdout.strip() != r2.stdout.strip():
         return False, "extractor is not deterministic"
+    out = r1.stdout
     if out.strip() != answer:
         return False, f"extractor printed {out.strip()[:80]!r} but declared answer is {answer!r}"
     if etype == "extractive":
@@ -1064,41 +1080,40 @@ def _check_one_task(task: dict[str, Any], ext: Path, log_path: Path, log_text: s
             ln = 0
         if not (1 <= ln <= len(lines)) or answer not in lines[ln - 1]:
             return False, f"evidence_line does not point to a line containing {answer!r}"
-    try:
-        _ok, decoy_out, _e = _run_python(ext, [str(decoy)])
-        if decoy_out.strip() == answer:
-            return False, "extractor prints the answer on an unrelated log (hardcoded)"
-    except subprocess.TimeoutExpired:
-        pass
+    decoy = backend.run_python(base_dir, probe_rel, [decoy_rel], limits=_LOG_LIMITS)
+    if not decoy.timed_out and decoy.stdout.strip() == answer:
+        return False, "extractor prints the answer on an unrelated log (hardcoded)"
     return True, ""
 
 
-def _verify_tasks_against_log(base_dir: Path, data: dict[str, Any], log_path: Path) -> AttemptResult:
+def _verify_tasks_against_log(base_dir: Path, data: dict[str, Any], log_rel: str,
+                             backend: "ExecutionBackend") -> AttemptResult:
     """Check each task independently and KEEP the ones that verify, dropping any
     that fail. The challenge is valid if at least one task survives — a log
     naturally supports several questions and we ship only the proven ones."""
     org = base_dir / "organizer"
     org.mkdir(parents=True, exist_ok=True)
-    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    log_text = (base_dir / log_rel).read_text(encoding="utf-8", errors="replace")
     lines = log_text.splitlines()
 
     tasks = data.get("tasks")
     if not isinstance(tasks, list) or not tasks:
         return AttemptResult(0, False, "no-tasks", "tasks must be a non-empty list.")
 
-    decoy = base_dir / "evidence" / "_decoy.log"
-    decoy.write_text(_DECOY_LOG, encoding="utf-8")
+    decoy_rel = "evidence/_decoy.log"
+    (base_dir / decoy_rel).write_text(_DECOY_LOG, encoding="utf-8")
     kept: list[dict[str, Any]] = []
     reasons: list[str] = []
     try:
         for i, task in enumerate(tasks, 1):
-            ok, reason = _check_one_task(task, org / f"_probe_{i}.py", log_path, log_text, lines, decoy)
+            ok, reason = _check_one_task(task, base_dir, f"organizer/_probe_{i}.py", log_rel,
+                                         log_text, lines, decoy_rel, backend)
             if ok:
                 kept.append(task)
             else:
                 reasons.append(f"task {i} ({task.get('question','')[:50]}): {reason}")
     finally:
-        decoy.unlink(missing_ok=True)
+        (base_dir / decoy_rel).unlink(missing_ok=True)
         for p in org.glob("_probe_*.py"):
             p.unlink(missing_ok=True)
 
@@ -1111,32 +1126,33 @@ def _verify_tasks_against_log(base_dir: Path, data: dict[str, Any], log_path: Pa
     return AttemptResult(0, True, "passed", note)
 
 
-def _verify_log_challenge(base_dir: Path, data: dict[str, Any], compiler: str | None = None) -> AttemptResult:
-    """Synthesis: run the generator to produce the log, then verify all tasks."""
+def _verify_log_challenge(base_dir: Path, data: dict[str, Any], backend: "ExecutionBackend",
+                          target: "Target | None" = None) -> AttemptResult:
+    """Synthesis: run the generator (isolated) to produce the log, then verify tasks."""
     org = base_dir / "organizer"
     ev = base_dir / "evidence"
     org.mkdir(parents=True, exist_ok=True)
     ev.mkdir(parents=True, exist_ok=True)
 
-    gen = org / "generator.py"
-    gen.write_text(_strip_code_fences(str(data.get("generator_code", ""))), encoding="utf-8")
-    log_path = ev / f"{base_dir.name}.log"
-    data["log_file"] = log_path.name
-    try:
-        # The generator PRINTS the log to stdout; we capture and save it. This
-        # avoids the model hardcoding an output filename / ignoring argv.
-        ok, out, err = _run_python(gen, [])
-    except subprocess.TimeoutExpired:
-        return AttemptResult(0, False, "generator-timeout", "generator.py did not finish within 20s.")
-    if not ok:
-        return AttemptResult(0, False, "generator-crash", f"generator.py failed:\n{err[:300]}")
-    if not out.strip():
+    (org / "generator.py").write_text(
+        _strip_code_fences(str(data.get("generator_code", ""))), encoding="utf-8")
+    log_rel = f"evidence/{base_dir.name}.log"
+    data["log_file"] = Path(log_rel).name
+    # The generator PRINTS the log to stdout; we capture and save it. This avoids
+    # the model hardcoding an output filename / ignoring argv.
+    res = backend.run_python(base_dir, "organizer/generator.py", [], limits=_LOG_LIMITS)
+    if res.timed_out:
+        return AttemptResult(0, False, "generator-timeout", "generator.py did not finish within the time limit.")
+    if not res.ok:
+        return AttemptResult(0, False, "generator-crash", f"generator.py failed:\n{res.stderr[:300]}")
+    if not res.stdout.strip():
         return AttemptResult(0, False, "no-log", "generator.py printed nothing; it must print the log to stdout.")
-    log_path.write_text(out, encoding="utf-8")
-    return _verify_tasks_against_log(base_dir, data, log_path)
+    (base_dir / log_rel).write_text(res.stdout, encoding="utf-8")
+    return _verify_tasks_against_log(base_dir, data, log_rel, backend)
 
 
-def _verify_log_analysis(base_dir: Path, data: dict[str, Any], provided_log: Path) -> AttemptResult:
+def _verify_log_analysis(base_dir: Path, data: dict[str, Any], provided_log: Path,
+                         backend: "ExecutionBackend") -> AttemptResult:
     """Analysis: copy the provided log in, then verify all tasks against it."""
     ev = base_dir / "evidence"
     ev.mkdir(parents=True, exist_ok=True)
@@ -1144,10 +1160,10 @@ def _verify_log_analysis(base_dir: Path, data: dict[str, Any], provided_log: Pat
         log_text = provided_log.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return AttemptResult(0, False, "no-input", f"could not read the provided log: {exc}")
-    log_path = ev / provided_log.name
-    log_path.write_text(log_text, encoding="utf-8")
-    data["log_file"] = log_path.name
-    return _verify_tasks_against_log(base_dir, data, log_path)
+    log_rel = f"evidence/{provided_log.name}"
+    (base_dir / log_rel).write_text(log_text, encoding="utf-8")
+    data["log_file"] = Path(log_rel).name
+    return _verify_tasks_against_log(base_dir, data, log_rel, backend)
 
 
 # --------------------------------------------------------------------------- #
@@ -1169,7 +1185,9 @@ def generate_challenge(
     roundtrip: bool = False,
     adversary: bool = False,
     adversary_budget: tuple[int, float] | None = None,
+    target: str = DEFAULT_TARGET,
     *,
+    backend: ExecutionBackend | None = None,
     caller: Callable[[str, str], dict[str, Any]] | None = None,
     return_report: bool = False,
 ) -> str | GenerationReport:
@@ -1196,6 +1214,15 @@ def generate_challenge(
     base_dir = Path("generated") / name
     base_dir.mkdir(parents=True, exist_ok=True)
 
+    tgt = get_target(target)
+    if backend is None:
+        # Default: the isolated backend compatible with the requested target. There
+        # is NO silent fallback to unsandboxed native — if no isolated backend is
+        # available for this target (e.g. PE before Phase B, or Docker down), this
+        # raises an explicit SandboxUnavailable. Pass backend=NativeBackend() to opt
+        # into the unsafe host path deliberately (development only).
+        backend = resolve_backend(tgt, "isolated")
+
     category = challenge_type if challenge_type and challenge_type not in {"reverse", "surprise"} else None
     user_prompt = (context.strip() + "\n" + prompt.strip()).strip() if context else prompt
     if surprise:
@@ -1209,6 +1236,7 @@ def generate_challenge(
         "prompt": user_prompt, "genre": genre, "model": model,
         "difficulty": difficulty, "roundtrip": bool(roundtrip),
         "adversary": bool(adversary), "surprise": bool(surprise),
+        "target": tgt.name, "backend": backend.name,
     }
     if input_path:
         gen_meta["input"] = Path(input_path).name
@@ -1222,24 +1250,16 @@ def generate_challenge(
             raise GenerationError(f"--input log not found: {provided_log}")
         temperature = 0.0
         schema, required = _SCHEMA_RULES_LOG_ANALYSIS, ("tasks",)
-        verify_fn = lambda b, d, c: _verify_log_analysis(b, d, provided_log)  # noqa: E731
-        compiler = None
+        verify_fn = lambda b, d, bk, tg: _verify_log_analysis(b, d, provided_log, bk)  # noqa: E731
         numbered = _number_log(provided_log.read_text(encoding="utf-8", errors="replace"))
         user_prompt = (user_prompt.strip() + "\n\n" if user_prompt.strip() else "") + \
             "LOG TO TURN INTO A CHALLENGE (1-based line numbers):\n" + numbered
     elif genre == "log":
         schema, required, verify_fn = _SCHEMA_RULES_LOG, ("generator_code", "tasks"), _verify_log_challenge
-        compiler = None  # log challenges are Python, no C compiler needed
     else:
         schema, required = _SCHEMA_RULES, ("encoder_code", "challenge_code")
-        verify_fn = lambda b, d, c: _verify_challenge(  # noqa: E731
-            b, d, c, roundtrip=roundtrip, adversary=adversary, adversary_budget=adversary_budget)
-        compiler = _find_compiler()
-        if compiler is None:
-            raise GenerationError(
-                "No C compiler found. Install one (e.g. `python main.py install-toolchain`) "
-                "and ensure gcc is on PATH — the self-verifying loop needs to compile."
-            )
+        verify_fn = lambda b, d, bk, tg: _verify_challenge(  # noqa: E731
+            b, d, bk, tg, roundtrip=roundtrip, adversary=adversary, adversary_budget=adversary_budget)
 
     ask = caller or (lambda p, m: _call_ollama(p, m, base_url=ollama_url, temperature=temperature))
     # Reverse challenges get a random default flag (used only if the prompt does
@@ -1266,7 +1286,7 @@ def generate_challenge(
 
         data = _normalize_challenge(raw, difficulty, category, genre)
 
-        result = verify_fn(base_dir, data, compiler)
+        result = verify_fn(base_dir, data, backend, tgt)
         result.index = attempt
         report.attempts.append(result)
         if result.ok:
@@ -1274,6 +1294,7 @@ def generate_challenge(
             # prose, rendered locally so it costs no extra model time.
             data["readme"] = _render_readme(data)
             data["solution"] = _render_solution(data)
+            data["target"] = tgt.name
             data["generation"] = gen_meta
             _write_challenge_files(base_dir, data)
             report.success = True

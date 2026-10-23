@@ -4,6 +4,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
+import subprocess
+
 from slothctf import generator
 from slothctf.generator import (
     AttemptResult,
@@ -11,6 +13,7 @@ from slothctf.generator import (
     GenerationError,
     _build_generation_prompt,
     _coerce_json,
+    _compile_binary,
     _flag_leaks_in_binary,
     _generate_endpoint,
     _normalize_flag,
@@ -43,6 +46,25 @@ class RunBinaryDecodeTests(unittest.TestCase):
         self.assertIn("sloth{x}", out)            # the valid part survives
         # the replacement never equals a clean flag, so a wrong decode is a mismatch
         self.assertNotEqual(out.strip(), "sloth{x}")
+
+
+class CompileTimeoutTests(unittest.TestCase):
+    """A model can emit C that makes the compiler hang; _compile_binary must bound
+    it with a timeout and return a clean failure, never block or raise."""
+
+    def test_compile_timeout_is_a_clean_failure(self):
+        with TemporaryDirectory() as tmp:
+            src = Path(tmp) / "challenge.c"
+            src.write_text("int main(void){return 0;}", encoding="utf-8")
+            out = Path(tmp) / "bin" / "challenge"
+            with mock.patch.object(
+                generator.subprocess, "run",
+                side_effect=subprocess.TimeoutExpired(cmd="gcc", timeout=generator._COMPILE_TIMEOUT),
+            ):
+                ok, stderr, produced = _compile_binary(src, out, "gcc")
+            self.assertFalse(ok)
+            self.assertIn("timed out", stderr)
+            self.assertEqual(produced, out)
 
 
 class FlagHelperTests(unittest.TestCase):
@@ -89,10 +111,13 @@ class PromptBuildTests(unittest.TestCase):
 
     def test_adversary_not_applicable_to_decode(self):
         from slothctf.generator import _adversary_check, _COMMON_SECRETS
+        from slothctf.execution import NativeBackend
+        from slothctf.targets import host_native_target
+        be, tg = NativeBackend(), host_native_target()
         self.assertIn("password", _COMMON_SECRETS)
         # decode / missing marker -> gate does not apply (returns None, no run)
-        self.assertIsNone(_adversary_check(Path("nope"), "decode", "", "hard"))
-        self.assertIsNone(_adversary_check(Path("nope"), "check", "", "hard"))
+        self.assertIsNone(_adversary_check(Path("nope"), "bin/x", be, tg, "decode", "", "hard"))
+        self.assertIsNone(_adversary_check(Path("nope"), "bin/x", be, tg, "check", "", "hard"))
 
     def test_default_flag_policy(self):
         from slothctf.generator import _random_flag
@@ -189,14 +214,15 @@ class GenerationLoopTests(unittest.TestCase):
             calls["n"] += 1
             return responses[min(idx, len(responses) - 1)]
 
-        with mock.patch.object(generator, "_find_compiler", return_value="gcc"), \
-             mock.patch.object(generator, "_write_challenge_files"), \
+        from slothctf.execution import NativeBackend
+        with mock.patch.object(generator, "_write_challenge_files"), \
              mock.patch.object(generator, "_verify_challenge", side_effect=verify_side_effect):
             return generate_challenge(
                 "unit_test_challenge",
                 prompt="make a challenge",
                 caller=fake_caller,
                 max_attempts=max_attempts,
+                backend=NativeBackend(),   # explicit: these tests mock verify, no real exec
                 return_report=True,
             )
 
@@ -233,10 +259,19 @@ class GenerationLoopTests(unittest.TestCase):
         self.assertFalse(report.success)
         self.assertEqual(report.attempts[0].stage, "bad-schema")
 
-    def test_raises_without_compiler(self):
-        with mock.patch.object(generator, "_find_compiler", return_value=None):
-            with self.assertRaises(GenerationError):
-                generate_challenge("x", caller=lambda p, m: {}, return_report=True)
+    def test_no_backend_without_docker_refuses(self):
+        # No backend + Docker unavailable => explicit error, never a silent native run.
+        from slothctf.execution import SandboxUnavailable
+        with mock.patch("slothctf.execution.docker_available", return_value=False):
+            with self.assertRaises(SandboxUnavailable):
+                generate_challenge("x", target="elf", caller=lambda p, m: {}, return_report=True)
+
+    def test_isolated_pe_refused_until_phase_b(self):
+        # PE has no isolated backend yet => explicit error, never converted to ELF.
+        from slothctf.execution import SandboxUnavailable
+        with mock.patch("slothctf.execution.docker_available", return_value=True):
+            with self.assertRaises(SandboxUnavailable):
+                generate_challenge("x", target="pe", caller=lambda p, m: {}, return_report=True)
 
 
 class AdversaryBudgetTests(unittest.TestCase):
@@ -252,7 +287,22 @@ class AdversaryBudgetTests(unittest.TestCase):
 
     @unittest.skipUnless(generator._find_compiler() is not None, "needs a C compiler")
     def test_budget_is_a_real_knob(self):
+        # Deterministic, machine-speed-independent check that the attempt budget is
+        # a real gate. The reference attacker tries each common secret first as the
+        # bare word and then wrapped as sloth{word} (generator._adversary_check over
+        # _COMMON_SECRETS). For a flag whose secret is the FIRST common secret:
+        #   candidate #1 = bare word  -> wrong length -> "Denied"
+        #   candidate #2 = sloth{word} -> the exact flag -> "Access Granted" (cracked)
+        # So an attempt budget of 1 never reaches the crack; a budget of 2 does.
+        # We pass an effectively infinite TIME budget so only the attempt count
+        # decides — the earlier version used a 60s wall-clock budget, which made the
+        # verdict depend on how fast the host spawned ~1000 real subprocesses (flaky
+        # under load). The production adversary is untouched; only the test's
+        # explicit budget differs, and this runs ~2 subprocesses instead of ~1800.
         import tempfile
+        from slothctf.generator import _COMMON_SECRETS
+        secret = _COMMON_SECRETS[0]
+        flag = f"sloth{{{secret}}}"
         enc = ('#include <stdio.h>\nint main(int c,char**v){for(char*p=v[1];*p;++p)'
                'printf("0x%02x,",(unsigned char)(*p^0x37));}')
         ch = ('#include <stdio.h>\n#include <string.h>\nstatic unsigned char t[]={ '
@@ -261,19 +311,25 @@ class AdversaryBudgetTests(unittest.TestCase):
               '{printf("Denied\\n");return 0;}for(size_t i=0;i<n;i++)'
               'if(((unsigned char)b[i]^0x37)!=t[i]){printf("Denied\\n");return 0;}'
               'printf("Access Granted\\n");return 0;}')
-        comp = generator._find_compiler()
+        from slothctf.execution import NativeBackend
+        from slothctf.targets import host_native_target
+        be, tg = NativeBackend(), host_native_target()
+
+        NO_TIME_LIMIT = 10 ** 9  # seconds; the attempt count is the only real bound
 
         def mk():
             return generator._normalize_challenge(
                 {"title": "B", "category": "Reverse Engineering", "difficulty": "hard",
-                 "flag": "sloth{z9}", "challenge_kind": "check", "success_marker": "Access Granted",
+                 "flag": flag, "challenge_kind": "check", "success_marker": "Access Granted",
                  "encoder_code": enc, "challenge_code": ch}, "hard", None, "reverse")
 
         with tempfile.TemporaryDirectory() as t1, tempfile.TemporaryDirectory() as t2:
-            small = generator._verify_challenge(Path(t1), mk(), comp, adversary=True, adversary_budget=(900, 60))
-            large = generator._verify_challenge(Path(t2), mk(), comp, adversary=True, adversary_budget=(1500, 60))
-        self.assertTrue(small.ok)            # small budget doesn't reach it
-        self.assertEqual(large.stage, "too-easy")  # larger budget cracks it
+            small = generator._verify_challenge(Path(t1), mk(), be, tg, adversary=True,
+                                                adversary_budget=(1, NO_TIME_LIMIT))
+            large = generator._verify_challenge(Path(t2), mk(), be, tg, adversary=True,
+                                                adversary_budget=(2, NO_TIME_LIMIT))
+        self.assertTrue(small.ok, small.detail)      # 1 attempt: never reaches sloth{word}
+        self.assertEqual(large.stage, "too-easy")    # 2 attempts: the dictionary cracks it
 
 
 class LogVerifyTests(unittest.TestCase):
@@ -294,8 +350,9 @@ class LogVerifyTests(unittest.TestCase):
         ]
 
     def _run(self, data):
+        from slothctf.execution import NativeBackend
         with TemporaryDirectory() as tmp:
-            return generator._verify_log_challenge(Path(tmp) / "c", data)
+            return generator._verify_log_challenge(Path(tmp) / "c", data, NativeBackend())
 
     def test_passes_multi_task(self):
         data = {"generator_code": self.GOOD_GEN, "tasks": self._tasks()}
@@ -342,7 +399,8 @@ class LogAnalysisVerifyTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             log = Path(tmp) / "provided.log"
             log.write_text(self.LOG, encoding="utf-8")
-            return generator._verify_log_analysis(Path(tmp) / "c", {"tasks": tasks}, log)
+            from slothctf.execution import NativeBackend
+            return generator._verify_log_analysis(Path(tmp) / "c", {"tasks": tasks}, log, NativeBackend())
 
     def test_passes_when_grounded(self):
         r = self._run([{"type": "extractive", "answer": "10.0.0.42", "evidence_line": 2,

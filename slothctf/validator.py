@@ -9,6 +9,12 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .execution import ExecutionBackend, SandboxUnavailable, resolve_backend
+from .targets import DEFAULT_TARGET, Target, TargetError, get_target, infer_target
+
+
+_COMPILE_TIMEOUT = 60.0  # a hanging compile of model-written C is a failure, not a wait
+
 
 @dataclass
 class ValidationResult:
@@ -101,11 +107,19 @@ def _compile_binary(challenge_dir: Path) -> tuple[bool, str, str]:
     source_path = challenge_dir / "src" / "challenge.c"
     binary_path = challenge_dir / "bin" / "challenge"
     binary_path.parent.mkdir(parents=True, exist_ok=True)  # bin/ may have been cleaned
-    result = subprocess.run(
-        [compiler, "-O2", "-s", "-o", str(binary_path), str(source_path)],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [compiler, "-O2", "-s", "-o", str(binary_path), str(source_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_COMPILE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return (False, "",
+                f"compilation timed out after {_COMPILE_TIMEOUT:.0f}s "
+                "(possible pathological source)")
     return result.returncode == 0, result.stdout, result.stderr
 
 
@@ -141,9 +155,10 @@ def _evidence_log(challenge_dir: Path) -> Path | None:
     return logs[0] if logs else None
 
 
-def _validate_log(challenge_dir: Path, metadata: dict) -> ValidationResult:
-    """Re-run each task's extractor against the evidence log and confirm its
-    declared answer — the real on-disk re-verification for log challenges.
+def _validate_log(challenge_dir: Path, metadata: dict,
+                  backend: ExecutionBackend) -> ValidationResult:
+    """Re-run each task's extractor against the evidence log (isolated) and confirm
+    its declared answer — the real on-disk re-verification for log challenges.
 
     Note: the anti-hardcode decoy test (extractor must NOT reproduce the answer
     on an unrelated log) runs at generation time, not here; validate re-checks
@@ -151,20 +166,19 @@ def _validate_log(challenge_dir: Path, metadata: dict) -> ValidationResult:
     log = _evidence_log(challenge_dir)
     if log is None:
         return _fail("no-log", "no evidence log found")
+    log_rel = log.relative_to(challenge_dir).as_posix()
     tasks = metadata.get("tasks") or []
     if not tasks:
         return _fail("no-tasks", "challenge.json has no tasks")
     ok = 0
     for i, task in enumerate(tasks, 1):
-        ext = challenge_dir / "organizer" / f"extractor_{i}.py"
-        if not ext.exists():
-            return _fail("missing-extractor", f"missing organizer/extractor_{i}.py")
-        try:
-            res = subprocess.run(["python", "-I", str(ext), str(log)],
-                                 capture_output=True, text=True, timeout=20)
-        except Exception as exc:
-            return _fail("extractor-error", f"task {i} extractor did not run\n{exc}")
-        if res.returncode != 0:
+        ext_rel = f"organizer/extractor_{i}.py"
+        if not (challenge_dir / ext_rel).exists():
+            return _fail("missing-extractor", f"missing {ext_rel}")
+        res = backend.run_python(challenge_dir, ext_rel, [log_rel])
+        if res.timed_out:
+            return _fail("extractor-error", f"task {i} extractor timed out")
+        if not res.ok:
             return _fail("extractor-crash", f"task {i} extractor crashed\n{res.stderr.strip()[:200]}")
         if res.stdout.strip() != str(task.get("answer", "")).strip():
             return _fail("answer-mismatch", f"task {i} answer mismatch\n"
@@ -174,7 +188,24 @@ def _validate_log(challenge_dir: Path, metadata: dict) -> ValidationResult:
                f"answer from {log.name}.\nDir: {challenge_dir}")
 
 
-def validate_challenge(challenge_dir: Path) -> ValidationResult:
+def _resolve_backend_for(challenge_dir: Path, metadata: dict, backend: ExecutionBackend | None,
+                         *, is_log: bool) -> tuple[Target, ExecutionBackend]:
+    """Determine the challenge's target and the backend to re-verify it with.
+    Raises TargetError / SandboxUnavailable, which the caller turns into a result."""
+    if is_log:
+        target = get_target(metadata.get("target", DEFAULT_TARGET))
+    else:
+        target = infer_target(challenge_dir, metadata)  # manifest, else binary magic bytes
+    be = backend or resolve_backend(target, "isolated")
+    if not is_log and not be.can_build(target):
+        raise SandboxUnavailable(
+            f"backend {be.name!r} cannot re-validate a {target.name!r} challenge "
+            f"(it builds/runs: {', '.join(sorted(be.supported_targets)) or 'none'})")
+    return target, be
+
+
+def validate_challenge(challenge_dir: Path, *,
+                       backend: ExecutionBackend | None = None) -> ValidationResult:
     challenge_dir = Path(challenge_dir)
     required = [
         challenge_dir / "README.md",
@@ -191,16 +222,29 @@ def validate_challenge(challenge_dir: Path) -> ValidationResult:
     except Exception:
         return _fail("invalid-json", "invalid challenge.json")
 
-    if metadata.get("challenge_kind") == "log":
-        return _validate_log(challenge_dir, metadata)
-
+    is_log = metadata.get("challenge_kind") == "log"
     src_c = challenge_dir / "src" / "challenge.c"
+    needs_exec = is_log or src_c.exists()
+    target = None
+    if needs_exec:
+        # No silent fallback: a PE challenge with no isolated backend (Phase A) or a
+        # missing Docker daemon is reported, not run unsandboxed. Pass an explicit
+        # NativeBackend (--unsafe-native) to re-validate on the host deliberately.
+        try:
+            target, backend = _resolve_backend_for(challenge_dir, metadata, backend, is_log=is_log)
+        except TargetError as exc:
+            return _fail("target-unknown", str(exc))
+        except SandboxUnavailable as exc:
+            return _fail("sandbox-unavailable", str(exc))
+
+    if is_log:
+        return _validate_log(challenge_dir, metadata, backend)
+
     if src_c.exists():
-        compile_ok, compile_out, compile_err = _compile_binary(challenge_dir)
-        if not compile_ok:
-            if "GCC compiler not found" in compile_err:
-                return _fail("no-compiler", compile_err)
-            return _fail("compile-error", f"compile error\n{compile_err}")
+        challenge_rel = f"bin/{target.artifact('challenge')}"
+        comp = backend.compile_c(challenge_dir, "src/challenge.c", challenge_rel, target)
+        if not comp.ok:
+            return _fail("compile-error", f"compile error\n{comp.stderr}")
 
         try:
             expected_flag = metadata["flag"]
@@ -210,7 +254,7 @@ def validate_challenge(challenge_dir: Path) -> ValidationResult:
 
         # Fail closed: a leak check that can't read the binary is not a pass.
         try:
-            leaked = _flag_leaks(_resolve_binary(challenge_dir), expected_flag)
+            leaked = _flag_leaks(challenge_dir / challenge_rel, expected_flag)
         except OSError as exc:
             return _fail("leak-check-failed", f"could not read the compiled binary for the leak check\n{exc}")
         if leaked:
@@ -220,23 +264,23 @@ def validate_challenge(challenge_dir: Path) -> ValidationResult:
             marker = str(metadata.get("success_marker", "")).strip()
             if not marker:
                 return _fail("no-marker", "check challenge missing success_marker")
-            try:
-                _, good_out, _ = _run_challenge(challenge_dir, stdin_text=expected_flag + "\n")
-                _, bad_out, _ = _run_challenge(challenge_dir, stdin_text="definitely_wrong_" + expected_flag + "\n")
-            except Exception as exc:
-                return _fail("run-error", f"challenge did not run\n{exc}")
-            if marker not in good_out:
+            good = backend.run_binary(challenge_dir, challenge_rel, target, stdin_text=expected_flag + "\n")
+            bad = backend.run_binary(challenge_dir, challenge_rel, target,
+                                     stdin_text="definitely_wrong_" + expected_flag + "\n")
+            if good.timed_out or bad.timed_out:
+                return _fail("run-error", "challenge did not finish within the time limit")
+            if marker not in good.stdout:
                 return _fail("check-reject", f"correct secret rejected (expected marker {marker!r})")
-            if marker in bad_out:
+            if marker in bad.stdout:
                 return _fail("check-accept-wrong", "a wrong input was also accepted")
             return _ok("ok", "Validation successful: challenge compiled; the secret is accepted, "
                        f"wrong input is rejected, and strings does not leak it.\nDir: {challenge_dir}")
 
-        run_ok, out, run_err = _run_challenge(challenge_dir)
-        if not run_ok:
-            return _fail("run-error", f"challenge did not run\n{run_err}")
-        if out.strip() != expected_flag:
-            return _fail("flag-mismatch", f"incorrect flag\nExpected: {expected_flag}\nGot: {out.strip()}")
+        run = backend.run_binary(challenge_dir, challenge_rel, target)
+        if run.timed_out or not run.ok:
+            return _fail("run-error", f"challenge did not run\n{run.stderr}")
+        if run.stdout.strip() != expected_flag:
+            return _fail("flag-mismatch", f"incorrect flag\nExpected: {expected_flag}\nGot: {run.stdout.strip()}")
 
         return _ok("ok", "Validation successful: challenge compiled, ran, printed the expected flag, "
                    f"and strings does not leak it.\nDir: {challenge_dir}")
