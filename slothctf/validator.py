@@ -188,6 +188,63 @@ def _validate_log(challenge_dir: Path, metadata: dict,
                f"answer from {log.name}.\nDir: {challenge_dir}")
 
 
+def _validate_recover(challenge_dir: Path, metadata: dict, target: Target,
+                      backend: ExecutionBackend) -> ValidationResult:
+    """Re-validate a `recover` challenge from what is distributed on disk.
+
+    REPEATED here (same as generation): the challenge compiles; running it does
+    not reveal the flag; the plaintext flag does not leak in the binary (UTF-8 or
+    UTF-16LE); the reference solver recovers the flag from the artifact alone, in
+    an isolated workspace. NOT repeated here: the generation-time independence
+    (flag-swap) proof — that a second, harness-chosen flag is recovered — which is
+    a property of the generator, not of the distributed artifact."""
+    from .generator import _flag_leaks_recover, _run_solver_isolated  # internal reuse
+
+    flag = str(metadata.get("flag", ""))
+    challenge_rel = f"bin/{target.artifact('challenge')}"
+    if not (challenge_dir / "src" / "challenge.c").exists():
+        return _fail("missing-file", "missing src/challenge.c")
+    solver = challenge_dir / "organizer" / "solver.py"
+    if not solver.exists():
+        return _fail("missing-solver", "missing organizer/solver.py")
+
+    comp = backend.compile_c(challenge_dir, "src/challenge.c", challenge_rel, target)
+    if not comp.ok:
+        return _fail("compile-error", f"compile error\n{comp.stderr}")
+    challenge_bin = challenge_dir / challenge_rel
+
+    try:
+        if _flag_leaks_recover(challenge_bin, flag):
+            return _fail("flag-leak", "the plaintext flag is readable in the binary (UTF-8 or UTF-16LE)")
+    except OSError as exc:
+        return _fail("leak-check-failed", f"could not read the compiled binary\n{exc}")
+
+    run = backend.run_binary(challenge_dir, challenge_rel, target)
+    if not run.timed_out:
+        combined = (run.stdout or "") + "\n" + (run.stderr or "")
+        inner = flag[6:-1] if flag.startswith("sloth{") and flag.endswith("}") else ""
+        if flag in combined or (inner and inner in combined):
+            return _fail("too-trivial", "running the binary reveals the flag (that is a decode, not recover)")
+
+    # The solver runs on a Python-capable backend; for a PE target resolve the
+    # isolated ELF backend (no Wine needed — the solver only reads bytes).
+    solver_backend = backend
+    if backend.name == "docker-wincompat":
+        try:
+            solver_backend = resolve_backend("elf", "isolated")
+        except SandboxUnavailable as exc:
+            return _fail("sandbox-unavailable", f"solver needs the ELF sandbox: {exc}")
+
+    ok, out, detail = _run_solver_isolated(solver.read_text(encoding="utf-8"), challenge_bin, solver_backend)
+    if not ok:
+        return _fail("solver-error", detail)
+    if out.strip() != flag:
+        return _fail("solver-mismatch", f"reference solver recovered {out.strip()!r}, expected {flag!r}")
+    return _ok("ok", "Validation successful: the binary hides the flag, a plain run does not reveal it, "
+               "and the reference solver recovers it from the artifact alone.\n"
+               f"Dir: {challenge_dir}")
+
+
 def _resolve_backend_for(challenge_dir: Path, metadata: dict, backend: ExecutionBackend | None,
                          *, is_log: bool) -> tuple[Target, ExecutionBackend]:
     """Determine the challenge's target and the backend to re-verify it with.
@@ -239,6 +296,9 @@ def validate_challenge(challenge_dir: Path, *,
 
     if is_log:
         return _validate_log(challenge_dir, metadata, backend)
+
+    if metadata.get("challenge_kind") == "recover":
+        return _validate_recover(challenge_dir, metadata, target, backend)
 
     if src_c.exists():
         challenge_rel = f"bin/{target.artifact('challenge')}"

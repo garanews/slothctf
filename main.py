@@ -58,9 +58,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     gen.add_argument(
         "--genre",
-        choices=["reverse", "log"],
+        choices=["reverse", "log", "recover"],
         default="reverse",
-        help="Challenge genre: 'reverse' (C binary) or 'log' (synthetic log analysis)",
+        help="Challenge genre: 'reverse' (C binary; decode/check), 'log' (synthetic log "
+             "analysis), or 'recover' (reverse-by-analysis with a reference solver)",
     )
     gen.add_argument(
         "--category",
@@ -129,7 +130,7 @@ def _build_parser() -> argparse.ArgumentParser:
     lst = subparsers.add_parser("list", help="List generated challenges from the catalog")
     lst.add_argument("--category", default=None, help="Filter by category")
     lst.add_argument("--difficulty", choices=["easy", "medium", "hard"], default=None, help="Filter by difficulty")
-    lst.add_argument("--kind", choices=["decode", "check"], default=None, help="Filter by challenge kind")
+    lst.add_argument("--kind", choices=["decode", "check", "recover"], default=None, help="Filter by challenge kind")
     lst.add_argument("--search", default=None, help="Free-text search over name/title/category")
     lst.add_argument("--json", action="store_true", help="Output JSON instead of a table")
     lst.add_argument("--no-scan", action="store_true", help="Do not rescan generated/ before listing")
