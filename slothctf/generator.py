@@ -114,6 +114,9 @@ def _find_compiler() -> str | None:
     return None
 
 
+_COMPILE_TIMEOUT = 60.0  # model-written C must compile fast; a hang is a failure, not a wait
+
+
 def _compile_binary(source_path: Path, binary_path: Path, compiler: str) -> tuple[bool, str, Path]:
     """Compile `source_path`. Returns (ok, stderr, actual_binary_path).
 
@@ -121,11 +124,20 @@ def _compile_binary(source_path: Path, binary_path: Path, compiler: str) -> tupl
     for the real artifact after a successful build instead of assuming the name.
     """
     binary_path.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        [compiler, "-O2", "-s", "-o", str(binary_path), str(source_path)],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [compiler, "-O2", "-s", "-o", str(binary_path), str(source_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_COMPILE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return (False,
+                f"compilation timed out after {_COMPILE_TIMEOUT:.0f}s "
+                "(possible pathological source from the model)",
+                binary_path)
     produced = binary_path
     if not produced.exists():
         exe = binary_path.with_suffix(".exe")

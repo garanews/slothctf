@@ -4,6 +4,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
+import subprocess
+
 from slothctf import generator
 from slothctf.generator import (
     AttemptResult,
@@ -11,6 +13,7 @@ from slothctf.generator import (
     GenerationError,
     _build_generation_prompt,
     _coerce_json,
+    _compile_binary,
     _flag_leaks_in_binary,
     _generate_endpoint,
     _normalize_flag,
@@ -43,6 +46,25 @@ class RunBinaryDecodeTests(unittest.TestCase):
         self.assertIn("sloth{x}", out)            # the valid part survives
         # the replacement never equals a clean flag, so a wrong decode is a mismatch
         self.assertNotEqual(out.strip(), "sloth{x}")
+
+
+class CompileTimeoutTests(unittest.TestCase):
+    """A model can emit C that makes the compiler hang; _compile_binary must bound
+    it with a timeout and return a clean failure, never block or raise."""
+
+    def test_compile_timeout_is_a_clean_failure(self):
+        with TemporaryDirectory() as tmp:
+            src = Path(tmp) / "challenge.c"
+            src.write_text("int main(void){return 0;}", encoding="utf-8")
+            out = Path(tmp) / "bin" / "challenge"
+            with mock.patch.object(
+                generator.subprocess, "run",
+                side_effect=subprocess.TimeoutExpired(cmd="gcc", timeout=generator._COMPILE_TIMEOUT),
+            ):
+                ok, stderr, produced = _compile_binary(src, out, "gcc")
+            self.assertFalse(ok)
+            self.assertIn("timed out", stderr)
+            self.assertEqual(produced, out)
 
 
 class FlagHelperTests(unittest.TestCase):

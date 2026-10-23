@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+_COMPILE_TIMEOUT = 60.0  # a hanging compile of model-written C is a failure, not a wait
+
+
 @dataclass
 class ValidationResult:
     """Structured outcome so callers can branch on success / stage instead of
@@ -101,11 +104,19 @@ def _compile_binary(challenge_dir: Path) -> tuple[bool, str, str]:
     source_path = challenge_dir / "src" / "challenge.c"
     binary_path = challenge_dir / "bin" / "challenge"
     binary_path.parent.mkdir(parents=True, exist_ok=True)  # bin/ may have been cleaned
-    result = subprocess.run(
-        [compiler, "-O2", "-s", "-o", str(binary_path), str(source_path)],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [compiler, "-O2", "-s", "-o", str(binary_path), str(source_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_COMPILE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return (False, "",
+                f"compilation timed out after {_COMPILE_TIMEOUT:.0f}s "
+                "(possible pathological source)")
     return result.returncode == 0, result.stdout, result.stderr
 
 
