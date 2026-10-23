@@ -75,6 +75,9 @@ class WinBackendUnitTests(unittest.TestCase):
         self.assertIn("/work/bin/challenge.exe", argv)
         self.assertIn("/work/src/challenge.c", argv)
         self.assertIn(":/work:rw", " ".join(argv))  # compile must write the .exe back
+        # self-contained link: no external libwinpthread-1.dll / libgcc DLL imports
+        self.assertIn("-static", argv)
+        self.assertIn("-pthread", argv)
 
     def test_run_mounts_only_the_exe_and_uses_winrun(self):
         b = DockerWinCompatBackend()

@@ -451,7 +451,12 @@ class DockerWinCompatBackend(ExecutionBackend):
         src = PurePosixPath(_WORK) / source_rel
         out = PurePosixPath(_WORK) / out_rel
         cc = target.mingw_cross or "x86_64-w64-mingw32-gcc"
-        inner = [cc, "-O2", "-s", "-o", str(out), str(src)]
+        # -static -pthread makes the .exe self-contained: libgcc and winpthread are
+        # linked IN, not left as external DLL imports. Without this a threaded PE
+        # imports libwinpthread-1.dll, which is absent from the Wine prefix, so it
+        # fails to load (status c0000135) — the compatibility study's one failure.
+        # It also means generated PE need no MinGW runtime DLLs alongside them.
+        inner = [cc, "-O2", "-s", "-static", "-pthread", "-o", str(out), str(src)]
         # Compile needs the workspace writable so the .exe lands back on the host
         # (for the strings-leak check). No Wine here, so the default tmpfs is fine.
         name = f"slothctf-{uuid.uuid4().hex[:12]}"

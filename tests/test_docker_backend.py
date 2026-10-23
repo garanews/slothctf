@@ -210,6 +210,24 @@ class WinCompatIsolationTests(unittest.TestCase):
             with self.assertRaises(SandboxUnavailable):
                 self.b.compile_c(Path(tmp), "src/c.c", "bin/c", ELF)  # PE-only backend
 
+    def test_threaded_pe_runs_under_wine(self):
+        # Regression for the compatibility study's one failure: a pthread-using PE
+        # must load and run under Wine. The backend links -static -pthread, so
+        # winpthread is embedded instead of imported as libwinpthread-1.dll (which
+        # the Wine prefix does not have). Without the fix this fails at load.
+        with TemporaryDirectory() as tmp:
+            ws = _ws(tmp)
+            (ws / "src" / "c.c").write_text(
+                '#include <stdio.h>\n#include <pthread.h>\n'
+                'static void* w(void* a){ return a; }\n'
+                'int main(void){ pthread_t t; pthread_create(&t,0,w,0); pthread_join(t,0);'
+                ' printf("sloth{threads_ok}"); return 0; }\n', encoding="utf-8")
+            c = self.b.compile_c(ws, "src/c.c", "bin/challenge.exe", PE)
+            self.assertTrue(c.ok, c.stderr)
+            r = self.b.run_binary(ws, "bin/challenge.exe", PE)
+            self.assertTrue(r.ok, r.stderr)
+            self.assertIn("sloth{threads_ok}", r.stdout)
+
     def test_generate_then_validate_pe(self):
         from slothctf.generator import generate_challenge
         from slothctf.validator import validate_challenge
