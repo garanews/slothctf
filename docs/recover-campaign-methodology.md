@@ -1,0 +1,91 @@
+# recover campaign — methodology
+
+A measurement campaign for the `recover` genre with **real Qwen generations** (not
+the pre-recorded responses used in tests). It exists to answer three questions and
+nothing more — it is not another development cycle.
+
+1. **Does it work?** The technical success rate of autonomous generations.
+2. **Does it produce different challenges?** The variety of obfuscation techniques.
+3. **Are they interesting?** Difficulty and obvious shortcuts — a challenge solved
+   in 30 seconds with `strings` is not the same as one that needs 15 minutes of
+   static analysis, even if both pass the automated checks.
+
+The tool (`tools/run_recover_campaign.py`) drives the existing generator,
+verifiers and backends **unchanged**.
+
+## Reproducibility
+
+- Scenarios are frozen in `tools/recover_campaign/scenarios.json`: both targets
+  (ELF, PE) × three difficulties (easy, medium, hard), with **neutral prompts** that
+  do not steer the obfuscation technique (we measure what Qwen chooses). Pilot
+  sample: **18 runs** (6 scenarios × 3 repetitions).
+- Every record stores provenance: tool version, git commit, model name and (online)
+  its Ollama digest, inference parameters, platform and Python version, plus the
+  backend and target. Do not edit prompts/model/reps mid-campaign — bump `version`
+  and start a new dataset.
+- The dataset is an **append-only JSONL**; the runner is **resumable** (it skips
+  run_ids already present), so an interrupted campaign neither duplicates nor loses
+  results. Records are written only after a run completes; an interruption mid-run
+  simply re-runs that one on resume.
+
+## What is recorded per run
+
+Final outcome and (on failure) the stage; number of attempts and total time; the
+per-attempt stages; and a category that distinguishes **infrastructure** problems
+(Ollama unreachable, Docker/solver backend errors, timeouts) from **model
+rejects** (the model produced content that failed a functional/solver check) and
+**ok**. Functional-check and solver/flag-swap outcomes are encoded in the stages
+(e.g. `recover-rejects-correct`, `solver-mismatch`, `solver-hardcoded`).
+
+## Heuristic quality measures (labelled as heuristics)
+
+On each **successful** challenge the tool also records, clearly flagged as
+heuristics, never as ground truth:
+
+- **Transform family** — a coarse tag set from the organizer's encoder/solver
+  source (xor, add/sub, rotate, s-box/table, named cipher, position-dependent), and
+  a `family_signature`. Variety is the number of distinct signatures over the
+  successful set.
+- **Obvious shortcuts** — whether the plaintext flag is recoverable by a `strings`
+  scan (UTF-8/UTF-16LE), or by a **single-byte XOR/ADD sweep** of the whole binary.
+  These catch the laziest attacks only.
+- **Structural** — binary size and byte entropy.
+
+**Important:** a challenge is **not** labelled hard because the naive attacker
+failed — that only rules out the laziest attack. Real difficulty comes from the
+human playtest, below.
+
+## Gameplay quality — human, not LLM
+
+No LLM assigns a final difficulty score. A human fills in
+`tools/recover_campaign/playtest_scorecard.md` per challenge: time to solve, tools
+used, hints needed, perceived difficulty, unintended shortcuts, and interest.
+
+### Note from the first (pre-campaign) playtest
+
+The two hand-made example binaries were solved from the distributed binaries alone
+using **static-analysis / disassembly tooling** (not necessarily the Ghidra GUI).
+Their transform was **position-dependent addition combined with XOR** — not a
+XOR-free scheme. Both are fine introductory challenges but use essentially the same
+mechanic, so they do not yet demonstrate variety or advanced difficulty. Measuring
+exactly that variety across real generations is the point of this campaign.
+
+## Limits
+
+- Technical success ≠ good gameplay. The automated checks prove a recovery path
+  exists and the program is a working validator; they do not prove the challenge is
+  interesting or appropriately hard.
+- Heuristics can mislabel (e.g. a custom transform tagged only "position_dependent").
+  Treat the family histogram as a signal, not a taxonomy.
+- The naive attacker is intentionally weak; absence of a shortcut is weak evidence.
+- Timeouts are classified as infrastructure, but a model that writes a slow program
+  can also cause them — inspect the stage/detail when it matters.
+
+## Outputs and data handling
+
+- **Raw dataset** (JSONL) is kept **locally** and is the source of truth; it contains
+  the plaintext flags and local paths and is not published.
+- **Aggregate report** (Markdown) and **CSV** are produced by `aggregate`.
+- **Publication** uses `anonymize`, which writes a separate copy with flags hashed,
+  host details dropped and recovered-flag fields redacted — **without altering the
+  original dataset**. Scrubbed, publishable datasets live under `campaign/`.
