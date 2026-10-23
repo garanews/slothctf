@@ -36,6 +36,18 @@ class AggregateTests(unittest.TestCase):
         # render must not crash
         self.assertIn("reliability report", rc.render_report(agg))
 
+    def test_gate_rejection_counted_on_intermediate_attempt(self):
+        # The round-trip gate rejected attempt 2, the model then failed on a
+        # flag-mismatch, so final_stage is NOT a gate stage — but the gate DID
+        # fire. It must still count as a gate rejection (the campaign's rep3 case).
+        rec = _rec("reverse", "easy", {"roundtrip": True}, False, 5, 60.0,
+                   "flag-mismatch", ["compile", "roundtrip", "flag-mismatch",
+                                     "flag-mismatch", "flag-mismatch"])
+        agg = rc.aggregate([rec])
+        g = agg["groups"][0]
+        self.assertEqual(g["gate_rejections"], 1)
+        self.assertIn("roundtrip", agg["stage_frequency"])
+
     def test_empty(self):
         agg = rc.aggregate([])
         self.assertEqual(agg["total_runs"], 0)

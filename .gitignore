@@ -17,3 +17,6 @@ tmp_hello.c
 pytest_results.txt
 verification_status.txt
 runs.jsonl
+runs_roundtrip_followup.jsonl
+# published, scrubbed datasets live under campaign/ and ARE tracked
+!campaign/

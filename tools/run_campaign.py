@@ -140,7 +140,13 @@ def aggregate(records: list[dict]) -> dict:
         n = len(rs)
         succ = [r for r in rs if r.get("success")]
         first = [r for r in succ if r.get("attempts_used") == 1]
-        gate_rej = [r for r in rs if r.get("final_stage") in GATE_STAGES]
+        # A gate can reject an *intermediate* attempt and still be repaired, so the
+        # run's final_stage may be something else. Count a run as a gate rejection
+        # if the gate fired on ANY attempt, not only the last one.
+        def _hit_gate(r):
+            return (r.get("final_stage") in GATE_STAGES
+                    or any(a.get("stage") in GATE_STAGES for a in r.get("attempts", [])))
+        gate_rej = [r for r in rs if _hit_gate(r)]
         for r in rs:
             for a in r.get("attempts", []):
                 stage_counts[a["stage"]] += 1
@@ -174,7 +180,8 @@ def render_report(agg: dict) -> str:
              ", ".join(f"{k}={v}" for k, v in agg["stage_frequency"].items()))
     L.append("")
     L.append("Note: rates are numerator/denominator; 'to converge' stats use successful runs only. "
-             "Disabling a gate means it was not evaluated, not that the run would have passed it.")
+             "gate-rejects counts runs where a gate fired on ANY attempt (including ones later "
+             "repaired). Disabling a gate means it was not evaluated, not that the run would have passed it.")
     return "\n".join(L)
 
 

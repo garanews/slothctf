@@ -1,3 +1,4 @@
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,10 +17,32 @@ from slothctf.generator import (
     _parse_encoder_output,
     _render_readme,
     _render_solution,
+    _run_binary,
     _SCHEMA_RULES,
     _strip_code_fences,
     generate_challenge,
 )
+
+
+class RunBinaryDecodeTests(unittest.TestCase):
+    """Regression: a challenge binary may print bytes that are not valid in the
+    host's default codec (the campaign hit 0x9d, which cp1252 can't decode and a
+    non-invertible transform emits on a random round-trip probe). _run_binary must
+    decode robustly and return a string, never raise UnicodeDecodeError or return
+    None. See generator._run_binary / _roundtrip_check."""
+
+    def test_non_decodable_byte_does_not_crash(self):
+        # Use the Python interpreter as a stand-in "binary" that writes a raw 0x9d
+        # byte to stdout — no compiler needed, reproduces the exact failing case.
+        ran, out, _err = _run_binary(
+            Path(sys.executable),
+            ["-c", "import sys; sys.stdout.buffer.write(b'sloth{x}\\x9d')"],
+        )
+        self.assertTrue(ran)
+        self.assertIsInstance(out, str)           # decoded, not None
+        self.assertIn("sloth{x}", out)            # the valid part survives
+        # the replacement never equals a clean flag, so a wrong decode is a mismatch
+        self.assertNotEqual(out.strip(), "sloth{x}")
 
 
 class FlagHelperTests(unittest.TestCase):

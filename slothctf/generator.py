@@ -147,9 +147,14 @@ def _run_binary(
         input=stdin_text,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
     )
-    return result.returncode == 0, result.stdout, result.stderr.strip()
+    # A challenge binary may print arbitrary bytes (especially a non-invertible
+    # transform on a random round-trip input). Decode them with replacement so a
+    # wrong decode is detected as a mismatch, never crashes the run.
+    return result.returncode == 0, result.stdout or "", result.stderr.strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -925,7 +930,7 @@ def _roundtrip_check(base_dir: Path, template: str, encoder_bin: Path, compiler:
             try:
                 if kind == "check":
                     _, good, _ = _run_binary(rt_bin, stdin_text=x + "\n")
-                    if marker not in good:
+                    if marker not in (good or ""):
                         return AttemptResult(
                             0, False, "roundtrip",
                             f"random input {x!r} is NOT accepted — your transform is not a true "
@@ -933,10 +938,11 @@ def _roundtrip_check(base_dir: Path, template: str, encoder_bin: Path, compiler:
                             "byte overflow / signed-unsigned / modulo edges.")
                 else:
                     _, o, _ = _run_binary(rt_bin)
-                    if o.strip() != x:
+                    o = (o or "").strip()
+                    if o != x:
                         return AttemptResult(
                             0, False, "roundtrip",
-                            f"decode(encode({x!r})) = {o.strip()[:80]!r} != {x!r} — your transform "
+                            f"decode(encode({x!r})) = {o[:80]!r} != {x!r} — your transform "
                             "is not a true inverse for all inputs (byte overflow / signed-unsigned / "
                             "modulo edges), it only happens to work for the chosen flag.")
             except subprocess.TimeoutExpired:
