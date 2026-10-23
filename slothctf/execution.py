@@ -286,15 +286,27 @@ _WORK = "/work"  # workspace mount point inside the container
 
 def build_docker_run_argv(image: str, inner: list[str], workspace: Path,
                           limits: ResourceLimits, name: str,
-                          stdin: bool = False) -> list[str]:
+                          stdin: bool = False, *,
+                          mounts: list[tuple[str, str, str]] | None = None,
+                          tmpfs: str = "/tmp:rw,size=64m,noexec",
+                          env: list[tuple[str, str]] | None = None,
+                          workdir: str = _WORK) -> list[str]:
     """Build the full ``docker run`` argv for one step — pure and side-effect free
     so the isolation flags can be unit-tested without a daemon.
 
     The container has: no network, a non-root user, no added capabilities and
-    no-new-privileges, a read-only root filesystem with a small writable tmpfs for
-    /tmp, CPU / memory / PID caps, and the workspace bind-mounted read-write at
-    /work (the compiled artifact must land back on the host). ``--rm`` plus an
-    explicit --name let the caller force-remove a timed-out container.
+    no-new-privileges, a read-only root filesystem with a writable tmpfs for /tmp,
+    and CPU / memory / PID caps. ``--rm`` plus an explicit --name let the caller
+    force-remove a timed-out container.
+
+    Mounts: by default the whole workspace is bind-mounted read-write at /work (the
+    compiled artifact must land back on the host). Pass ``mounts`` as a list of
+    ``(host_src, container_dst, mode)`` to instead expose ONLY those paths — the
+    Windows-compat backend uses this to run a PE with just that one file visible,
+    read-only, so model code under Wine cannot read or write the rest of the
+    workspace. ``tmpfs`` and ``env`` are overridable for backends (e.g. Wine needs a
+    larger, exec-capable /tmp and its WINEPREFIX env). These are isolation knobs;
+    they do not change the fixed security flags above.
     """
     argv = [
         "docker", "run", "--rm", "--name", name,
@@ -303,13 +315,19 @@ def build_docker_run_argv(image: str, inner: list[str], workspace: Path,
         "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges",
         "--read-only",
-        "--tmpfs", "/tmp:rw,size=64m,noexec",
+        "--tmpfs", tmpfs,
         "--pids-limit", str(limits.pids),
         "--memory", limits.memory,
         "--cpus", str(limits.cpus),
-        "--workdir", _WORK,
-        "-v", f"{str(workspace.resolve())}:{_WORK}:rw",
+        "--workdir", workdir,
     ]
+    for k, v in (env or []):
+        argv += ["-e", f"{k}={v}"]
+    if mounts is None:
+        argv += ["-v", f"{str(workspace.resolve())}:{_WORK}:rw"]
+    else:
+        for src, dst, mode in mounts:
+            argv += ["-v", f"{str(Path(src).resolve())}:{dst}:{mode}"]
     if stdin:
         argv.append("-i")
     argv.append(image)
@@ -378,6 +396,91 @@ class DockerLinuxBackend(ExecutionBackend):
 
 
 # --------------------------------------------------------------------------- #
+# Docker Windows-compat backend — isolated PE via MinGW-w64 + Wine (Phase B)
+# --------------------------------------------------------------------------- #
+DEFAULT_WIN_IMAGE = os.environ.get("SLOTHCTF_WIN_IMAGE", "slothctf-sandbox-win:latest")
+_RUN_EXE = "/run/challenge.exe"  # read-only mount point for the PE under test
+
+
+class DockerWinCompatBackend(ExecutionBackend):
+    """Cross-compiles Windows PE with MinGW-w64 and runs it under Wine, inside the
+    same throwaway, network-less, non-root, read-only-root container as the Linux
+    backend. It builds the ``pe`` target only; ELF is explicitly unsupported here
+    (use DockerLinuxBackend), never silently retargeted.
+
+    Fidelity caveat: Wine is a compatibility layer, not Windows. A PE verified here
+    is "likely correct", not "behaves exactly as on Windows" — ``fidelity`` records
+    that so callers can surface it. Container isolation is independent of, and must
+    not be weakened for, emulation fidelity.
+    """
+    name = "docker-wincompat"
+    safe = True
+    supported_targets = frozenset({"pe"})
+    fidelity = "wine"  # vs "native" — NOT real Windows
+
+    # Wine needs a writable, exec-capable per-run WINEPREFIX in tmpfs; tmpfs pages
+    # are charged to the container's memory cgroup, so the default memory floor is
+    # raised and sized to hold the staged prefix.
+    _TMPFS = "/tmp:rw,size=384m"
+    _DEFAULT_MEMORY = "1g"
+    _WIN_ENV = [("HOME", "/tmp"), ("WINEPREFIX", "/tmp/wineprefix"), ("WINEDEBUG", "-all")]
+
+    def __init__(self, image: str = DEFAULT_WIN_IMAGE):
+        self.image = image
+
+    def _limits(self, limits: ResourceLimits | None) -> ResourceLimits:
+        # Default runs get the larger Wine/tmpfs memory floor; an explicit caller
+        # limit is respected as-is.
+        return limits or ResourceLimits(memory=self._DEFAULT_MEMORY)
+
+    def _capped(self, argv: list[str], name: str, timeout: float,
+                limits: ResourceLimits, stdin_text: str | None = None) -> ExecResult:
+        rc, out, err, timed_out, truncated = _run_capped(
+            argv, timeout=timeout, output_bytes=limits.output_bytes,
+            stdin_text=stdin_text,
+            on_timeout=lambda: DockerLinuxBackend._force_remove(name),
+        )
+        if timed_out:
+            return ExecResult(False, "", f"timed out after {timeout:.0f}s", timed_out=True)
+        return ExecResult(rc == 0, out, err.strip(), exit_code=rc, truncated=truncated)
+
+    def compile_c(self, workspace, source_rel, out_rel, target, limits=None):
+        self._require_target(target)  # pe only
+        limits = self._limits(limits)
+        (workspace / out_rel).parent.mkdir(parents=True, exist_ok=True)
+        src = PurePosixPath(_WORK) / source_rel
+        out = PurePosixPath(_WORK) / out_rel
+        cc = target.mingw_cross or "x86_64-w64-mingw32-gcc"
+        inner = [cc, "-O2", "-s", "-o", str(out), str(src)]
+        # Compile needs the workspace writable so the .exe lands back on the host
+        # (for the strings-leak check). No Wine here, so the default tmpfs is fine.
+        name = f"slothctf-{uuid.uuid4().hex[:12]}"
+        argv = build_docker_run_argv(self.image, inner, workspace, limits, name)
+        return self._capped(argv, name, limits.compile_timeout, limits)
+
+    def run_binary(self, workspace, binary_rel, target, args=None, stdin_text=None, limits=None):
+        self._require_target(target)
+        limits = self._limits(limits)
+        # Expose ONLY the PE under test, read-only — the rest of the workspace
+        # (sources, other binaries, the flag) stays invisible to the Wine process.
+        exe_host = workspace / binary_rel
+        mounts = [(str(exe_host), _RUN_EXE, "ro")]
+        inner = ["winrun", _RUN_EXE, *(args or [])]
+        name = f"slothctf-{uuid.uuid4().hex[:12]}"
+        argv = build_docker_run_argv(
+            self.image, inner, workspace, limits, name,
+            stdin=stdin_text is not None, mounts=mounts, tmpfs=self._TMPFS, env=self._WIN_ENV)
+        return self._capped(argv, name, limits.run_timeout, limits, stdin_text=stdin_text)
+
+    def run_python(self, workspace, script_rel, args=None, stdin_text=None, limits=None):
+        # The Windows-compat image has no Python; Python steps (log genre) run on
+        # the Linux backend. Refuse rather than pretend.
+        raise SandboxUnavailable(
+            "the Windows-compat backend runs PE binaries only; Python steps use the "
+            "Linux backend (target 'elf').")
+
+
+# --------------------------------------------------------------------------- #
 # Selection — explicit, no silent fallback
 # --------------------------------------------------------------------------- #
 def docker_available() -> bool:
@@ -402,14 +505,26 @@ def image_available(image: str = DEFAULT_IMAGE) -> bool:
         return False
 
 
-def build_sandbox_image(image: str = DEFAULT_IMAGE, context_dir: str = "docker") -> bool:
-    """Build the sandbox image from docker/Dockerfile, streaming output. Returns
-    True on success. Raises SandboxUnavailable if the docker CLI is missing."""
+def win_image_available(image: str = DEFAULT_WIN_IMAGE) -> bool:
+    """True if the Windows-compat sandbox image (MinGW + Wine) is built locally."""
+    return image_available(image)
+
+
+def build_sandbox_image(image: str | None = None, context_dir: str = "docker",
+                        dockerfile: str = "Dockerfile") -> bool:
+    """Build a sandbox image, streaming output. Returns True on success. Raises
+    SandboxUnavailable if the docker CLI or the Dockerfile is missing.
+
+    ``dockerfile`` selects which image: the default ELF image, or
+    ``Dockerfile.wincompat`` (MinGW + Wine) for the Windows-compat image."""
     if shutil.which("docker") is None:
         raise SandboxUnavailable("docker CLI not found; install Docker Desktop (Windows) or docker (Linux).")
-    if not (Path(context_dir) / "Dockerfile").exists():
-        raise SandboxUnavailable(f"no Dockerfile under {context_dir}/")
-    r = subprocess.run(["docker", "build", "-t", image, context_dir])  # inherit stdio: live output
+    df = Path(context_dir) / dockerfile
+    if not df.exists():
+        raise SandboxUnavailable(f"no {dockerfile} under {context_dir}/")
+    if image is None:
+        image = DEFAULT_WIN_IMAGE if dockerfile.endswith("wincompat") else DEFAULT_IMAGE
+    r = subprocess.run(["docker", "build", "-t", image, "-f", str(df), context_dir])  # inherit stdio
     return r.returncode == 0
 
 
@@ -451,7 +566,8 @@ UNSAFE_NATIVE = "unsafe-native"
 
 
 def resolve_backend(target: str | Target, isolation: str = ISOLATED, *,
-                    allow_native: bool = False, image: str = DEFAULT_IMAGE) -> ExecutionBackend:
+                    allow_native: bool = False, image: str = DEFAULT_IMAGE,
+                    win_image: str = DEFAULT_WIN_IMAGE) -> ExecutionBackend:
     """Pick the backend for a (target, isolation) request, or raise with a clear
     reason. This is the main entry point: it couples the two axes and never falls
     back silently from isolated to native or across targets.
@@ -469,11 +585,17 @@ def resolve_backend(target: str | Target, isolation: str = ISOLATED, *,
                     "--unsafe-native (dev only). No automatic fallback.")
             return DockerLinuxBackend(image=image)
         if tgt.name == "pe":
-            raise SandboxUnavailable(
-                "Isolated Windows PE is not available in Phase A. It arrives in Phase B "
-                "(DockerWinCompat: MinGW + Wine). For now choose target 'elf' for an "
-                "isolated build, or '--unsafe-native' on a Windows host to build the .exe "
-                "with no isolation. SlothCTF will not convert PE to ELF.")
+            if not docker_available():
+                raise SandboxUnavailable(
+                    "Isolated Windows PE needs Docker (MinGW + Wine), which is not "
+                    "available. Start Docker Desktop, or use --unsafe-native on a Windows "
+                    "host to build the .exe with no isolation. No automatic fallback.")
+            if not win_image_available(image=win_image):
+                raise SandboxUnavailable(
+                    f"Isolated Windows PE needs the Windows-compat image {win_image!r}, "
+                    "which is not built. Run `python main.py sandbox-build --win`. SlothCTF "
+                    "will not silently build the .exe unsandboxed or convert PE to ELF.")
+            return DockerWinCompatBackend(image=win_image)
         raise SandboxUnavailable(f"no isolated backend for target {tgt.name!r}")
 
     if isolation == UNSAFE_NATIVE:

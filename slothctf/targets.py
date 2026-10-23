@@ -82,24 +82,54 @@ def get_target(name: str) -> Target:
         raise TargetError(f"unknown target {name!r} (known: {', '.join(sorted(TARGETS))})")
 
 
-def detect_target_from_binary(binary_path: Path) -> Target:
-    """Identify a compiled artifact's target from its magic bytes.
+# Machine codes we accept (x86-64 only, matching the Target descriptors).
+_ELF_EM_X86_64 = 0x3E          # e_machine in the ELF header
+_PE_MACHINE_AMD64 = 0x8664     # Machine in the PE/COFF header
+_ELFCLASS64 = 2                # EI_CLASS
 
-    Content-based, not extension-based. Raises TargetError if the file is missing,
-    unreadable, or does not match exactly one known format (ambiguous/unknown)."""
+
+def _u16le(data: bytes, off: int) -> int | None:
+    return int.from_bytes(data[off:off + 2], "little") if len(data) >= off + 2 else None
+
+
+def detect_target_from_binary(binary_path: Path) -> Target:
+    """Identify a compiled artifact's target by PARSING its header, not just the
+    leading magic or the filename.
+
+    - ELF: ``\\x7fELF`` + 64-bit class + e_machine == x86-64.
+    - PE:  ``MZ`` + a valid ``PE\\0\\0`` signature at e_lfanew + Machine == AMD64.
+
+    This rejects a stray ``MZ`` that is not a real PE, and a PE/ELF of the wrong
+    architecture, instead of mislabelling it. Raises TargetError if the file is
+    missing/unreadable, is not a recognised x86-64 ELF or PE, or is ambiguous."""
     try:
-        head = Path(binary_path).read_bytes()[:8]
+        data = Path(binary_path).read_bytes()[:65536]  # header lives near the start
     except OSError as exc:
         raise TargetError(f"cannot read binary to detect target: {exc}") from exc
-    matched = [t for t in TARGETS.values() if t.matches_magic(head)]
-    if len(matched) == 1:
-        return matched[0]
-    if not matched:
+
+    is_elf = data[:4] == b"\x7fELF"
+    is_pe = False
+    if data[:2] == b"MZ" and len(data) >= 0x40:
+        e_lfanew = int.from_bytes(data[0x3C:0x40], "little")
+        if 0 < e_lfanew <= len(data) - 6 and data[e_lfanew:e_lfanew + 4] == b"PE\x00\x00":
+            is_pe = _u16le(data, e_lfanew + 4) == _PE_MACHINE_AMD64
+
+    if is_elf and is_pe:  # shouldn't happen for real files, but never guess
+        raise TargetError(f"ambiguous target for {binary_path}: header looks like both ELF and PE")
+    if is_elf:
+        if data[4:5] != bytes([_ELFCLASS64]) or _u16le(data, 18) != _ELF_EM_X86_64:
+            raise TargetError(
+                f"{binary_path} is an ELF but not x86-64 (class={data[4:5]!r}, "
+                f"e_machine={_u16le(data, 18)!r}); only x86-64 is supported")
+        return ELF
+    if is_pe:
+        return PE
+    if data[:2] == b"MZ":
         raise TargetError(
-            f"cannot determine target of {binary_path}: magic {head[:4]!r} matches no "
-            "known format (expected ELF \\x7fELF or PE MZ)")
+            f"{binary_path} starts with 'MZ' but is not a valid x86-64 PE "
+            "(no PE\\0\\0 signature / wrong machine) — refusing to guess from the extension")
     raise TargetError(
-        f"ambiguous target for {binary_path}: magic matches {[t.name for t in matched]}")
+        f"cannot determine target of {binary_path}: not a recognised x86-64 ELF or PE")
 
 
 def _artifact_candidates(challenge_dir: Path) -> list[Path]:

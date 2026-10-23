@@ -13,14 +13,19 @@ from tempfile import TemporaryDirectory
 
 from slothctf.execution import (
     DockerLinuxBackend,
+    DockerWinCompatBackend,
     ResourceLimits,
+    SandboxUnavailable,
     docker_available,
     image_available,
+    win_image_available,
 )
-from slothctf.targets import ELF
+from slothctf.targets import ELF, PE, detect_target_from_binary
 
 _READY = docker_available() and image_available()
 _SKIP = "needs Docker + the slothctf-sandbox image (python main.py sandbox-build)"
+_WIN_READY = docker_available() and win_image_available()
+_WIN_SKIP = "needs Docker + the slothctf-sandbox-win image (python main.py sandbox-build --win)"
 
 
 def _ws(tmp: str) -> Path:
@@ -157,6 +162,80 @@ class EndToEndElfTests(unittest.TestCase):
 
                 # Re-validate from scratch through the same sandbox.
                 result = validate_challenge(challenge_dir, backend=DockerLinuxBackend())
+                self.assertTrue(result.success, str(result))
+            finally:
+                os.chdir(prev)
+
+
+@unittest.skipUnless(_WIN_READY, _WIN_SKIP)
+class WinCompatIsolationTests(unittest.TestCase):
+    """Live tests for the MinGW-w64 + Wine backend: a real PE is cross-compiled and
+    run under Wine in the isolated container. Gated on the built win image."""
+
+    def setUp(self):
+        self.b = DockerWinCompatBackend()
+
+    def test_compile_and_run_pe_under_wine(self):
+        with TemporaryDirectory() as tmp:
+            ws = _ws(tmp)
+            (ws / "src" / "c.c").write_text(
+                '#include <stdio.h>\nint main(){printf("sloth{pe_ok}");return 0;}', encoding="utf-8")
+            c = self.b.compile_c(ws, "src/c.c", "bin/challenge.exe", PE)
+            self.assertTrue(c.ok, c.stderr)
+            exe = ws / "bin" / "challenge.exe"
+            self.assertTrue(exe.exists())                              # PE landed on the host mount
+            self.assertEqual(detect_target_from_binary(exe).name, "pe")  # real x86-64 PE
+            r = self.b.run_binary(ws, "bin/challenge.exe", PE)
+            self.assertTrue(r.ok, r.stderr)
+            self.assertIn("sloth{pe_ok}", r.stdout)
+
+    def test_run_exposes_only_the_exe(self):
+        # The run mounts ONLY the PE, so the rest of the workspace is not in the
+        # container: a program reaching for a sibling file cannot find it.
+        with TemporaryDirectory() as tmp:
+            ws = _ws(tmp)
+            (ws / "secret.txt").write_text("TOPSECRET", encoding="utf-8")
+            (ws / "src" / "peek.c").write_text(
+                '#include <stdio.h>\n'
+                'int main(){FILE*f=fopen("Z:\\\\work\\\\secret.txt","r");'
+                'if(!f){printf("NO-ACCESS");return 0;}printf("LEAKED");return 0;}', encoding="utf-8")
+            c = self.b.compile_c(ws, "src/peek.c", "bin/challenge.exe", PE)
+            self.assertTrue(c.ok, c.stderr)
+            r = self.b.run_binary(ws, "bin/challenge.exe", PE)
+            self.assertIn("NO-ACCESS", r.stdout)
+            self.assertNotIn("LEAKED", r.stdout)
+
+    def test_refuses_elf_target(self):
+        with TemporaryDirectory() as tmp:
+            with self.assertRaises(SandboxUnavailable):
+                self.b.compile_c(Path(tmp), "src/c.c", "bin/c", ELF)  # PE-only backend
+
+    def test_generate_then_validate_pe(self):
+        from slothctf.generator import generate_challenge
+        from slothctf.validator import validate_challenge
+        resp = {
+            "title": "XOR PE", "category": "Reverse Engineering", "difficulty": "easy",
+            "description": "Recover the flag.", "flag": "sloth{pe_e2e}",
+            "challenge_kind": "decode",
+            "encoder_code": ("#include <stdio.h>\nint main(int c,char**v){for(char*p=v[1];*p;++p)"
+                             "printf(\"0x%02x,\",(unsigned char)(*p^0x5a));return 0;}\n"),
+            "challenge_code": ("#include <stdio.h>\nstatic unsigned char t[]={ /*__ENCODED_ARRAY__*/ };\n"
+                               "int main(void){for(unsigned long i=0;i<sizeof t;i++)"
+                               "putchar(t[i]^0x5a);return 0;}\n"),
+        }
+        prev = os.getcwd()
+        with TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            try:
+                report = generate_challenge(
+                    "pe_e2e", prompt="easy XOR reverse",
+                    caller=lambda p, m: dict(resp),
+                    backend=DockerWinCompatBackend(), target="pe",
+                    max_attempts=1, return_report=True)
+                self.assertTrue(report.success, report.as_text())
+                cd = Path("generated") / "pe_e2e"
+                self.assertTrue((cd / "bin" / "challenge.exe").exists())
+                result = validate_challenge(cd, backend=DockerWinCompatBackend())
                 self.assertTrue(result.success, str(result))
             finally:
                 os.chdir(prev)

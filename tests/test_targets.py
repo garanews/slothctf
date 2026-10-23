@@ -13,8 +13,31 @@ from slothctf.targets import (
     infer_target,
 )
 
-ELF_MAGIC = b"\x7fELF\x02\x01\x01\x00rest"
-PE_MAGIC = b"MZ\x90\x00\x03\x00\x00\x00rest"
+def _elf_bytes(machine: int = 0x3E, cls: int = 2) -> bytes:
+    """A minimal but structurally valid ELF header (x86-64 by default)."""
+    b = bytearray(64)
+    b[0:4] = b"\x7fELF"
+    b[4] = cls          # EI_CLASS: 2 = 64-bit
+    b[5] = 1            # EI_DATA: little-endian
+    b[6] = 1            # EI_VERSION
+    b[16:18] = (2).to_bytes(2, "little")        # e_type = ET_EXEC
+    b[18:20] = machine.to_bytes(2, "little")    # e_machine
+    return bytes(b)
+
+
+def _pe_bytes(machine: int = 0x8664) -> bytes:
+    """A minimal but structurally valid PE: MZ, a PE\\0\\0 at e_lfanew, a machine."""
+    b = bytearray(0x50)
+    b[0:2] = b"MZ"
+    e_lfanew = 0x40
+    b[0x3C:0x40] = e_lfanew.to_bytes(4, "little")
+    b[e_lfanew:e_lfanew + 4] = b"PE\x00\x00"
+    b[e_lfanew + 4:e_lfanew + 6] = machine.to_bytes(2, "little")
+    return bytes(b)
+
+
+ELF_MAGIC = _elf_bytes()
+PE_MAGIC = _pe_bytes()
 
 
 def _write(dirpath: Path, name: str, data: bytes) -> Path:
@@ -52,6 +75,26 @@ class DetectTests(unittest.TestCase):
     def test_unknown_magic_errors(self):
         with TemporaryDirectory() as tmp:
             p = _write(Path(tmp), "challenge", b"garbage!")
+            with self.assertRaises(TargetError):
+                detect_target_from_binary(p)
+
+    def test_bare_mz_without_pe_signature_is_rejected(self):
+        # 'MZ' alone (e.g. a DOS stub or a stray file) is NOT a PE: detection parses
+        # the PE header, it does not guess from the leading two bytes or the name.
+        with TemporaryDirectory() as tmp:
+            p = _write(Path(tmp), "challenge.exe", b"MZ" + b"\x00" * 200)
+            with self.assertRaises(TargetError):
+                detect_target_from_binary(p)
+
+    def test_wrong_architecture_pe_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            p = _write(Path(tmp), "challenge.exe", _pe_bytes(machine=0x014C))  # i386
+            with self.assertRaises(TargetError):
+                detect_target_from_binary(p)
+
+    def test_wrong_architecture_elf_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            p = _write(Path(tmp), "challenge", _elf_bytes(machine=0xB7))  # aarch64
             with self.assertRaises(TargetError):
                 detect_target_from_binary(p)
 

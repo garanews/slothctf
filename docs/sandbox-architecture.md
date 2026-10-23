@@ -24,7 +24,7 @@ run, and **never** converts one target into another.
 |---|---|---|---|---|---|
 | **NativeBackend** (host toolchain) | host-native only: `pe` on Windows, `elf` on Linux | **none — UNSAFE** | real OS | a host compiler | A (legacy/dev, explicit `--unsafe-native`) |
 | **DockerLinuxBackend** (`gcc` in a container) | `elf` | strong (container) | real Linux | Docker + `slothctf-sandbox` image | **A (default for elf)** |
-| **DockerWinCompat** (`x86_64-w64-mingw32-gcc` + **Wine**) | `pe` | strong (container) | Wine ≈ (not real Windows) | Docker + a win image | **B (next)** |
+| **DockerWinCompatBackend** (`x86_64-w64-mingw32-gcc` + **Wine**) | `pe` | strong (container) | Wine ≈ (not real Windows) | Docker + `slothctf-sandbox-win` image | **B (implemented)** |
 | **VMWindows** (real Windows VM) | `pe` | strong (VM) | real Windows (anti-debug, WinAPI) | a Windows VM | C (later, maybe) |
 
 ## Resolution rules (no silent fallback)
@@ -33,9 +33,11 @@ run, and **never** converts one target into another.
 
 - `elf` + isolated → **DockerLinuxBackend** (requires Docker + the image, else an
   explicit `SandboxUnavailable`).
-- `pe` + isolated → **not available in Phase A** → explicit error naming Phase B.
-  SlothCTF does not build the `.exe` unsandboxed on its own, and does not downgrade
-  it to ELF.
+- `pe` + isolated → **DockerWinCompatBackend** (requires Docker + the
+  `slothctf-sandbox-win` image, else an explicit `SandboxUnavailable` naming
+  `sandbox-build --win`). It cross-compiles the `.exe` with MinGW-w64 and runs it
+  under Wine. SlothCTF does not build the `.exe` unsandboxed on its own, and does
+  not downgrade it to ELF.
 - any target + `unsafe-native` → **NativeBackend**, but only after an explicit opt-in
   (`--unsafe-native` / `SLOTHCTF_ALLOW_NATIVE=1`) **and** only if the host toolchain
   emits that target (e.g. a native `elf` build on Windows is refused).
@@ -55,6 +57,20 @@ read-only root filesystem with a small `--tmpfs /tmp`, `--pids-limit`, `--memory
 byte cap. A timed-out container is force-removed. The workspace is bind-mounted so the
 ELF artifact is readable on the host (for the byte-level strings-leak check).
 
+### Extra isolation for the Windows-compat (Wine) backend
+
+`DockerWinCompatBackend` keeps every flag above and tightens two things for the run
+step. (1) It bind-mounts **only the single `.exe`** under test, read-only, instead of
+the whole workspace — so model code under Wine cannot read or modify the sources, the
+flag or other binaries. (2) Wine needs a writable `WINEPREFIX`, which would clash with
+the read-only root, so each run stages a private prefix in the per-run `/tmp` tmpfs:
+the 687 MB static DLL tree (`drive_c/windows`) is **shared read-only** by symlink to a
+prefix baked at build time, and only the few MB of mutable state (registry, user dir)
+are copied. tmpfs pages count against `--memory`, so this backend runs with a larger
+memory floor. Compile uses the normal read-write workspace mount (the `.exe` must land
+back on the host). Container isolation (this section) is **independent of** Wine's
+emulation fidelity (next section); do not conflate the two.
+
 ## Limitations — a container is not a VM
 
 Docker shares the **host kernel**. It is a strong boundary against the challenge code
@@ -70,9 +86,12 @@ syscalls behave differently, so a PE verified under Wine is "likely correct", no
 - **Phase A (this change):** Target concept (pe/elf), DockerLinuxBackend for isolated
   ELF, NativeBackend preserved as explicit unsafe legacy (keeps existing Windows `.exe`
   generation and validation working), CLI/GUI selectors, no-fallback resolver, tests.
-- **Phase B (next):** DockerWinCompat (MinGW + Wine) for *isolated* PE, with the Wine
-  caveat surfaced in metadata/solution. This is the immediate priority — Phase A alone
-  does **not** count as isolated Windows support.
-- **Phase C (later, only if needed):** VMWindows for faithful isolated PE. Deferred:
-  first measure how many real PE challenges behave correctly under Wine; that decides
-  whether C is urgent or whether effort goes to new challenge genres instead.
+- **Phase B (implemented):** DockerWinCompatBackend (MinGW-w64 + Wine) for *isolated*
+  PE, resolver wired (`pe` + isolated → this backend), hardened PE detection (PE
+  signature + x86-64 machine, not just `MZ`/extension), `sandbox-build --win`, gated
+  live tests, and a Wine **compatibility report** over the existing PE challenges
+  (`tools/wine_compat_report.py`) — the result-driven measure of how faithfully Wine
+  runs them, especially the WinAPI / anti-debug / anti-VM ones.
+- **Phase C (later, only if needed):** VMWindows for faithful isolated PE. The decision
+  is driven by the compatibility report: if Wine covers most PE challenges, C stays
+  deferred and effort goes elsewhere; the report names the cases that would need it.
