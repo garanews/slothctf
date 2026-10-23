@@ -6,6 +6,7 @@ native Docker) and `python main.py sandbox-build`, they prove the container real
 is isolated: no network, bounded time, read-only root fs with a writable /tmp, and
 truncated output. Run: python -m unittest tests.test_docker_backend
 """
+import contextlib
 import os
 import unittest
 from pathlib import Path
@@ -257,6 +258,138 @@ class WinCompatIsolationTests(unittest.TestCase):
                 self.assertTrue(result.success, str(result))
             finally:
                 os.chdir(prev)
+
+
+# --- recover genre: shared pre-recorded model response (XOR 0x5a) --------------
+# encoder prints flag^0x5a as bytes; challenge embeds them and VALIDATES stdin
+# against them (never prints the flag); solver XORs the whole binary back and
+# finds sloth{...}. Works for any flag, so the harness flag-swap round-trips.
+_REC_ENCODER = ("#include <stdio.h>\nint main(int c,char**v){for(char*p=v[1];*p;++p)"
+                "printf(\"0x%02x,\",(unsigned char)(*p^0x5a));return 0;}\n")
+_REC_CHALLENGE = ("#include <stdio.h>\n#include <string.h>\n"
+                  "static unsigned char data[]={ /*__ENCODED_ARRAY__*/ };\n"
+                  "int main(void){char b[256];if(!fgets(b,sizeof b,stdin)){printf(\"no input\\n\");return 0;}"
+                  "size_t n=strlen(b);if(n&&b[n-1]=='\\n')b[--n]=0;"
+                  "if(n!=sizeof data){printf(\"Denied\\n\");return 0;}"
+                  "for(size_t i=0;i<n;i++)if(((unsigned char)b[i]^0x5a)!=data[i]){printf(\"Denied\\n\");return 0;}"
+                  "printf(\"Correct\\n\");return 0;}\n")
+_REC_SOLVER = ("import sys, re\n"
+               "b = open(sys.argv[1], 'rb').read()\n"
+               "dec = bytes(x ^ 0x5a for x in b)\n"
+               "m = re.search(rb'sloth\\{[^}]{1,64}\\}', dec)\n"
+               "print(m.group(0).decode() if m else '')\n")
+
+
+def _recover_response(flag, challenge=_REC_CHALLENGE, solver=_REC_SOLVER, marker="Correct"):
+    return {"title": "XOR Recover", "category": "Reverse Engineering", "difficulty": "easy",
+            "description": "Recover the flag from the binary.", "flag": flag,
+            "challenge_kind": "recover", "success_marker": marker, "encoder_code": _REC_ENCODER,
+            "challenge_code": challenge, "solver_code": solver}
+
+
+# A challenge that IGNORES its input and always prints the marker — a broken
+# validator that must be rejected even though encoder and solver are fine. It uses
+# `data` (via a volatile sum) so the array is NOT optimised away: the embedded
+# bytes are present, so verification reaches the functional check and rejects it
+# there (a wrong input is accepted), not merely for missing data.
+_REC_IGNORES_INPUT = ("#include <stdio.h>\n"
+                      "static unsigned char data[]={ /*__ENCODED_ARRAY__*/ };\n"
+                      "int main(void){ volatile unsigned s=0;"
+                      "for(unsigned i=0;i<sizeof data;i++) s+=data[i];"
+                      "(void)s; printf(\"Correct\\n\"); return 0; }\n")
+
+# A solver that tries to EXECUTE the artifact instead of reading it — must fail
+# (the artifact is mounted read-only with no execute bit; /tmp is noexec).
+_REC_EXEC_SOLVER = ("import os, sys\n"
+                    "os.execv(sys.argv[1], [sys.argv[1]])  # attempt to run the binary\n"
+                    "print('unreachable')\n")
+
+
+@contextlib.contextmanager
+def _generate_recover(name, target, backend, response):
+    """Generate a recover challenge in a throwaway cwd; yields (report, dir) while
+    the workspace still exists so the caller can inspect files, then cleans up."""
+    from slothctf.generator import generate_challenge
+    prev = os.getcwd()
+    with TemporaryDirectory() as tmp:
+        os.chdir(tmp)
+        try:
+            report = generate_challenge(name, prompt="xor recover", genre="recover",
+                                        caller=lambda p, m: dict(response), backend=backend,
+                                        target=target, max_attempts=1, return_report=True)
+            yield report, Path(tmp) / "generated" / name
+        finally:
+            os.chdir(prev)
+
+
+@unittest.skipUnless(_READY, _SKIP)
+class RecoverGenreTests(unittest.TestCase):
+    """Live recover-genre verification on real binaries (ELF via DockerLinux)."""
+
+    def test_recover_elf_end_to_end(self):
+        with _generate_recover("rec_elf", "elf", DockerLinuxBackend(),
+                               _recover_response("sloth{rec_elf}")) as (report, cdir):
+            self.assertTrue(report.success, report.as_text())
+            self.assertTrue((cdir / "bin" / "challenge").exists())
+            self.assertTrue((cdir / "organizer" / "solver.py").exists())
+
+    def test_hardcoded_solver_is_rejected_by_flag_swap(self):
+        # Solver prints the ORIGINAL flag literally: the first recovery looks OK,
+        # but the harness flag-swap (a different binary) exposes it as hardcoded.
+        flag = "sloth{rec_hc}"
+        with _generate_recover("rec_hc", "elf", DockerLinuxBackend(),
+                               _recover_response(flag, solver=f"print({flag!r})\n")) as (report, _):
+            self.assertFalse(report.success)
+            self.assertEqual(report.attempts[-1].stage, "solver-hardcoded")
+
+    def test_solver_reading_challenge_json_fails(self):
+        # The isolated solver workspace has no challenge.json, so a solver that
+        # tries to read it fails (file absent) — it never sees organizer data.
+        peek = "import json,sys\nprint(json.load(open('challenge.json'))['flag'])\n"
+        with _generate_recover("rec_peek", "elf", DockerLinuxBackend(),
+                               _recover_response("sloth{rec_peek}", solver=peek)) as (report, _):
+            self.assertFalse(report.success)
+            self.assertEqual(report.attempts[-1].stage, "solver-error")
+
+    def test_recover_revalidates_on_disk(self):
+        from slothctf.validator import validate_challenge
+        with _generate_recover("rec_val", "elf", DockerLinuxBackend(),
+                               _recover_response("sloth{rec_val}")) as (report, cdir):
+            self.assertTrue(report.success, report.as_text())
+            result = validate_challenge(cdir, backend=DockerLinuxBackend())
+            self.assertTrue(result.success, str(result))
+
+    def test_program_ignoring_input_is_rejected(self):
+        # encoder + solver are fine, but the binary ignores stdin and always prints
+        # the marker -> the functional check rejects it (a wrong input is accepted).
+        with _generate_recover("rec_ignore", "elf", DockerLinuxBackend(),
+                               _recover_response("sloth{rec_ignore}", challenge=_REC_IGNORES_INPUT)
+                               ) as (report, _):
+            self.assertFalse(report.success)
+            self.assertEqual(report.attempts[-1].stage, "recover-accepts-wrong")
+
+    def test_solver_cannot_execute_the_binary(self):
+        # A solver that tries os.execv on the ELF is stopped by the stripped exec bit
+        # on the read-only mount, so it fails to recover the flag -> rejected. (This
+        # blocks the naive exec path; the ld-loader bypass is not claimed to be
+        # prevented — the container sandbox is the real boundary. See run_solver.)
+        with _generate_recover("rec_exec", "elf", DockerLinuxBackend(),
+                               _recover_response("sloth{rec_exec}", solver=_REC_EXEC_SOLVER)
+                               ) as (report, _):
+            self.assertFalse(report.success)
+            self.assertIn(report.attempts[-1].stage, {"solver-error", "solver-mismatch"})
+
+
+@unittest.skipUnless(_WIN_READY and _READY, _WIN_SKIP)
+class RecoverPeTests(unittest.TestCase):
+    """Recover for a Windows PE: challenge built/run under Wine, solver (Python)
+    analyses the .exe bytes on the Linux backend."""
+
+    def test_recover_pe_end_to_end(self):
+        with _generate_recover("rec_pe", "pe", DockerWinCompatBackend(),
+                               _recover_response("sloth{rec_pe}")) as (report, cdir):
+            self.assertTrue(report.success, report.as_text())
+            self.assertTrue((cdir / "bin" / "challenge.exe").exists())
 
 
 if __name__ == "__main__":

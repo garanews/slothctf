@@ -1,0 +1,21 @@
+{
+  "title": "XOR Vault (ELF)",
+  "category": "Reverse Engineering",
+  "difficulty": "easy",
+  "description": "The binary validates input but never prints the flag. Recover it by analysing the binary.",
+  "flag": "sloth{r3covered_from_elf}",
+  "challenge_kind": "recover",
+  "target": "elf",
+  "success_marker": "Correct",
+  "generation": {
+    "prompt": "recover xor",
+    "genre": "recover",
+    "model": "gemma3:4b",
+    "difficulty": "easy",
+    "roundtrip": false,
+    "adversary": false,
+    "surprise": false,
+    "target": "elf",
+    "backend": "docker-linux"
+  }
+}

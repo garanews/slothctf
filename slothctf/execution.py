@@ -394,6 +394,43 @@ class DockerLinuxBackend(ExecutionBackend):
         inner = ["python3", "-I", str(PurePosixPath(_WORK) / script_rel), *(args or [])]
         return self._exec(inner, workspace, limits.run_timeout, limits, stdin_text=stdin_text)
 
+    def run_solver(self, solver_ws: Path, script_rel: str, artifact_host: Path,
+                   limits: ResourceLimits | None = None) -> ExecResult:
+        """Run a recover-genre solver (Python) against ONE artifact with hardened
+        isolation: the solver workspace AND the artifact are mounted READ-ONLY (so
+        the solver cannot restore an execute bit or drop an executable there) and the
+        only writable area is the noexec /tmp tmpfs. This strongly discourages the
+        solver from EXECUTING the binary instead of analysing it.
+
+        It is NOT an absolute guarantee: a read-only mount and a stripped execute bit
+        do not stop a determined script from invoking an ELF's dynamic loader
+        directly (e.g. `ld-linux.so <path>`), which ignores the execute bit. The real
+        containment is the container itself — no network, non-root, read-only root,
+        all capabilities dropped — so even if the solver did run the binary it stays
+        sandboxed. We do not present the static-only property as a hard boundary;
+        broadening enforcement (e.g. a seccomp/exec-blocking profile) is out of scope
+        for this change.
+
+        The artifact is exposed at a fixed read-only path and passed to the solver as
+        its argv[1]. Does not change compile_c/run_binary/run_python behaviour."""
+        limits = limits or ResourceLimits()
+        name = f"slothctf-{uuid.uuid4().hex[:12]}"
+        artifact_path = "/data/artifact.bin"
+        mounts = [
+            (str(Path(solver_ws).resolve()), _WORK, "ro"),            # script, read-only
+            (str(Path(artifact_host).resolve()), artifact_path, "ro"),  # binary, read-only
+        ]
+        inner = ["python3", "-I", str(PurePosixPath(_WORK) / script_rel), artifact_path]
+        argv = build_docker_run_argv(
+            self.image, inner, Path(solver_ws), limits, name,
+            mounts=mounts, env=[("PYTHONDONTWRITEBYTECODE", "1")])
+        rc, out, err, timed_out, truncated = _run_capped(
+            argv, timeout=limits.run_timeout, output_bytes=limits.output_bytes,
+            on_timeout=lambda: self._force_remove(name))
+        if timed_out:
+            return ExecResult(False, "", f"timed out after {limits.run_timeout:.0f}s", timed_out=True)
+        return ExecResult(rc == 0, out, err.strip(), exit_code=rc, truncated=truncated)
+
 
 # --------------------------------------------------------------------------- #
 # Docker Windows-compat backend — isolated PE via MinGW-w64 + Wine (Phase B)

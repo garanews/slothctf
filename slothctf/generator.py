@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib import request
 
-from .execution import ExecutionBackend, NativeBackend, ResourceLimits, resolve_backend
+from .execution import DEFAULT_IMAGE, ExecutionBackend, NativeBackend, ResourceLimits, resolve_backend
 from .targets import Target, get_target, DEFAULT_TARGET
 
 # Base URL of the Ollama server. Defaults to localhost but can point at a
@@ -374,6 +374,75 @@ HARD REQUIREMENTS (breaking any is rejected and sent back to you to fix):
 Think carefully so the encoder and the challenge agree perfectly.""" % {"ph": ENCODED_PLACEHOLDER}
 
 
+_SCHEMA_RULES_RECOVER = """\
+You are SlothCTF, a generator of small reverse-engineering challenges in C where
+the player must RECOVER a hidden flag by ANALYSING the compiled binary — NOT by
+simply running it. Running the program must not reveal the flag. You invent
+EVERYTHING: the secret, the obfuscation, the C code, and a reference SOLVER.
+
+You never compute obfuscated bytes in your head. You write an ENCODER in C; the
+machine runs it on the flag to get the exact bytes and injects them into the
+challenge. A reference SOLVER (Python) then recovers the flag from the compiled
+binary's bytes alone.
+
+Return ONE JSON object (no prose, no fences) with EXACTLY these keys:
+  "title"          : short challenge name
+  "category"       : e.g. "Reverse Engineering"
+  "difficulty"     : "easy", "medium" or "hard"
+  "description"    : 1-2 sentences the player sees (do NOT reveal the secret/method)
+  "flag"           : the SECRET, formatted sloth{...}
+  "challenge_kind" : "recover"
+  "success_marker" : the EXACT text the program prints when the input equals the
+                     flag, e.g. "Access Granted" (must NOT contain the flag)
+  "encoder_code"   : a COMPLETE C program (organizer tool; players never see it)
+  "challenge_code" : a COMPLETE C program given to the player
+  "solver_code"    : a COMPLETE Python 3 program (organizer tool; players never see it)
+
+HARD REQUIREMENTS (breaking any is rejected and sent back to you to fix):
+
+1. encoder_code:
+   - compiles with: gcc -O2 -s -o encoder encoder.c
+   - reads the flag from argv[1], applies YOUR invertible transform (xor, add,
+     sbox, rolling key, …) and prints the result as comma-separated SINGLE-byte
+     0xNN tokens and NOTHING else, e.g.:  0x31,0x2e,0x2d,
+     One token PER BYTE; split wide values into individual bytes.
+   - process the WHOLE flag; do not require a fixed length.
+
+2. challenge_code (an input VALIDATOR that hides the flag):
+   - compiles with: gcc -O2 -s -o challenge challenge.c
+   - contains the EXACT token %(ph)s where the embedded byte array is initialised
+     (the machine substitutes the encoder's output there — put NO numbers there);
+   - MUST embed and use that array so the obfuscated flag really is present in the
+     compiled binary (that is what the solver recovers from).
+   - reads ONE line from stdin, strips the trailing newline, and prints EXACTLY
+     success_marker if and only if the input equals the flag; for any other input
+     it prints a DIFFERENT message (e.g. "Denied"). It must accept the correct
+     flag and reject wrong input — not always accept, not always reject.
+   - it MUST NOT print the flag or the plaintext secret under ANY input, and the
+     plaintext secret must NOT appear as a readable literal anywhere in
+     challenge_code. Running the program never hands over the flag: the player has
+     to RECOVER it from the binary, then can confirm it by typing it in.
+
+3. solver_code (the reference solution, proving a recovery path exists):
+   - runs as: python solver.py <path-to-compiled-binary>
+   - reads the binary's RAW BYTES from argv[1] and recovers the flag by INVERTING
+     your transform, then prints EXACTLY the flag (sloth{...}) and nothing else.
+   - MUST derive the flag from the binary's bytes. It must NOT hardcode the flag,
+     must NOT read any other file (no challenge.json, no source, no encoder), and
+     must NOT execute the binary. Standard library only; deterministic; must
+     terminate quickly.
+   - Robust recovery: scan the binary for the embedded region and invert the
+     transform; accept the window that yields a well-formed sloth{...}. Do NOT
+     rely on a hardcoded absolute file offset (it changes between builds).
+
+4. CONSISTENCY: the encoder transform and the solver's inverse MUST match exactly,
+   so the real flag round-trips: solver(compile(encode(flag))) == flag, for ANY
+   flag. Put shared constants/tables identically in encoder and solver. Ensure
+   every loop terminates and every buffer is bounded.
+
+Think carefully so encoder, challenge and solver agree perfectly.""" % {"ph": ENCODED_PLACEHOLDER}
+
+
 def _default_platform() -> str:
     """Describe the platform where the generated C is compiled and run, so the
     model avoids OS APIs that are not available there."""
@@ -493,6 +562,14 @@ _DIFFICULTY_RUBRIC = {
         "hard": "the answer requires multi-step correlation across many lines — time windows, "
                 "joining related events, or decoding embedded/encoded data.",
     },
+    "recover": {
+        "easy": "a SINGLE invertible byte transform (e.g. XOR or add with one key) hiding the "
+                "flag in the binary; the solver inverts it in a few lines.",
+        "medium": "a named cipher/encoding or a keyed/rolling transform; the solver must "
+                  "re-implement the inverse to recover the flag from the embedded bytes.",
+        "hard": "a layered or keyed obfuscation (e.g. an S-box plus a rolling key); still "
+                "statically invertible, but the solver needs real work to undo it.",
+    },
 }
 
 
@@ -502,6 +579,15 @@ def _random_flag() -> str:
     import string
     token = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(12))
     return f"sloth{{{token}}}"
+
+
+def _distinct_random_flag(exclude: str) -> str:
+    """A random flag guaranteed different from `exclude` (used for the recover
+    flag-swap, so the independence check really builds a DIFFERENT challenge)."""
+    f = _random_flag()
+    while f == exclude:
+        f = _random_flag()
+    return f
 
 
 def _build_generation_prompt(
@@ -521,13 +607,18 @@ def _build_generation_prompt(
             f"Otherwise, set the flag to exactly {default_flag} — do NOT invent a guessable "
             "word like 'password' or 'easy_peasy'."
         )
-    if schema is _SCHEMA_RULES:
+    if schema is _SCHEMA_RULES or schema is _SCHEMA_RULES_RECOVER:
         parts.append(
-            "BUILD TARGET — both C programs are compiled and run on: "
+            "BUILD TARGET — the C programs are compiled and run on: "
             f"{target_platform or _default_platform()} "
             "They MUST compile and run there, so do not call APIs that platform lacks."
         )
-    genre_key = "reverse" if schema is _SCHEMA_RULES else "log"
+    if schema is _SCHEMA_RULES_RECOVER:
+        genre_key = "recover"
+    elif schema is _SCHEMA_RULES:
+        genre_key = "reverse"
+    else:
+        genre_key = "log"
     rubric = _DIFFICULTY_RUBRIC[genre_key].get(difficulty.lower())
     parts.append(f"Target difficulty: {difficulty}." + (f" At this level, {rubric}" if rubric else ""))
     if category:
@@ -560,6 +651,8 @@ def _write_challenge_files(base_dir: Path, data: dict[str, Any]) -> None:
         (base_dir / "src" / "challenge.c").write_text(data["challenge_code"], encoding="utf-8")
     if "encoder_code" in data:  # organizer-only tool
         (private_dir / "encoder.c").write_text(data["encoder_code"], encoding="utf-8")
+    if "solver_code" in data:  # organizer-only reference solver (recover genre)
+        (private_dir / "solver.py").write_text(data["solver_code"], encoding="utf-8")
     if "generator_code" in data:
         (private_dir / "generator.py").write_text(data["generator_code"], encoding="utf-8")
     for stale in private_dir.glob("extractor_*.py"):  # drop extractors of removed tasks
@@ -578,7 +671,7 @@ def _write_challenge_files(base_dir: Path, data: dict[str, Any]) -> None:
         "challenge_kind": data.get("challenge_kind", "decode"),
         "target": data.get("target", DEFAULT_TARGET),
     }
-    if data.get("challenge_kind") == "check":
+    if data.get("challenge_kind") in ("check", "recover"):
         meta["success_marker"] = data.get("success_marker", "Access Granted")
     if data.get("challenge_kind") == "log":
         kept = data.get("tasks", [])
@@ -646,6 +739,20 @@ def _normalize_challenge(
         data["flag"] = f"{len(tasks)} task(s)"
         return data
 
+    if genre == "recover":
+        data.setdefault("category", category or "Reverse Engineering")
+        data.setdefault("description", "Recover the flag by analysing the binary (do not just run it).")
+        data["challenge_kind"] = "recover"
+        data.setdefault("success_marker", "Access Granted")
+        data.setdefault("solution", "See organizer/solver.py for how the flag is recovered.")
+        for k in ("encoder_code", "challenge_code"):
+            if k in data:
+                data[k] = _strip_code_fences(str(data[k]))
+        if "solver_code" in data:
+            data["solver_code"] = _strip_code_fences(str(data["solver_code"]))
+        data["flag"] = _normalize_flag(str(data.get("flag", "")))
+        return data
+
     # reverse / crypto (C encoder pipeline)
     data.setdefault("category", category or "Reverse Engineering")
     data.setdefault("description", "Reverse the binary and recover the flag.")
@@ -675,7 +782,18 @@ def _render_readme(data: dict[str, Any]) -> str:
             "## Questions\n\n"
             f"{qs}\n"
         )
-    if data.get("challenge_kind") == "check":
+    if data.get("challenge_kind") == "recover":
+        goal = (
+            "## Goal\n\n"
+            "Recover the flag `sloth{...}` by ANALYSING the binary — static analysis, a "
+            "disassembler, extracting and inverting the embedded data. Simply running it "
+            "does **not** reveal the flag.\n\n"
+            "## Run (won't hand you the flag)\n\n"
+            "```\n"
+            "./bin/challenge\n"
+            "```\n"
+        )
+    elif data.get("challenge_kind") == "check":
         goal = (
             "## Goal\n\n"
             "Reverse the binary to find the secret input it accepts. Run it, type a "
@@ -728,6 +846,31 @@ def _render_solution(data: dict[str, Any]) -> str:
                 f"```python\n{t.get('extractor_code','')}\n```\n"
             )
         return "\n".join(parts)
+    if data.get("challenge_kind") == "recover":
+        return (
+            f"# Solution — {data['title']}\n\n"
+            f"**Flag:** `{data['flag']}`\n\n"
+            "This is a RECOVER challenge: running the binary does not reveal the flag. "
+            "It was verified automatically — the obfuscated bytes are embedded in the "
+            "binary, a plain run does not print the flag (UTF-8 or UTF-16LE strings do "
+            "not leak it either), and the reference solver below recovers the flag from "
+            "the distributed artifact alone, in an isolated workspace with no access to "
+            "this file or the sources. The same solver also recovered an independent, "
+            "harness-chosen second flag from a freshly built binary, proving it is not "
+            "hardcoded.\n\n"
+            "## Recover the flag (organizer reference solver)\n\n"
+            "```\n"
+            "python organizer/solver.py bin/challenge      # .exe on Windows\n"
+            "```\n\n"
+            "## How the flag was hidden (`organizer/encoder.c`)\n\n"
+            "```c\n"
+            f"{data.get('encoder_code', '')}\n"
+            "```\n\n"
+            "## Reference solver (`organizer/solver.py`)\n\n"
+            "```python\n"
+            f"{data.get('solver_code', '')}\n"
+            "```\n"
+        )
     if data.get("challenge_kind") == "check":
         recover = (
             f"**Secret input:** `{data['flag']}`\n\n"
@@ -971,6 +1114,284 @@ def _roundtrip_check(base_dir: Path, template: str, backend: "ExecutionBackend",
         rt_src.unlink(missing_ok=True)
         for ext in ("", ".exe"):
             (base_dir / "bin" / f"_roundtrip{ext}").unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------- #
+# recover genre — recover-by-analysis verification
+# --------------------------------------------------------------------------- #
+def _marker_matches(output: str, marker: str) -> bool:
+    """True only if `marker` is the whole (stripped) output or an EXACT line of it.
+    A substring match is not enough — e.g. marker 'Correct' must not be considered
+    present just because the program printed 'Incorrect'."""
+    if not marker:
+        return False
+    if output.strip() == marker:
+        return True
+    return any(line.strip() == marker for line in output.splitlines())
+
+
+def _recover_execution_problem(good: "ExecResult", bad: "ExecResult", marker: str,
+                               expected: str) -> tuple[str, str] | None:
+    """Shared functional contract for a recover binary, used at generation AND
+    validation. Returns (stage, message) on a problem, or None if the program is a
+    well-behaved validator that hides the flag.
+
+    recover v1 requires BOTH runs to exit 0 (exit code 0 on the correct flag and on
+    a wrong input); the ONLY difference must be the success marker. A crash, an
+    unexpected exit code, a timeout, or TRUNCATED output is a failure — truncated
+    output cannot be trusted to prove the flag is absent."""
+    if good.timed_out or bad.timed_out:
+        return ("challenge-timeout", "the challenge did not finish within the time limit.")
+    if good.truncated or bad.truncated:
+        return ("output-truncated",
+                "the challenge produced too much output and it was truncated, so flag-absence "
+                "cannot be verified reliably — keep the program's output small.")
+    if not good.ok:
+        return ("challenge-crash",
+                f"the challenge did not exit 0 on the correct flag (exit {good.exit_code}): "
+                f"{good.stderr[:160]}")
+    if not bad.ok:
+        return ("challenge-bad-exit",
+                f"on a wrong input the challenge exited {bad.exit_code}, not 0. For recover v1 "
+                "both correct and wrong input must exit 0; the only difference is the marker.")
+    if not _marker_matches(good.stdout, marker):
+        return ("recover-rejects-correct",
+                f"feeding the correct flag did not print the marker {marker!r} on its own line "
+                f"(got {good.stdout.strip()[:120]!r}); the validator must accept the flag.")
+    if _marker_matches(bad.stdout, marker):
+        return ("recover-accepts-wrong",
+                "a wrong input also printed the success marker; the validator must only accept the "
+                "exact flag (it must not ignore its input or always accept).")
+    inner = expected[6:-1] if expected.startswith("sloth{") and expected.endswith("}") else ""
+    for label, r in (("valid", good), ("wrong", bad)):
+        combined = (r.stdout or "") + "\n" + (r.stderr or "")
+        if expected in combined or (inner and inner in combined):
+            return ("too-trivial",
+                    f"running the binary on {label} input reveals the flag — recover challenges must "
+                    "hide it; the flag is obtained by analysis, not by running the program.")
+    return None
+
+
+def _tokens_to_bytes(body: str) -> bytes:
+    """Turn the encoder's '0x31, 0x2e, ...' output into raw bytes."""
+    out = bytearray()
+    for tok in re.findall(r"0x[0-9a-fA-F]{1,2}", body or ""):
+        out.append(int(tok, 16) & 0xFF)
+    return bytes(out)
+
+
+def _flag_leaks_recover(binary_path: Path, flag: str) -> bool:
+    """Like _flag_leaks_in_binary but also checks UTF-16LE (wide) strings, which
+    matter for PE. Fail closed on read errors (raises OSError)."""
+    blob = binary_path.read_bytes()
+    needles = {flag}
+    m = re.match(r"sloth\{(.*)\}$", flag)
+    if m and m.group(1):
+        needles.add(m.group(1))
+    for n in needles:
+        if len(n) < 4:
+            continue
+        if n.encode("utf-8") in blob or n.encode("utf-16-le") in blob:
+            return True
+    return False
+
+
+def _run_solver_isolated(solver_code: str, artifact_host: Path, solver_backend: "ExecutionBackend",
+                         ) -> tuple[bool, str, str]:
+    """Run the reference solver against ONE artifact in a throwaway workspace that
+    contains ONLY the solver script and the binary (as read-only data, exec bit
+    stripped). The solver never sees challenge.json, the sources, the encoder or
+    the expected flag — it must recover the flag from the bytes it is given.
+
+    Returns (ok, recovered_stdout, detail). `ok` is False on an infra/run failure.
+    The solver always runs on a Python-capable backend (Linux/native); a PE under
+    test is inert here (the Linux image has no Wine), reinforcing no-execution."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp)
+        (ws / "solver.py").write_text(solver_code, encoding="utf-8")
+        try:
+            if hasattr(solver_backend, "run_solver"):
+                # Hardened path (Docker): solver workspace + artifact mounted
+                # read-only, only /tmp (noexec) writable — the solver cannot execute
+                # the binary, only read its bytes.
+                res = solver_backend.run_solver(ws, "solver.py", artifact_host)
+            else:
+                # Fallback (native, dev only): copy the artifact in read-only, no
+                # execute bit; best-effort isolation without a container.
+                artifact_rel = "artifact.bin"
+                dst = ws / artifact_rel
+                dst.write_bytes(artifact_host.read_bytes())
+                try:
+                    os.chmod(dst, 0o444)
+                except OSError:
+                    pass
+                res = solver_backend.run_python(ws, "solver.py", [artifact_rel])
+        except Exception as exc:  # backend/infra failure, not a solver verdict
+            return False, "", f"solver backend error: {type(exc).__name__}: {exc}"
+        if res.timed_out:
+            return False, "", "solver timed out"
+        if res.truncated:
+            return False, "", "solver output was truncated (unreliable); keep it to just the flag"
+        if not res.ok:
+            return False, (res.stdout or ""), f"solver exited non-zero: {res.stderr[:200]}"
+        return True, (res.stdout or ""), ""
+
+
+def _verify_recover_challenge(base_dir: Path, data: dict[str, Any], backend: "ExecutionBackend",
+                              target: "Target", *, solver_backend: "ExecutionBackend | None" = None
+                              ) -> AttemptResult:
+    """Verify a `recover` challenge: the binary hides the flag, running it does not
+    reveal it, and a reference Python solver recovers it from the artifact bytes
+    alone — for the real flag AND for a second, harness-chosen flag built from the
+    same template (proving the solver is not hardcoded and a recovery path exists).
+
+    The challenge is built/run on `backend` (the target's backend); the solver runs
+    on `solver_backend` (a Python-capable Linux/native backend), in an isolated
+    workspace. The original challenge in base_dir is never mutated by the swap."""
+    solver_backend = solver_backend or backend
+    expected = data["flag"]
+    template = str(data.get("challenge_code", ""))   # pre-injection, for the swap
+    solver_code = str(data.get("solver_code", ""))
+    if not solver_code.strip():
+        return AttemptResult(0, False, "no-solver", "recover challenge needs a solver_code.")
+    src_dir = base_dir / "src"
+    bin_dir = base_dir / "bin"
+    org_dir = base_dir / "organizer"
+    for d in (src_dir, bin_dir, org_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    encoder_rel = f"bin/{target.artifact('encoder')}"
+    challenge_rel = f"bin/{target.artifact('challenge')}"
+
+    # 1. Encoder compiles and runs on the flag -> the exact embedded bytes.
+    (org_dir / "encoder.c").write_text(data.get("encoder_code", ""), encoding="utf-8")
+    res = backend.compile_c(base_dir, "organizer/encoder.c", encoder_rel, target)
+    if not res.ok:
+        return AttemptResult(0, False, "encoder-compile",
+                             "encoder.c failed to compile:\n" + "\n".join(res.stderr.splitlines()[:20]))
+    enc = backend.run_binary(base_dir, encoder_rel, target, args=[expected])
+    if enc.timed_out or not enc.ok:
+        return AttemptResult(0, False, "encoder-crash", f"encoder did not run: {enc.stderr[:200]}")
+    body = _parse_encoder_output(enc.stdout)
+    if not body:
+        return AttemptResult(0, False, "encoder-output",
+                             "encoder must print the bytes as comma-separated 0xNN tokens only.")
+
+    # 2. Inject the bytes and compile the challenge.
+    challenge_code = data.get("challenge_code", "")
+    if ENCODED_PLACEHOLDER not in challenge_code:
+        return AttemptResult(0, False, "missing-placeholder",
+                             f"challenge_code must contain the token {ENCODED_PLACEHOLDER}.")
+    injected = challenge_code.replace(ENCODED_PLACEHOLDER, body)
+    data["challenge_code"] = injected
+    (src_dir / "challenge.c").write_text(injected, encoding="utf-8")
+    res = backend.compile_c(base_dir, "src/challenge.c", challenge_rel, target)
+    if not res.ok:
+        return AttemptResult(0, False, "challenge-compile",
+                             "challenge.c failed to compile:\n" + "\n".join(res.stderr.splitlines()[:20]))
+    challenge_bin = base_dir / challenge_rel
+
+    # 3. No plaintext leak (UTF-8 AND UTF-16LE); fail closed if unreadable.
+    try:
+        if _flag_leaks_recover(challenge_bin, expected):
+            return AttemptResult(0, False, "flag-leak",
+                                 "the plaintext flag is readable in the binary (UTF-8 or UTF-16LE); "
+                                 "only the obfuscated bytes may be embedded.")
+    except OSError as exc:
+        return AttemptResult(0, False, "leak-check-failed", f"could not read the binary: {exc}")
+
+    # 4. The obfuscated bytes the solver needs must really be embedded in the binary.
+    want = _tokens_to_bytes(body)
+    if len(want) >= 4 and want not in challenge_bin.read_bytes():
+        return AttemptResult(0, False, "data-missing",
+                             "the encoded byte array is not present contiguously in the compiled "
+                             "binary, so the solver has nothing to recover — ensure challenge_code "
+                             "embeds and uses the array (do not let the compiler drop it).")
+
+    # 5. The distributed program must actually WORK: it accepts the correct flag
+    #    (prints the marker) and rejects wrong input (does not), and never reveals
+    #    the flag. A crash/timeout, an always-accept or an always-reject program is
+    #    a failure — not a pass. (So we never bless a challenge just because the
+    #    solver works while the binary is unusable.)
+    marker = str(data.get("success_marker", "")).strip()
+    if not marker:
+        return AttemptResult(0, False, "no-marker",
+                             "a recover challenge needs a non-empty success_marker.")
+    if marker in expected or expected in marker:
+        return AttemptResult(0, False, "bad-marker", "success_marker must not contain the flag.")
+    good = backend.run_binary(base_dir, challenge_rel, target, stdin_text=expected + "\n")
+    bad = backend.run_binary(base_dir, challenge_rel, target,
+                             stdin_text="definitely_wrong_" + expected + "\n")
+    prob = _recover_execution_problem(good, bad, marker, expected)
+    if prob is not None:
+        return AttemptResult(0, False, prob[0], prob[1])
+
+    # 6. The reference solver recovers the real flag from the artifact alone.
+    ok, out, detail = _run_solver_isolated(solver_code, challenge_bin, solver_backend)
+    if not ok:
+        return AttemptResult(0, False, "solver-error", detail)
+    if out.strip() != expected:
+        return AttemptResult(0, False, "solver-mismatch",
+                             f"the reference solver recovered {out.strip()[:80]!r} but the flag is "
+                             f"{expected!r}. Its inverse must match the encoder's transform.")
+
+    # 7. Independence / anti-hardcode: a SECOND flag chosen by the harness (never the
+    #    model), built from the SAME template in a throwaway workspace, must be
+    #    recovered by the SAME unmodified solver — and the two binaries must differ.
+    swap = _recover_flag_swap(base_dir, template, data.get("encoder_code", ""), solver_code,
+                              backend, target, solver_backend, original_bin=challenge_bin,
+                              original_flag=expected)
+    if swap is not None:
+        return swap
+
+    return AttemptResult(0, True, "passed", f"recover verified: solver recovers {expected} "
+                         "(and an independent second flag) from the artifact alone")
+
+
+def _recover_flag_swap(base_dir: Path, template: str, encoder_code: str, solver_code: str,
+                       backend: "ExecutionBackend", target: "Target",
+                       solver_backend: "ExecutionBackend", original_bin: Path,
+                       original_flag: str) -> AttemptResult | None:
+    """Build the SAME challenge template with a fresh harness-chosen flag in a
+    separate temp workspace, confirm the artifact really differs, and require the
+    SAME solver to recover the new flag. Returns a failure AttemptResult or None.
+    The original challenge directory is not modified."""
+    import tempfile
+    flag2 = _distinct_random_flag(original_flag)  # guaranteed != the original flag
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp)
+        (ws / "organizer").mkdir(parents=True, exist_ok=True)
+        (ws / "src").mkdir(parents=True, exist_ok=True)
+        (ws / "bin").mkdir(parents=True, exist_ok=True)
+        enc_rel = f"bin/{target.artifact('encoder')}"
+        ch_rel = f"bin/{target.artifact('challenge')}"
+        (ws / "organizer" / "encoder.c").write_text(encoder_code, encoding="utf-8")
+        c = backend.compile_c(ws, "organizer/encoder.c", enc_rel, target)
+        if not c.ok:
+            return AttemptResult(0, False, "swap-encoder", "encoder did not compile for the swap flag.")
+        e = backend.run_binary(ws, enc_rel, target, args=[flag2])
+        body2 = _parse_encoder_output(e.stdout) if (e.ok and not e.timed_out) else None
+        if not body2:
+            return AttemptResult(0, False, "swap-encoder", "encoder produced no bytes for the swap flag.")
+        (ws / "src" / "challenge.c").write_text(template.replace(ENCODED_PLACEHOLDER, body2), encoding="utf-8")
+        c = backend.compile_c(ws, "src/challenge.c", ch_rel, target)
+        if not c.ok:
+            return AttemptResult(0, False, "swap-compile", "challenge did not compile for the swap flag.")
+        new_bin = ws / ch_rel
+        # The artifacts MUST differ, or the flag was not really embedded distinctly.
+        if new_bin.read_bytes() == original_bin.read_bytes():
+            return AttemptResult(0, False, "swap-identical",
+                                 "the binary is identical for a different flag — the flag is not "
+                                 "actually embedded in the artifact, so it cannot be recovered from it.")
+        ok, out, detail = _run_solver_isolated(solver_code, new_bin, solver_backend)
+        if not ok:
+            return AttemptResult(0, False, "swap-solver-error", detail)
+        if out.strip() != flag2:
+            return AttemptResult(0, False, "solver-hardcoded",
+                                 f"on a different binary the SAME solver recovered {out.strip()[:80]!r}, "
+                                 f"not the new flag {flag2!r} — it is hardcoding the flag or ignoring "
+                                 "the artifact, not actually recovering it.")
+    return None
 
 
 _COMMON_SECRETS = [
@@ -1256,15 +1677,27 @@ def generate_challenge(
             "LOG TO TURN INTO A CHALLENGE (1-based line numbers):\n" + numbered
     elif genre == "log":
         schema, required, verify_fn = _SCHEMA_RULES_LOG, ("generator_code", "tasks"), _verify_log_challenge
+    elif genre == "recover":
+        schema, required = _SCHEMA_RULES_RECOVER, ("encoder_code", "challenge_code", "solver_code")
+        # The solver is Python and analyses the artifact statically, so it always
+        # runs on a Python-capable Linux/native backend — never the Wine backend,
+        # which has no Python. For a PE target we resolve the isolated ELF backend
+        # purely to run the solver; the PE itself is built/run on `backend`.
+        if backend.name == "docker-wincompat":
+            solver_backend = resolve_backend("elf", "isolated", image=DEFAULT_IMAGE)
+        else:
+            solver_backend = backend
+        verify_fn = lambda b, d, bk, tg: _verify_recover_challenge(  # noqa: E731
+            b, d, bk, tg, solver_backend=solver_backend)
     else:
         schema, required = _SCHEMA_RULES, ("encoder_code", "challenge_code")
         verify_fn = lambda b, d, bk, tg: _verify_challenge(  # noqa: E731
             b, d, bk, tg, roundtrip=roundtrip, adversary=adversary, adversary_budget=adversary_budget)
 
     ask = caller or (lambda p, m: _call_ollama(p, m, base_url=ollama_url, temperature=temperature))
-    # Reverse challenges get a random default flag (used only if the prompt does
-    # not specify one), so unspecified secrets aren't guessable model clichés.
-    default_flag = _random_flag() if genre == "reverse" else None
+    # Reverse / recover challenges get a random default flag (used only if the
+    # prompt does not specify one), so unspecified secrets aren't guessable clichés.
+    default_flag = _random_flag() if genre in ("reverse", "recover") else None
 
     report = GenerationReport(name=name, model=model, directory=str(base_dir), success=False)
     feedback: str | None = None
