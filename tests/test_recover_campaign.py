@@ -76,10 +76,15 @@ class SpecsAndResumeTests(unittest.TestCase):
 class ClassifyTests(unittest.TestCase):
     def test_categories(self):
         self.assertEqual(camp.classify({"success": True}), "ok")
-        self.assertEqual(camp.classify({"success": False, "exception": "RuntimeError"}), "infra")
-        self.assertEqual(camp.classify({"success": False, "fail_stage": "model-error"}), "infra")
-        self.assertEqual(camp.classify({"success": False, "fail_stage": "challenge-timeout"}), "infra")
-        self.assertEqual(camp.classify({"success": False, "fail_stage": "solver-hardcoded"}), "model-reject")
+        # genuine infra = a caught backend exception
+        self.assertEqual(camp.classify({"success": False, "exception": "SandboxUnavailable"}), "infra")
+        # ambiguous causes are 'undetermined', NOT auto-infra
+        for stg in ("solver-error", "swap-solver-error", "challenge-timeout", "model-error"):
+            self.assertEqual(camp.classify({"success": False, "fail_stage": stg}), "undetermined", stg)
+        # concrete content failures are attributable -> verification-failure
+        for stg in ("solver-hardcoded", "solver-mismatch", "challenge-compile",
+                    "recover-accepts-wrong", "too-trivial", "bad-schema"):
+            self.assertEqual(camp.classify({"success": False, "fail_stage": stg}), "verification-failure", stg)
 
 
 class HeuristicTests(unittest.TestCase):
@@ -132,7 +137,7 @@ class AggregateAnonymizeTests(unittest.TestCase):
              "flag": "sloth{b}", "quality": {"family_signature": "sbox_table+xor",
                                              "strings_shortcut": False, "naive_attacker_shortcut": False}},
             {"run_id": "elf-hard#rep1", "scenario": "elf-hard", "target": "elf", "difficulty": "hard",
-             "rep": 1, "success": False, "category": "model-reject", "fail_stage": "solver-mismatch",
+             "rep": 1, "success": False, "category": "verification-failure", "fail_stage": "solver-mismatch",
              "attempts_used": 2, "total_time_s": 9},
         ]
 
@@ -200,7 +205,9 @@ class ReplayAndFailureTests(unittest.TestCase):
     """These touch the driver but the replayed caller raises BEFORE any backend is
     used, so no Docker is needed."""
 
-    def test_model_error_is_infra_category(self):
+    def test_model_error_is_undetermined_not_infra(self):
+        # a failed model call (GenerationError) is ambiguous — could be the provider
+        # down OR unparseable output — so it is 'undetermined', never auto-'infra'.
         with TemporaryDirectory() as tmp:
             jsonl = Path(tmp) / "raw.jsonl"
             factory = camp.replay_caller_factory(
@@ -210,7 +217,7 @@ class ReplayAndFailureTests(unittest.TestCase):
             self.assertEqual(len(recs), 1)
             self.assertFalse(recs[0]["success"])
             self.assertEqual(recs[0]["fail_stage"], "model-error")
-            self.assertEqual(recs[0]["category"], "infra")
+            self.assertEqual(recs[0]["category"], "undetermined")
 
     def test_infra_exception_recorded(self):
         with TemporaryDirectory() as tmp:
@@ -240,6 +247,34 @@ class ReplayAndFailureTests(unittest.TestCase):
                          + '{"run_id": "b#rep1", "succ', encoding="utf-8")  # torn last line
             recs = camp._read_records(p)
             self.assertEqual([r["run_id"] for r in recs], ["a#rep1"])  # valid record kept
+
+    def test_repair_drops_torn_tail_and_ends_clean(self):
+        with TemporaryDirectory() as tmp:
+            p = Path(tmp) / "raw.jsonl"
+            p.write_text(json.dumps({"run_id": "a#rep1"}) + "\n"
+                         + json.dumps({"run_id": "b#rep1"}) + "\n"
+                         + '{"run_id": "c#re', encoding="utf-8")  # torn fragment, no newline
+            kept = camp.repair_jsonl(p)
+            self.assertEqual(kept, 2)
+            text = p.read_text(encoding="utf-8")
+            self.assertTrue(text.endswith("\n"))          # clean to append to
+            self.assertNotIn("c#re", text)                # torn fragment gone
+            self.assertEqual([r["run_id"] for r in camp._read_records(p)], ["a#rep1", "b#rep1"])
+
+    def test_crash_safe_resume_end_to_end(self):
+        # A valid record + a truncated final line, then resume: both complete records
+        # readable afterwards, the missing run is executed once, no duplicate run_id.
+        with TemporaryDirectory() as tmp:
+            jsonl = Path(tmp) / "raw.jsonl"
+            jsonl.write_text(json.dumps({"run_id": "elf-easy#rep1", "success": True}) + "\n"
+                             + '{"run_id": "elf-easy#rep2", "succ', encoding="utf-8")  # torn tail
+            factory = camp.replay_caller_factory({"*": [{"__raise__": "GenerationError", "msg": "x"}]})
+            recs = camp.run_campaign(_one_scenario_campaign(reps=2), tmp, jsonl,
+                                     caller_factory=factory, log=lambda *a: None)
+            self.assertEqual([r["run_id"] for r in recs], ["elf-easy#rep2"])  # only the missing run
+            ids = [r["run_id"] for r in camp._read_records(jsonl)]
+            self.assertEqual(ids, ["elf-easy#rep1", "elf-easy#rep2"])  # both complete, readable
+            self.assertEqual(len(ids), len(set(ids)))                  # no duplicates
 
     def test_resume_skips_completed(self):
         with TemporaryDirectory() as tmp:

@@ -51,9 +51,10 @@ from slothctf.generator import (  # noqa: E402
 
 TOOL_VERSION = "1.0"
 
-# Stages that mean "infrastructure, not the model's content" (vs the model
-# producing something that failed a functional/solver check).
-_INFRA_STAGES = {"model-error", "solver-error", "swap-solver-error", "challenge-timeout"}
+# Failure stages whose cause CANNOT be attributed with certainty: the solver/swap
+# erroring, a timeout, or the model call failing may be the generated code's fault
+# OR the infrastructure's. They are classified 'undetermined', never auto-'infra'.
+_UNDETERMINED_STAGES = {"solver-error", "swap-solver-error", "challenge-timeout", "model-error"}
 
 
 # --------------------------------------------------------------------------- #
@@ -195,6 +196,37 @@ def completed_run_ids(jsonl_path: str | Path) -> set[str]:
     return done
 
 
+def repair_jsonl(jsonl_path: str | Path) -> int:
+    """Make the dataset safe to append to after a crash: drop a torn trailing
+    fragment (an incomplete final line, or any trailing bytes not terminated by a
+    newline) so the next append starts on a clean line, WITHOUT losing any complete
+    record. Returns the number of valid records kept. Rewrites only if a repair is
+    needed, via a temp file + atomic replace so the repair itself is crash-safe."""
+    p = Path(jsonl_path)
+    if not p.exists():
+        return 0
+    raw = p.read_text(encoding="utf-8")
+    kept: list[str] = []
+    torn = False
+    for line in raw.split("\n"):
+        if line == "":
+            continue
+        try:
+            json.loads(line)
+            kept.append(line)
+        except Exception:
+            torn = True  # a damaged fragment (only ever the trailing one in practice)
+    # Repair if anything was damaged, or the file did not end on a clean newline.
+    if torn or (raw and not raw.endswith("\n")):
+        tmp = p.with_suffix(p.suffix + ".repair")
+        tmp.write_text(("".join(l + "\n" for l in kept)), encoding="utf-8")
+        with tmp.open("r+", encoding="utf-8") as fh:
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, p)
+    return len(kept)
+
+
 def append_record(jsonl_path: str | Path, record: dict) -> None:
     p = Path(jsonl_path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -205,12 +237,24 @@ def append_record(jsonl_path: str | Path, record: dict) -> None:
 
 
 def classify(record: dict) -> str:
+    """Attribute a failure's cause conservatively:
+    - 'ok'                  : success
+    - 'infra'               : a genuine infrastructure error we caught (a backend
+                              exception: SandboxUnavailable, Docker, etc.)
+    - 'undetermined'        : cause not attributable with certainty (solver/swap
+                              error, timeout, failed model call — could be the
+                              generated code OR the environment)
+    - 'verification-failure': the generated challenge failed a concrete check
+                              (compile, schema, functional, leak, solver mismatch,
+                              hardcoded solver, ...) — attributable to the content."""
     if record.get("success"):
         return "ok"
     if record.get("exception"):
         return "infra"
     stage = record.get("fail_stage") or ""
-    return "infra" if stage in _INFRA_STAGES else "model-reject"
+    if stage in _UNDETERMINED_STAGES:
+        return "undetermined"
+    return "verification-failure"
 
 
 # --------------------------------------------------------------------------- #
@@ -373,6 +417,7 @@ def run_campaign(campaign: dict, out_dir: str | Path, jsonl_path: str | Path, *,
     prov = provenance(model, ollama_url, online)
     fp = campaign_fingerprint(campaign, prov)
 
+    repair_jsonl(jsonl_path)  # crash-safe: drop a torn trailing line before appending
     existing_fp = _existing_fingerprint(jsonl_path)
     if existing_fp is not None and existing_fp != fp:
         raise RuntimeError(

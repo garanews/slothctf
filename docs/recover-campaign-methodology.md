@@ -26,8 +26,10 @@ verifiers and backends **unchanged**.
 - The dataset is an **append-only JSONL**; the runner is **resumable** (it skips
   run_ids already present), so an interrupted campaign neither duplicates nor loses
   results. Records are written only after a run completes; an interruption mid-run
-  simply re-runs that one on resume. A torn final line (from a hard kill) is
-  tolerated on read without losing earlier valid records.
+  simply re-runs that one on resume. Before resuming, the runner **repairs** the
+  dataset: a torn trailing fragment (an incomplete final line from a hard kill) is
+  dropped via a temp-file + atomic replace, so the next append starts on a clean
+  line and no complete record is lost.
 - Each record carries a **campaign fingerprint** (a hash of scenarios + prompts +
   model + reps + max_attempts + inference params + tool version + git commit). On
   resume, if the current fingerprint does not match the dataset's, the runner
@@ -39,12 +41,21 @@ verifiers and backends **unchanged**.
 
 ## What is recorded per run
 
-Final outcome and (on failure) the stage; number of attempts and total time; the
-per-attempt stages; and a category that distinguishes **infrastructure** problems
-(Ollama unreachable, Docker/solver backend errors, timeouts) from **model
-rejects** (the model produced content that failed a functional/solver check) and
-**ok**. Functional-check and solver/flag-swap outcomes are encoded in the stages
-(e.g. `recover-rejects-correct`, `solver-mismatch`, `solver-hardcoded`).
+Final outcome and (on failure) the original stage; number of attempts and total
+time; the per-attempt stages; and a **cause category** assigned conservatively:
+
+- **ok** — success.
+- **infra** — a genuine infrastructure error we caught (a backend exception such as
+  `SandboxUnavailable` or a Docker error).
+- **undetermined** — the cause cannot be attributed with certainty: `solver-error`,
+  `swap-solver-error`, `challenge-timeout`, or a failed model call (`model-error`).
+  These may be the generated code's fault OR the environment's, so they are **not**
+  counted as infrastructure.
+- **verification-failure** — the generated challenge failed a concrete check
+  (compile, schema, functional accept/reject, leak, `solver-mismatch`,
+  `solver-hardcoded`, `too-trivial`, ...), attributable to the content.
+
+The original stage is always preserved alongside the category.
 
 ## Heuristic quality measures (labelled as heuristics)
 
