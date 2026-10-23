@@ -23,12 +23,19 @@ from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 from slothctf import catalog
+from slothctf.execution import (
+    NativeBackend,
+    docker_available,
+    image_available,
+    resolve_backend,
+)
 from slothctf.generator import (
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MODEL,
     DEFAULT_OLLAMA_URL,
     generate_challenge,
 )
+from slothctf.targets import DEFAULT_TARGET
 from slothctf.validator import validate_challenge
 
 GENERATED = Path("generated")
@@ -57,6 +64,11 @@ def _build_generate_kwargs(payload: dict) -> dict:
         max_attempts = max(1, int(payload.get("max_attempts") or DEFAULT_MAX_ATTEMPTS))
     except (TypeError, ValueError):
         max_attempts = DEFAULT_MAX_ATTEMPTS
+    target = "pe" if str(payload.get("target")) == "pe" else "elf"
+    unsafe = bool(payload.get("unsafe_native"))
+    # Resolve the backend up front so an unavailable combination surfaces as a clean
+    # job error (no silent fallback). Isolated by default; native only on opt-in.
+    backend = resolve_backend(target, "unsafe-native" if unsafe else "isolated", allow_native=unsafe)
     kwargs = {
         "name": name,
         "prompt": str(payload.get("prompt") or "").strip(),
@@ -68,6 +80,8 @@ def _build_generate_kwargs(payload: dict) -> dict:
         "surprise": bool(payload.get("surprise")),
         "roundtrip": bool(payload.get("roundtrip")) and genre == "reverse",
         "adversary": bool(payload.get("adversary")) and genre == "reverse",
+        "target": target,
+        "backend": backend,
     }
     if payload.get("category"):
         kwargs["challenge_type"] = str(payload["category"]).strip()
@@ -264,6 +278,7 @@ _PAGE = r"""<!doctype html>
   <div class="row">
     <label>Name<input id="f_name" placeholder="my_challenge"></label>
     <label>Genre<select id="f_genre"></select></label>
+    <label>Target<select id="f_target"></select></label>
     <label>Difficulty<select id="f_difficulty"></select></label>
     <label>Category (optional)<input id="f_category" placeholder="e.g. cryptography"></label>
     <label>Max attempts<input id="f_attempts" type="number" min="1" value="5" style="min-width:90px"></label>
@@ -277,11 +292,13 @@ _PAGE = r"""<!doctype html>
     <label style="flex-direction:row; align-items:center; gap:6px; align-self:flex-end"><input type="checkbox" id="f_surprise"> surprise me</label>
     <label id="f_rt_wrap" style="flex-direction:row; align-items:center; gap:6px; align-self:flex-end"><input type="checkbox" id="f_roundtrip"> round-trip gate</label>
     <label id="f_adv_wrap" style="flex-direction:row; align-items:center; gap:6px; align-self:flex-end" title="reject medium/hard 'check' challenges a baseline attacker can crack"><input type="checkbox" id="f_adversary"> adversary gate</label>
+    <label style="flex-direction:row; align-items:center; gap:6px; align-self:flex-end" title="run the model's code on the host with NO isolation (development only)"><input type="checkbox" id="f_unsafe"> unsafe native (no sandbox)</label>
   </div>
   <div class="row" style="align-items:center">
     <button class="btn primary" id="genBtn" onclick="submitGen()">Generate</button>
     <button class="btn" onclick="toggleNew()">Cancel</button>
     <span class="genstatus" id="genstatus"></span>
+    <span id="sandboxnote" class="meta"></span>
   </div>
 </div>
 
@@ -325,20 +342,27 @@ const F = id => document.getElementById(id);
 async function loadConfig(){
   const c = await (await fetch('/api/config')).json();
   for (const g of c.genres){ const o=document.createElement('option'); o.value=o.textContent=g; F('f_genre').appendChild(o); }
+  for (const t of (c.targets||['elf'])){ const o=document.createElement('option'); o.value=o.textContent=t; F('f_target').appendChild(o); }
+  F('f_target').value = c.default_target || 'elf';
   for (const d of c.difficulties){ const o=document.createElement('option'); o.value=o.textContent=d; F('f_difficulty').appendChild(o); }
   F('f_difficulty').value='easy';
   F('f_model').value=c.model; F('f_url').value=c.ollama_url; F('f_attempts').value=c.max_attempts;
   F('f_genre').addEventListener('change', ()=>{ const rev = F('f_genre').value==='reverse';
     F('f_rt_wrap').style.display = rev?'flex':'none'; F('f_adv_wrap').style.display = rev?'flex':'none'; });
+  // Sandbox readiness note: isolated ELF needs Docker + the built image.
+  const note = c.docker ? (c.sandbox_image ? 'Docker sandbox ready (isolated ELF).'
+      : 'Docker is up but the sandbox image is missing — run: python main.py sandbox-build')
+      : 'Docker not detected: isolated runs are unavailable. Tick "unsafe native" to build on the host (PE on Windows), or start Docker for ELF.';
+  F('sandboxnote').textContent = note;
 }
 function toggleNew(){ F('newpanel').classList.toggle('open'); }
 async function submitGen(){
   const body = {
     name:F('f_name').value, genre:F('f_genre').value, difficulty:F('f_difficulty').value,
-    category:F('f_category').value, prompt:F('f_prompt').value, model:F('f_model').value,
-    ollama_url:F('f_url').value, max_attempts:F('f_attempts').value,
+    target:F('f_target').value, category:F('f_category').value, prompt:F('f_prompt').value,
+    model:F('f_model').value, ollama_url:F('f_url').value, max_attempts:F('f_attempts').value,
     surprise:F('f_surprise').checked, roundtrip:F('f_roundtrip').checked,
-    adversary:F('f_adversary').checked,
+    adversary:F('f_adversary').checked, unsafe_native:F('f_unsafe').checked,
   };
   if(!body.name.trim()){ F('genstatus').textContent='Please enter a name.'; return; }
   F('genBtn').disabled=true; F('genstatus').textContent='Starting…';
@@ -367,7 +391,8 @@ async function loadFacetsRefresh(){ // rebuild filter options then refresh grid
 }
 async function validateChallenge(name){
   const el=document.getElementById('valresult'); if(el) el.textContent='Validating…';
-  const r = await (await fetch('/api/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})})).json();
+  const unsafe = F('f_unsafe') ? F('f_unsafe').checked : false;  // reuse the form's opt-in
+  const r = await (await fetch('/api/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name, unsafe_native:unsafe})})).json();
   if(el) el.textContent = r.result || '(no result)';
 }
 async function deleteChallenge(name){
@@ -507,12 +532,17 @@ class _Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             self._send(200, _PAGE.encode("utf-8"), "text/html; charset=utf-8")
         elif path == "/api/config":
+            docker_up = docker_available()
             self._json({
                 "model": DEFAULT_MODEL,
                 "ollama_url": DEFAULT_OLLAMA_URL,
                 "genres": ["reverse", "log"],
+                "targets": ["elf", "pe"],
+                "default_target": DEFAULT_TARGET,
                 "difficulties": ["easy", "medium", "hard"],
                 "max_attempts": DEFAULT_MAX_ATTEMPTS,
+                "docker": docker_up,
+                "sandbox_image": docker_up and image_available(),
             })
         elif path.startswith("/api/job/"):
             with _LOCK:
@@ -589,7 +619,9 @@ class _Handler(BaseHTTPRequestHandler):
             d = _challenge_dir(_safe_name(payload.get("name", "")) or "")
             if d is None:
                 self._send(404, b"not found", "text/plain"); return
-            res = validate_challenge(d)
+            # Isolated by default; opt into the unsafe host backend explicitly.
+            vb = NativeBackend() if bool(payload.get("unsafe_native")) else None
+            res = validate_challenge(d, backend=vb)
             self._json({"result": str(res), "success": res.success, "stage": res.stage})
         elif parsed.path == "/api/delete":
             d = _challenge_dir(_safe_name(payload.get("name", "")) or "")

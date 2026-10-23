@@ -15,25 +15,41 @@ class GenerateFormTests(unittest.TestCase):
         self.assertIsNone(web._safe_name("x" * 65))
 
     def test_build_generate_kwargs(self):
-        k = web._build_generate_kwargs({
-            "name": "c1", "genre": "log", "difficulty": "hard", "prompt": "p",
-            "model": "m", "ollama_url": "http://h", "max_attempts": "7",
-            "category": "forensics", "roundtrip": True, "surprise": False,
-        })
+        with mock.patch.object(web, "resolve_backend", return_value="BE") as rb:
+            k = web._build_generate_kwargs({
+                "name": "c1", "genre": "log", "difficulty": "hard", "prompt": "p",
+                "model": "m", "ollama_url": "http://h", "max_attempts": "7",
+                "category": "forensics", "roundtrip": True, "surprise": False,
+            })
         self.assertEqual(k["name"], "c1")
         self.assertEqual(k["genre"], "log")
         self.assertEqual(k["difficulty"], "hard")
         self.assertEqual(k["max_attempts"], 7)
         self.assertEqual(k["challenge_type"], "forensics")
         self.assertFalse(k["roundtrip"])  # roundtrip only applies to reverse
+        self.assertEqual(k["target"], "elf")       # default target
+        self.assertEqual(k["backend"], "BE")       # resolved backend passed through
+        rb.assert_called_once()
 
     def test_build_generate_kwargs_defaults_and_validation(self):
         with self.assertRaises(ValueError):
-            web._build_generate_kwargs({"name": "bad/name"})
-        k = web._build_generate_kwargs({"name": "c2", "genre": "reverse", "roundtrip": True, "difficulty": "nope"})
+            web._build_generate_kwargs({"name": "bad/name"})  # name checked before backend
+        with mock.patch.object(web, "resolve_backend", return_value="BE"):
+            k = web._build_generate_kwargs({"name": "c2", "genre": "reverse", "roundtrip": True,
+                                            "difficulty": "nope", "target": "pe", "unsafe_native": True})
         self.assertEqual(k["genre"], "reverse")
         self.assertTrue(k["roundtrip"])
         self.assertEqual(k["difficulty"], "easy")  # invalid -> default
+        self.assertEqual(k["target"], "pe")
+
+    def test_build_generate_kwargs_isolation_choice(self):
+        # unsafe_native toggles the isolation argument passed to resolve_backend
+        with mock.patch.object(web, "resolve_backend", return_value="BE") as rb:
+            web._build_generate_kwargs({"name": "c3", "target": "elf", "unsafe_native": False})
+        self.assertEqual(rb.call_args.args[1], "isolated")
+        with mock.patch.object(web, "resolve_backend", return_value="BE") as rb:
+            web._build_generate_kwargs({"name": "c4", "target": "pe", "unsafe_native": True})
+        self.assertEqual(rb.call_args.args[1], "unsafe-native")
 
 
 class ClassifyTests(unittest.TestCase):
