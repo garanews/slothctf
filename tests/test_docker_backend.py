@@ -369,8 +369,10 @@ class RecoverGenreTests(unittest.TestCase):
             self.assertEqual(report.attempts[-1].stage, "recover-accepts-wrong")
 
     def test_solver_cannot_execute_the_binary(self):
-        # A solver that tries to exec the ELF cannot (read-only, no exec bit, noexec
-        # /tmp): it fails to recover the flag -> the challenge is rejected.
+        # A solver that tries os.execv on the ELF is stopped by the stripped exec bit
+        # on the read-only mount, so it fails to recover the flag -> rejected. (This
+        # blocks the naive exec path; the ld-loader bypass is not claimed to be
+        # prevented — the container sandbox is the real boundary. See run_solver.)
         with _generate_recover("rec_exec", "elf", DockerLinuxBackend(),
                                _recover_response("sloth{rec_exec}", solver=_REC_EXEC_SOLVER)
                                ) as (report, _):

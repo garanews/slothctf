@@ -1119,6 +1119,59 @@ def _roundtrip_check(base_dir: Path, template: str, backend: "ExecutionBackend",
 # --------------------------------------------------------------------------- #
 # recover genre — recover-by-analysis verification
 # --------------------------------------------------------------------------- #
+def _marker_matches(output: str, marker: str) -> bool:
+    """True only if `marker` is the whole (stripped) output or an EXACT line of it.
+    A substring match is not enough — e.g. marker 'Correct' must not be considered
+    present just because the program printed 'Incorrect'."""
+    if not marker:
+        return False
+    if output.strip() == marker:
+        return True
+    return any(line.strip() == marker for line in output.splitlines())
+
+
+def _recover_execution_problem(good: "ExecResult", bad: "ExecResult", marker: str,
+                               expected: str) -> tuple[str, str] | None:
+    """Shared functional contract for a recover binary, used at generation AND
+    validation. Returns (stage, message) on a problem, or None if the program is a
+    well-behaved validator that hides the flag.
+
+    recover v1 requires BOTH runs to exit 0 (exit code 0 on the correct flag and on
+    a wrong input); the ONLY difference must be the success marker. A crash, an
+    unexpected exit code, a timeout, or TRUNCATED output is a failure — truncated
+    output cannot be trusted to prove the flag is absent."""
+    if good.timed_out or bad.timed_out:
+        return ("challenge-timeout", "the challenge did not finish within the time limit.")
+    if good.truncated or bad.truncated:
+        return ("output-truncated",
+                "the challenge produced too much output and it was truncated, so flag-absence "
+                "cannot be verified reliably — keep the program's output small.")
+    if not good.ok:
+        return ("challenge-crash",
+                f"the challenge did not exit 0 on the correct flag (exit {good.exit_code}): "
+                f"{good.stderr[:160]}")
+    if not bad.ok:
+        return ("challenge-bad-exit",
+                f"on a wrong input the challenge exited {bad.exit_code}, not 0. For recover v1 "
+                "both correct and wrong input must exit 0; the only difference is the marker.")
+    if not _marker_matches(good.stdout, marker):
+        return ("recover-rejects-correct",
+                f"feeding the correct flag did not print the marker {marker!r} on its own line "
+                f"(got {good.stdout.strip()[:120]!r}); the validator must accept the flag.")
+    if _marker_matches(bad.stdout, marker):
+        return ("recover-accepts-wrong",
+                "a wrong input also printed the success marker; the validator must only accept the "
+                "exact flag (it must not ignore its input or always accept).")
+    inner = expected[6:-1] if expected.startswith("sloth{") and expected.endswith("}") else ""
+    for label, r in (("valid", good), ("wrong", bad)):
+        combined = (r.stdout or "") + "\n" + (r.stderr or "")
+        if expected in combined or (inner and inner in combined):
+            return ("too-trivial",
+                    f"running the binary on {label} input reveals the flag — recover challenges must "
+                    "hide it; the flag is obtained by analysis, not by running the program.")
+    return None
+
+
 def _tokens_to_bytes(body: str) -> bytes:
     """Turn the encoder's '0x31, 0x2e, ...' output into raw bytes."""
     out = bytearray()
@@ -1178,6 +1231,8 @@ def _run_solver_isolated(solver_code: str, artifact_host: Path, solver_backend: 
             return False, "", f"solver backend error: {type(exc).__name__}: {exc}"
         if res.timed_out:
             return False, "", "solver timed out"
+        if res.truncated:
+            return False, "", "solver output was truncated (unreliable); keep it to just the flag"
         if not res.ok:
             return False, (res.stdout or ""), f"solver exited non-zero: {res.stderr[:200]}"
         return True, (res.stdout or ""), ""
@@ -1267,26 +1322,9 @@ def _verify_recover_challenge(base_dir: Path, data: dict[str, Any], backend: "Ex
     good = backend.run_binary(base_dir, challenge_rel, target, stdin_text=expected + "\n")
     bad = backend.run_binary(base_dir, challenge_rel, target,
                              stdin_text="definitely_wrong_" + expected + "\n")
-    if good.timed_out or bad.timed_out:
-        return AttemptResult(0, False, "challenge-timeout", "the challenge did not finish in time.")
-    if not good.ok:
-        return AttemptResult(0, False, "challenge-crash", f"the challenge crashed on valid input: {good.stderr[:200]}")
-    if marker not in good.stdout:
-        return AttemptResult(0, False, "recover-rejects-correct",
-                             f"feeding the correct flag did not print the marker {marker!r} "
-                             f"(got {good.stdout.strip()[:120]!r}); the validator must accept the flag.")
-    if marker in bad.stdout:
-        return AttemptResult(0, False, "recover-accepts-wrong",
-                             "a wrong input also printed the success marker; the validator must only "
-                             "accept the exact flag (it must not ignore its input or always accept).")
-    # Non-triviality: no run may hand over the flag.
-    for label, r in (("valid", good), ("wrong", bad)):
-        combined = (r.stdout or "") + "\n" + (r.stderr or "")
-        if expected in combined or (expected[6:-1] and expected[6:-1] in combined):
-            return AttemptResult(0, False, "too-trivial",
-                                 f"running the binary on {label} input reveals the flag — recover "
-                                 "challenges must hide it; the flag is obtained by analysis, not by "
-                                 "running the program.")
+    prob = _recover_execution_problem(good, bad, marker, expected)
+    if prob is not None:
+        return AttemptResult(0, False, prob[0], prob[1])
 
     # 6. The reference solver recovers the real flag from the artifact alone.
     ok, out, detail = _run_solver_isolated(solver_code, challenge_bin, solver_backend)

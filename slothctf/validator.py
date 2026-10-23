@@ -198,7 +198,9 @@ def _validate_recover(challenge_dir: Path, metadata: dict, target: Target,
     an isolated workspace. NOT repeated here: the generation-time independence
     (flag-swap) proof — that a second, harness-chosen flag is recovered — which is
     a property of the generator, not of the distributed artifact."""
-    from .generator import _flag_leaks_recover, _run_solver_isolated  # internal reuse
+    from .generator import (  # internal reuse
+        _flag_leaks_recover, _recover_execution_problem, _run_solver_isolated,
+    )
 
     flag = str(metadata.get("flag", ""))
     challenge_rel = f"bin/{target.artifact('challenge')}"
@@ -227,19 +229,9 @@ def _validate_recover(challenge_dir: Path, metadata: dict, target: Target,
     good = backend.run_binary(challenge_dir, challenge_rel, target, stdin_text=flag + "\n")
     bad = backend.run_binary(challenge_dir, challenge_rel, target,
                              stdin_text="definitely_wrong_" + flag + "\n")
-    if good.timed_out or bad.timed_out:
-        return _fail("run-error", "the challenge did not finish within the time limit")
-    if not good.ok:
-        return _fail("run-error", f"the challenge crashed on valid input\n{good.stderr[:200]}")
-    if marker not in good.stdout:
-        return _fail("recover-rejects-correct", f"the correct flag was not accepted (expected marker {marker!r})")
-    if marker in bad.stdout:
-        return _fail("recover-accepts-wrong", "a wrong input was also accepted")
-    inner = flag[6:-1] if flag.startswith("sloth{") and flag.endswith("}") else ""
-    for r in (good, bad):
-        combined = (r.stdout or "") + "\n" + (r.stderr or "")
-        if flag in combined or (inner and inner in combined):
-            return _fail("too-trivial", "running the binary reveals the flag (that is a decode, not recover)")
+    prob = _recover_execution_problem(good, bad, marker, flag)
+    if prob is not None:
+        return _fail(prob[0], prob[1])
 
     # The solver runs on a Python-capable backend; for a PE target resolve the
     # isolated ELF backend (no Wine needed — the solver only reads bytes).

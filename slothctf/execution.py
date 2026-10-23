@@ -397,14 +397,22 @@ class DockerLinuxBackend(ExecutionBackend):
     def run_solver(self, solver_ws: Path, script_rel: str, artifact_host: Path,
                    limits: ResourceLimits | None = None) -> ExecResult:
         """Run a recover-genre solver (Python) against ONE artifact with hardened
-        isolation: the solver workspace AND the artifact are mounted READ-ONLY, so
-        the solver cannot modify the binary (e.g. restore an execute bit) or drop an
-        executable into the workspace; the only writable area is the noexec /tmp
-        tmpfs. Combined with the stripped execute bit on the artifact, the solver
-        cannot execute the binary under analysis — it can only read its bytes.
+        isolation: the solver workspace AND the artifact are mounted READ-ONLY (so
+        the solver cannot restore an execute bit or drop an executable there) and the
+        only writable area is the noexec /tmp tmpfs. This strongly discourages the
+        solver from EXECUTING the binary instead of analysing it.
 
-        The artifact is exposed at a fixed read-only path and passed to the solver
-        as its argv[1]. Does not change compile_c/run_binary/run_python behaviour."""
+        It is NOT an absolute guarantee: a read-only mount and a stripped execute bit
+        do not stop a determined script from invoking an ELF's dynamic loader
+        directly (e.g. `ld-linux.so <path>`), which ignores the execute bit. The real
+        containment is the container itself — no network, non-root, read-only root,
+        all capabilities dropped — so even if the solver did run the binary it stays
+        sandboxed. We do not present the static-only property as a hard boundary;
+        broadening enforcement (e.g. a seccomp/exec-blocking profile) is out of scope
+        for this change.
+
+        The artifact is exposed at a fixed read-only path and passed to the solver as
+        its argv[1]. Does not change compile_c/run_binary/run_python behaviour."""
         limits = limits or ResourceLimits()
         name = f"slothctf-{uuid.uuid4().hex[:12]}"
         artifact_path = "/data/artifact.bin"

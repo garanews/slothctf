@@ -11,7 +11,63 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from slothctf import generator as g
-from slothctf.execution import NativeBackend
+from slothctf.execution import ExecResult, NativeBackend
+
+
+def _er(ok=True, stdout="", stderr="", exit_code=0, timed_out=False, truncated=False):
+    return ExecResult(ok, stdout, stderr, exit_code=exit_code, timed_out=timed_out, truncated=truncated)
+
+
+class RecoverExecutionContractTests(unittest.TestCase):
+    """The shared functional contract (_recover_execution_problem), used at both
+    generation and validation — tested deterministically with crafted ExecResults."""
+
+    FLAG = "sloth{x}"
+
+    def problem(self, good, bad, marker="Unlocked"):
+        return g._recover_execution_problem(good, bad, marker, self.FLAG)
+
+    def test_well_behaved_validator_passes(self):
+        self.assertIsNone(self.problem(_er(stdout="Unlocked\n"), _er(stdout="Nope\n")))
+
+    def test_marker_substring_is_not_a_false_accept(self):
+        # marker 'Correct' must NOT be seen as present in 'Incorrect' (line-exact).
+        self.assertIsNone(
+            g._recover_execution_problem(_er(stdout="Correct\n"), _er(stdout="Incorrect\n"),
+                                         "Correct", self.FLAG))
+
+    def test_always_accept_rejected(self):
+        self.assertEqual(self.problem(_er(stdout="Unlocked\n"), _er(stdout="Unlocked\n"))[0],
+                         "recover-accepts-wrong")
+
+    def test_wrong_input_nonzero_exit_rejected(self):
+        # both runs must exit 0; a non-zero exit on wrong input is a failure
+        self.assertEqual(self.problem(_er(stdout="Unlocked\n"),
+                                      _er(ok=False, exit_code=1, stdout="Nope\n"))[0],
+                         "challenge-bad-exit")
+
+    def test_crash_on_correct_rejected(self):
+        self.assertEqual(self.problem(_er(ok=False, exit_code=139), _er(stdout="Nope\n"))[0],
+                         "challenge-crash")
+
+    def test_timeout_rejected(self):
+        self.assertEqual(self.problem(_er(timed_out=True), _er(stdout="Nope\n"))[0],
+                         "challenge-timeout")
+
+    def test_truncated_output_rejected(self):
+        # incomplete output cannot prove the flag is absent
+        self.assertEqual(self.problem(_er(stdout="Unlocked\n", truncated=True), _er(stdout="Nope\n"))[0],
+                         "output-truncated")
+
+    def test_flag_revealed_is_trivial(self):
+        self.assertEqual(self.problem(_er(stdout="Unlocked\n" + self.FLAG), _er(stdout="Nope\n"))[0],
+                         "too-trivial")
+
+    def test_marker_matches_line_exact(self):
+        self.assertTrue(g._marker_matches("foo\nUnlocked\nbar", "Unlocked"))
+        self.assertTrue(g._marker_matches("Unlocked", "Unlocked"))
+        self.assertFalse(g._marker_matches("Incorrect", "Correct"))
+        self.assertFalse(g._marker_matches("", "Unlocked"))
 
 
 class SchemaAndNormalizeTests(unittest.TestCase):
