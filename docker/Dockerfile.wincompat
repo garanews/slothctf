@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1
+# SlothCTF Windows-compat sandbox image (Phase B): cross-compile Windows PE with
+# MinGW-w64 and run it under Wine, all inside the same throwaway, network-less,
+# non-root, read-only-root container as the Linux backend. Built locally with
+# `python main.py sandbox-build --win` (never auto-pulled).
+#
+# IMPORTANT: Wine is a compatibility layer, not Windows. A PE verified here is
+# "likely correct", not "behaves exactly as on Windows" — anti-debugging, some
+# WinAPI calls and syscalls differ. Container isolation (below) is independent of
+# that emulation fidelity; do not conflate the two.
+FROM debian:bookworm-slim
+
+# Toolchain: the MinGW-w64 cross-gcc that emits x86_64 PE, and the Wine runtime.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         gcc-mingw-w64-x86-64 wine wine64 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Verify the dependencies AT BUILD TIME: fail the build if either the cross
+# compiler or the Wine runtime is not actually callable, so the backend never has
+# to assume they are present / on PATH. Debian ships a single `wine` launcher
+# (no separate `wine64` command); WINEARCH=win64 makes it run 64-bit PEs.
+RUN x86_64-w64-mingw32-gcc --version >/dev/null \
+    && wine --version >/dev/null
+
+# Bake a ready 64-bit Wine prefix at build time so a run never has to initialise
+# one (slow, and it writes a lot). Gecko/Mono install prompts are disabled. The
+# prefix is world-readable; at runtime winrun copies it into a per-run tmpfs so
+# the writable Wine state lives off the read-only root and outside the workspace.
+ENV WINEARCH=win64 WINEDEBUG=-all WINEDLLOVERRIDES="mscoree=d;mshtml=d"
+RUN WINEPREFIX=/opt/wineprefix wineboot --init \
+    && WINEPREFIX=/opt/wineprefix wineserver -w \
+    && chmod -R a+rX /opt/wineprefix
+
+# winrun <pe> [args...] : stage a private, writable Wine prefix in the per-run
+# tmpfs (HOME=/tmp), then exec Wine on the PE. The 687 MB static DLL tree
+# (drive_c/windows) is SHARED READ-ONLY via a symlink to the baked prefix, not
+# copied, so the tmpfs holds only the few MB of per-run mutable state (registry +
+# users). That keeps memory bounded and the DLLs unwritable. `exec` keeps the pid
+# tree inside the container so `docker rm -f` on timeout reaps every Wine process.
+RUN cat > /usr/local/bin/winrun <<'EOF'
+#!/bin/sh
+set -e
+export HOME=/tmp
+export WINEPREFIX=/tmp/wineprefix
+export WINEDEBUG=-all
+export WINEDLLOVERRIDES="mscoree=d;mshtml=d"
+src=/opt/wineprefix
+mkdir -p "$WINEPREFIX/drive_c"
+cp -a "$src"/system.reg "$src"/user.reg "$src"/userdef.reg "$src"/.update-timestamp "$WINEPREFIX"/
+cp -a "$src"/dosdevices "$WINEPREFIX"/
+# big, static Windows DLL tree: shared read-only (symlink), never copied
+ln -s "$src"/drive_c/windows "$WINEPREFIX"/drive_c/windows
+# small, writable per-run copies of the rest of C:
+for d in users ProgramData "Program Files" "Program Files (x86)"; do
+  if [ -e "$src/drive_c/$d" ]; then cp -a "$src/drive_c/$d" "$WINEPREFIX/drive_c/$d"; fi
+done
+exec wine "$@"
+EOF
+RUN chmod a+rx /usr/local/bin/winrun
+
+WORKDIR /work

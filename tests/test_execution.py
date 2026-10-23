@@ -96,9 +96,24 @@ class ResolveBackendTests(unittest.TestCase):
             with self.assertRaises(SandboxUnavailable):
                 resolve_backend("elf", "isolated")  # explicit error, no native fallback
 
-    def test_isolated_pe_is_phase_b(self):
-        # even with Docker up, isolated PE is not available in Phase A -> explicit error
-        with mock.patch.object(ex, "docker_available", return_value=True):
+    def test_isolated_pe_resolves_to_wincompat(self):
+        # Phase B: pe + isolated -> DockerWinCompatBackend when Docker is up and the
+        # Windows-compat image is built.
+        from slothctf.execution import DockerWinCompatBackend
+        with mock.patch.object(ex, "docker_available", return_value=True), \
+             mock.patch.object(ex, "win_image_available", return_value=True):
+            self.assertIsInstance(resolve_backend("pe", "isolated"), DockerWinCompatBackend)
+
+    def test_isolated_pe_without_docker_errors(self):
+        with mock.patch.object(ex, "docker_available", return_value=False):
+            with self.assertRaises(SandboxUnavailable):
+                resolve_backend("pe", "isolated")  # no fallback to native
+
+    def test_isolated_pe_without_win_image_errors(self):
+        # Docker up but the MinGW+Wine image not built -> explicit error, no silent
+        # unsandboxed build and no PE->ELF conversion.
+        with mock.patch.object(ex, "docker_available", return_value=True), \
+             mock.patch.object(ex, "win_image_available", return_value=False):
             with self.assertRaises(SandboxUnavailable):
                 resolve_backend("pe", "isolated")
 

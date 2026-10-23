@@ -266,10 +266,12 @@ class GenerationLoopTests(unittest.TestCase):
             with self.assertRaises(SandboxUnavailable):
                 generate_challenge("x", target="elf", caller=lambda p, m: {}, return_report=True)
 
-    def test_isolated_pe_refused_until_phase_b(self):
-        # PE has no isolated backend yet => explicit error, never converted to ELF.
+    def test_isolated_pe_without_win_image_refused(self):
+        # Phase B: isolated PE needs the MinGW+Wine image. Without it => explicit
+        # error, never a silent unsandboxed .exe build and never converted to ELF.
         from slothctf.execution import SandboxUnavailable
-        with mock.patch("slothctf.execution.docker_available", return_value=True):
+        with mock.patch("slothctf.execution.docker_available", return_value=True), \
+             mock.patch("slothctf.execution.win_image_available", return_value=False):
             with self.assertRaises(SandboxUnavailable):
                 generate_challenge("x", target="pe", caller=lambda p, m: {}, return_report=True)
 

@@ -117,7 +117,9 @@ def _build_parser() -> argparse.ArgumentParser:
     install.add_argument("--dry-run", action="store_true", help="Print the installation steps without executing them")
 
     sb = subparsers.add_parser("sandbox-build", help="Build the Docker sandbox image for isolated execution")
-    sb.add_argument("--image", default=None, help="Image tag (default: slothctf-sandbox:latest)")
+    sb.add_argument("--image", default=None, help="Image tag (default: slothctf-sandbox:latest, or -win with --win)")
+    sb.add_argument("--win", action="store_true",
+                    help="Build the Windows-compat image (MinGW-w64 + Wine) for isolated PE instead of the ELF image")
 
     subparsers.add_parser("sandbox-check", help="Report Docker sandbox availability")
 
@@ -215,10 +217,11 @@ def main() -> None:
         return
 
     if args.command == "sandbox-build":
-        from slothctf.execution import DEFAULT_IMAGE
-        image = args.image or DEFAULT_IMAGE
+        from slothctf.execution import DEFAULT_IMAGE, DEFAULT_WIN_IMAGE
+        dockerfile = "Dockerfile.wincompat" if args.win else "Dockerfile"
+        image = args.image or (DEFAULT_WIN_IMAGE if args.win else DEFAULT_IMAGE)
         try:
-            ok = build_sandbox_image(image=image)
+            ok = build_sandbox_image(image=image, dockerfile=dockerfile)
         except SandboxUnavailable as exc:
             print(str(exc), file=sys.stderr)
             raise SystemExit(2) from exc
@@ -226,12 +229,15 @@ def main() -> None:
         raise SystemExit(0 if ok else 1)
 
     if args.command == "sandbox-check":
-        from slothctf.execution import DEFAULT_IMAGE
+        from slothctf.execution import DEFAULT_IMAGE, DEFAULT_WIN_IMAGE, win_image_available
         up = docker_available()
         img = image_available() if up else False
+        win_img = win_image_available() if up else False
         print(f"docker daemon: {'available' if up else 'NOT available'}")
-        print(f"sandbox image ({DEFAULT_IMAGE}): {'present' if img else 'missing - run: python main.py sandbox-build'}")
+        print(f"ELF sandbox image ({DEFAULT_IMAGE}): {'present' if img else 'missing - run: python main.py sandbox-build'}")
+        print(f"Windows-compat image ({DEFAULT_WIN_IMAGE}): {'present' if win_img else 'missing - run: python main.py sandbox-build --win'}")
         print("isolated ELF generation:", "READY" if (up and img) else "not ready")
+        print("isolated PE (Wine) generation:", "READY" if (up and win_img) else "not ready")
         raise SystemExit(0 if (up and img) else 1)
 
     if args.command == "gui":
