@@ -1,0 +1,738 @@
+[
+  {
+    "name": "anti_debug_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": true,
+    "anti_debug": true,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "anti_vm_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": true,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "camp_rev_check_pwd_1",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": true,
+    "anti_debug": true,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "camp_rev_check_pwd_2",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": true,
+    "anti_debug": true,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "camp_rev_check_pwd_3",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": true,
+    "anti_debug": true,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "camp_rev_check_pwd_adv_1",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": true,
+    "anti_debug": true,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "camp_rev_check_pwd_adv_2",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": true,
+    "anti_debug": true,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "camp_rev_check_pwd_adv_3",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": true,
+    "anti_debug": true,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "camp_rev_decode_xor_1",
+    "kind": "decode",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "sloth{g6iecoeh1q0g}\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "sloth{g6iecoeh1q0g}\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "camp_rev_decode_xor_2",
+    "kind": "decode",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "sloth{wr3vmrlkfm8t}\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "sloth{wr3vmrlkfm8t}\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "camp_rev_decode_xor_3",
+    "kind": "decode",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "sloth{9bfxz93ig22q}\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "sloth{9bfxz93ig22q}\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "camp_rev_decode_xor_rt_1",
+    "kind": "decode",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "sloth{8g698nfj4s6k}\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "sloth{8g698nfj4s6k}\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "camp_rev_decode_xor_rt_2",
+    "kind": "",
+    "target_ok": false,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": false,
+      "correct": null,
+      "stdout": "",
+      "detail": ""
+    },
+    "wine": {
+      "ran": false,
+      "correct": null,
+      "stdout": "",
+      "detail": ""
+    },
+    "compile_ok": null,
+    "verdict": "not-runnable",
+    "cause": "missing challenge.json or bin/challenge.exe"
+  },
+  {
+    "name": "camp_rev_decode_xor_rt_3",
+    "kind": "",
+    "target_ok": false,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": false,
+      "correct": null,
+      "stdout": "",
+      "detail": ""
+    },
+    "wine": {
+      "ran": false,
+      "correct": null,
+      "stdout": "",
+      "detail": ""
+    },
+    "compile_ok": null,
+    "verdict": "not-runnable",
+    "cause": "missing challenge.json or bin/challenge.exe"
+  },
+  {
+    "name": "constructor_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Enter the password: Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Enter the password: Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "custom_b64_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "custom_vm_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "dynamic_imports_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": true,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "fnv1a_hash_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "func_pointers_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "junk_code_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "math_equations_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "multithread_check_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": false,
+      "stdout": "",
+      "detail": "correct secret did not print marker 'Access Granted' (got '')"
+    },
+    "compile_ok": false,
+    "verdict": "wine-incompat",
+    "cause": "native correct but wine: correct secret did not print marker 'Access Granted' (got '')"
+  },
+  {
+    "name": "obfuscation_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "rc4_cipher_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "sbox_crypto_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "seh_exception_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Enter the password: Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Enter the password: Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "self_modifying_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "state_machine_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "tea_crypto_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "timing_attack_demo",
+    "kind": "check",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "Access Granted\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  },
+  {
+    "name": "xor_demo",
+    "kind": "decode",
+    "target_ok": true,
+    "uses_winapi": false,
+    "anti_debug": false,
+    "anti_vm": false,
+    "native": {
+      "ran": true,
+      "correct": true,
+      "stdout": "sloth{easy_xor}\n",
+      "detail": ""
+    },
+    "wine": {
+      "ran": true,
+      "correct": true,
+      "stdout": "sloth{easy_xor}\n",
+      "detail": ""
+    },
+    "compile_ok": true,
+    "verdict": "ok",
+    "cause": ""
+  }
+]
