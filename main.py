@@ -4,6 +4,13 @@ import argparse
 import sys
 from pathlib import Path
 
+from slothctf.execution import (
+    SandboxUnavailable,
+    build_sandbox_image,
+    docker_available,
+    image_available,
+    resolve_backend,
+)
 from slothctf.generator import (
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MODEL,
@@ -12,7 +19,30 @@ from slothctf.generator import (
     GenerationReport,
     generate_challenge,
 )
+from slothctf.targets import DEFAULT_TARGET, TargetError
 from slothctf.validator import install_toolchain_windows, validate_challenge
+
+
+def _add_sandbox_flags(p: argparse.ArgumentParser) -> None:
+    """Target + isolation flags shared by generate/validate."""
+    p.add_argument("--target", choices=["elf", "pe"], default=DEFAULT_TARGET,
+                   help="binary target: 'elf' (Linux, isolated via Docker) or 'pe' "
+                        "(Windows .exe; isolated backend arrives in Phase B, so for now "
+                        "pair it with --unsafe-native on a Windows host). Default: elf")
+    p.add_argument("--unsafe-native", action="store_true",
+                   help="run the model's code on the HOST with no isolation (development "
+                        "only, explicit opt-in). Without this, execution is isolated and "
+                        "there is no automatic fallback.")
+
+
+def _resolve_cli_backend(args):
+    """Resolve the backend from --target/--unsafe-native, or exit with a clear message."""
+    isolation = "unsafe-native" if getattr(args, "unsafe_native", False) else "isolated"
+    try:
+        return resolve_backend(args.target, isolation, allow_native=getattr(args, "unsafe_native", False))
+    except (SandboxUnavailable, TargetError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2) from exc
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -74,13 +104,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="override the attacker budget (e.g. '2000,20'); default scales with difficulty "
         "(medium=800/8s, hard=2000/20s)",
     )
+    _add_sandbox_flags(gen)
 
     validate = subparsers.add_parser("validate", help="Validate a generated challenge")
     validate.add_argument("--dir", required=True, help="Challenge directory to validate")
     validate.add_argument("--install-toolchain", action="store_true", help="Attempt to install the required C compiler if it is missing")
+    validate.add_argument("--unsafe-native", action="store_true",
+                          help="re-validate on the host with no isolation (dev only, explicit "
+                               "opt-in; required for existing Windows .exe challenges until Phase B)")
 
     install = subparsers.add_parser("install-toolchain", help="Install the required C compiler on Windows")
     install.add_argument("--dry-run", action="store_true", help="Print the installation steps without executing them")
+
+    sb = subparsers.add_parser("sandbox-build", help="Build the Docker sandbox image for isolated execution")
+    sb.add_argument("--image", default=None, help="Image tag (default: slothctf-sandbox:latest)")
+
+    subparsers.add_parser("sandbox-check", help="Report Docker sandbox availability")
 
     gui = subparsers.add_parser("gui", help="Launch the desktop GUI")
     gui.add_argument("--no-splash", action="store_true", help="Launch without the startup message")
@@ -123,6 +162,7 @@ def main() -> None:
                 print("--adversary-budget needs attempts>=1 and seconds>0 (finite)", file=sys.stderr)
                 raise SystemExit(2)
             adv_budget = (a, s)
+        backend = _resolve_cli_backend(args)
         try:
             report = generate_challenge(
                 args.name,
@@ -139,6 +179,8 @@ def main() -> None:
                 roundtrip=args.roundtrip,
                 adversary=args.adversary,
                 adversary_budget=adv_budget,
+                target=args.target,
+                backend=backend,
                 return_report=True,
             )
         except GenerationError as exc:
@@ -155,7 +197,13 @@ def main() -> None:
         if args.install_toolchain:
             result = install_toolchain_windows(dry_run=False)
             print(result)
-        result = validate_challenge(Path(args.dir))
+        # Default: isolated (resolved from the challenge's own target). --unsafe-native
+        # re-validates on the host, required for existing .exe challenges until Phase B.
+        backend = None
+        if args.unsafe_native:
+            from slothctf.execution import NativeBackend
+            backend = NativeBackend()
+        result = validate_challenge(Path(args.dir), backend=backend)
         print(result)
         if not result.success:
             raise SystemExit(1)
@@ -165,6 +213,26 @@ def main() -> None:
         result = install_toolchain_windows(dry_run=args.dry_run)
         print(result)
         return
+
+    if args.command == "sandbox-build":
+        from slothctf.execution import DEFAULT_IMAGE
+        image = args.image or DEFAULT_IMAGE
+        try:
+            ok = build_sandbox_image(image=image)
+        except SandboxUnavailable as exc:
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(2) from exc
+        print(f"built {image}" if ok else "docker build failed", file=sys.stderr if not ok else sys.stdout)
+        raise SystemExit(0 if ok else 1)
+
+    if args.command == "sandbox-check":
+        from slothctf.execution import DEFAULT_IMAGE
+        up = docker_available()
+        img = image_available() if up else False
+        print(f"docker daemon: {'available' if up else 'NOT available'}")
+        print(f"sandbox image ({DEFAULT_IMAGE}): {'present' if img else 'missing - run: python main.py sandbox-build'}")
+        print("isolated ELF generation:", "READY" if (up and img) else "not ready")
+        raise SystemExit(0 if (up and img) else 1)
 
     if args.command == "gui":
         try:

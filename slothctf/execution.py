@@ -284,6 +284,27 @@ def docker_available() -> bool:
         return False
 
 
+def image_available(image: str = DEFAULT_IMAGE) -> bool:
+    """True if the sandbox image is already built locally (never auto-pulled)."""
+    try:
+        r = subprocess.run(["docker", "image", "inspect", image],
+                           capture_output=True, text=True, timeout=20)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def build_sandbox_image(image: str = DEFAULT_IMAGE, context_dir: str = "docker") -> bool:
+    """Build the sandbox image from docker/Dockerfile, streaming output. Returns
+    True on success. Raises SandboxUnavailable if the docker CLI is missing."""
+    if shutil.which("docker") is None:
+        raise SandboxUnavailable("docker CLI not found; install Docker Desktop (Windows) or docker (Linux).")
+    if not (Path(context_dir) / "Dockerfile").exists():
+        raise SandboxUnavailable(f"no Dockerfile under {context_dir}/")
+    r = subprocess.run(["docker", "build", "-t", image, context_dir])  # inherit stdio: live output
+    return r.returncode == 0
+
+
 def _native_opt_in(explicit: bool) -> bool:
     return explicit or os.environ.get("SLOTHCTF_ALLOW_NATIVE", "") == "1"
 
