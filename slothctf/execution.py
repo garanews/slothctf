@@ -29,8 +29,10 @@ import shutil
 import subprocess
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+
+from .targets import Target, get_target, host_native_target
 
 
 class SandboxUnavailable(RuntimeError):
@@ -78,15 +80,26 @@ class ExecutionBackend(ABC):
     """
     name: str = "base"
     safe: bool = False
+    supported_targets: frozenset[str] = frozenset()
+
+    def can_build(self, target: Target) -> bool:
+        return target.name in self.supported_targets
+
+    def _require_target(self, target: Target) -> None:
+        if not self.can_build(target):
+            raise SandboxUnavailable(
+                f"backend {self.name!r} cannot build/run target {target.name!r} "
+                f"(supports: {', '.join(sorted(self.supported_targets)) or 'none'})")
 
     @abstractmethod
-    def compile_c(self, workspace: Path, source_rel: str, out_rel: str,
-                  compiler: str = "gcc", limits: ResourceLimits | None = None) -> ExecResult:
+    def compile_c(self, workspace: Path, source_rel: str, out_rel: str, target: Target,
+                  limits: ResourceLimits | None = None) -> ExecResult:
         ...
 
     @abstractmethod
-    def run_binary(self, workspace: Path, binary_rel: str, args: list[str] | None = None,
-                   stdin_text: str | None = None, limits: ResourceLimits | None = None) -> ExecResult:
+    def run_binary(self, workspace: Path, binary_rel: str, target: Target,
+                   args: list[str] | None = None, stdin_text: str | None = None,
+                   limits: ResourceLimits | None = None) -> ExecResult:
         ...
 
     @abstractmethod
@@ -99,17 +112,31 @@ class ExecutionBackend(ABC):
 # Native (unsafe) backend — current host behaviour
 # --------------------------------------------------------------------------- #
 class NativeBackend(ExecutionBackend):
-    """Runs on the host with no isolation. UNSAFE; development only."""
+    """Runs on the host with no isolation, using the host's own toolchain. UNSAFE;
+    development only. It can only build and run the host-native target (PE on
+    Windows, ELF on Linux) — it does not cross-compile or emulate."""
     name = "native"
     safe = False
 
+    def __init__(self):
+        self._native = host_native_target()
+        self.supported_targets = frozenset({self._native.name})
+
+    def _compiler_for(self, target: Target) -> str:
+        for cand in target.native_compilers:
+            found = shutil.which(cand)
+            if found:
+                return found
+        raise SandboxUnavailable(
+            f"no native compiler for target {target.name!r} on PATH "
+            f"(looked for: {', '.join(target.native_compilers)})")
+
     def _run(self, argv: list[str], timeout: float, limits: ResourceLimits,
-             stdin_text: str | None = None, cwd: Path | None = None) -> ExecResult:
+             stdin_text: str | None = None) -> ExecResult:
         try:
             r = subprocess.run(
                 argv, input=stdin_text, capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=timeout,
-                cwd=str(cwd) if cwd else None,
             )
         except subprocess.TimeoutExpired:
             return ExecResult(False, "", f"timed out after {timeout:.0f}s", timed_out=True)
@@ -117,15 +144,18 @@ class NativeBackend(ExecutionBackend):
         err, t2 = _truncate((r.stderr or "").strip(), limits.output_bytes)
         return ExecResult(r.returncode == 0, out, err, exit_code=r.returncode, truncated=t1 or t2)
 
-    def compile_c(self, workspace, source_rel, out_rel, compiler="gcc", limits=None):
+    def compile_c(self, workspace, source_rel, out_rel, target, limits=None):
+        self._require_target(target)
         limits = limits or ResourceLimits()
+        compiler = self._compiler_for(target)
         src = workspace / source_rel
         out = workspace / out_rel
         out.parent.mkdir(parents=True, exist_ok=True)
         return self._run([compiler, "-O2", "-s", "-o", str(out), str(src)],
                          limits.compile_timeout, limits)
 
-    def run_binary(self, workspace, binary_rel, args=None, stdin_text=None, limits=None):
+    def run_binary(self, workspace, binary_rel, target, args=None, stdin_text=None, limits=None):
+        self._require_target(target)
         limits = limits or ResourceLimits()
         return self._run([str(workspace / binary_rel), *(args or [])],
                          limits.run_timeout, limits, stdin_text=stdin_text)
@@ -176,15 +206,18 @@ def build_docker_run_argv(image: str, inner: list[str], workspace: Path,
     return argv
 
 
-class DockerBackend(ExecutionBackend):
-    """Runs each step inside a throwaway, network-less, non-root container.
+class DockerLinuxBackend(ExecutionBackend):
+    """Runs each step inside a throwaway, network-less, non-root container and
+    builds Linux ELF (Phase A). Works with Docker Desktop + WSL2 on Windows and
+    native Docker on Linux. The workspace is bind-mounted, so the ELF artifact is
+    readable on the host (for the byte-level leak check) and runnable in-container.
 
-    Works with Docker Desktop + WSL2 on Windows and native Docker on Linux. The
-    workspace is bind-mounted, so the Linux-ELF artifact it produces is readable on
-    the host (for the byte-level leak check) and runnable in the container.
+    Windows PE under this backend is a later phase (DockerWinCompat, MinGW + Wine);
+    here it is explicitly unsupported rather than silently cross-compiled.
     """
-    name = "docker"
+    name = "docker-linux"
     safe = True
+    supported_targets = frozenset({"elf"})
 
     def __init__(self, image: str = DEFAULT_IMAGE):
         self.image = image
@@ -215,15 +248,17 @@ class DockerBackend(ExecutionBackend):
         except Exception:
             pass  # best-effort cleanup; nothing else to do if docker itself is gone
 
-    def compile_c(self, workspace, source_rel, out_rel, compiler="gcc", limits=None):
+    def compile_c(self, workspace, source_rel, out_rel, target, limits=None):
+        self._require_target(target)
         limits = limits or ResourceLimits()
         (workspace / out_rel).parent.mkdir(parents=True, exist_ok=True)
         src = PurePosixPath(_WORK) / source_rel
         out = PurePosixPath(_WORK) / out_rel
-        inner = [compiler, "-O2", "-s", "-o", str(out), str(src)]
+        inner = ["gcc", "-O2", "-s", "-o", str(out), str(src)]
         return self._exec(inner, workspace, limits.compile_timeout, limits)
 
-    def run_binary(self, workspace, binary_rel, args=None, stdin_text=None, limits=None):
+    def run_binary(self, workspace, binary_rel, target, args=None, stdin_text=None, limits=None):
+        self._require_target(target)
         limits = limits or ResourceLimits()
         inner = [str(PurePosixPath(_WORK) / binary_rel), *(args or [])]
         return self._exec(inner, workspace, limits.run_timeout, limits, stdin_text=stdin_text)
@@ -263,7 +298,7 @@ def get_backend(mode: str | None = None, *, allow_native: bool = False,
     isolation.
     """
     mode = (mode or os.environ.get("SLOTHCTF_EXECUTION", "docker")).strip().lower()
-    if mode == "docker":
+    if mode in ("docker", "docker-linux"):
         if not docker_available():
             raise SandboxUnavailable(
                 "Docker is not available (CLI missing or daemon not responding), and "
@@ -271,7 +306,7 @@ def get_backend(mode: str | None = None, *, allow_native: bool = False,
                 "Docker Desktop and build the image (python main.py sandbox-build), or "
                 "explicitly opt into the UNSAFE native backend with "
                 "SLOTHCTF_EXECUTION=native SLOTHCTF_ALLOW_NATIVE=1.")
-        return DockerBackend(image=image)
+        return DockerLinuxBackend(image=image)
     if mode in ("native", "native-unsafe"):
         if not _native_opt_in(allow_native):
             raise SandboxUnavailable(
@@ -280,3 +315,49 @@ def get_backend(mode: str | None = None, *, allow_native: bool = False,
                 "really intend to run untrusted code as yourself (development only).")
         return NativeBackend()
     raise ValueError(f"unknown execution mode {mode!r} (use 'docker' or 'native')")
+
+
+ISOLATED = "isolated"
+UNSAFE_NATIVE = "unsafe-native"
+
+
+def resolve_backend(target: str | Target, isolation: str = ISOLATED, *,
+                    allow_native: bool = False, image: str = DEFAULT_IMAGE) -> ExecutionBackend:
+    """Pick the backend for a (target, isolation) request, or raise with a clear
+    reason. This is the main entry point: it couples the two axes and never falls
+    back silently from isolated to native or across targets.
+
+    isolation: "isolated" (default) or "unsafe-native" (requires an opt-in).
+    """
+    tgt = target if isinstance(target, Target) else get_target(target)
+
+    if isolation == ISOLATED:
+        if tgt.name == "elf":
+            if not docker_available():
+                raise SandboxUnavailable(
+                    "Isolated ELF needs Docker, which is not available. Start Docker "
+                    "Desktop and run `python main.py sandbox-build`, or use "
+                    "--unsafe-native (dev only). No automatic fallback.")
+            return DockerLinuxBackend(image=image)
+        if tgt.name == "pe":
+            raise SandboxUnavailable(
+                "Isolated Windows PE is not available in Phase A. It arrives in Phase B "
+                "(DockerWinCompat: MinGW + Wine). For now choose target 'elf' for an "
+                "isolated build, or '--unsafe-native' on a Windows host to build the .exe "
+                "with no isolation. SlothCTF will not convert PE to ELF.")
+        raise SandboxUnavailable(f"no isolated backend for target {tgt.name!r}")
+
+    if isolation == UNSAFE_NATIVE:
+        if not _native_opt_in(allow_native):
+            raise SandboxUnavailable(
+                "The native (unsafe, no isolation) backend must be opted into explicitly: "
+                "pass --unsafe-native / allow_native=True or set SLOTHCTF_ALLOW_NATIVE=1.")
+        backend = NativeBackend()
+        if not backend.can_build(tgt):
+            raise SandboxUnavailable(
+                f"this host's native toolchain emits {host_native_target().name!r}, not "
+                f"{tgt.name!r}; a native {tgt.name!r} build is not possible here. Use Docker "
+                "for an isolated build of that target, or run on a matching host.")
+        return backend
+
+    raise ValueError(f"unknown isolation {isolation!r} (use {ISOLATED!r} or {UNSAFE_NATIVE!r})")

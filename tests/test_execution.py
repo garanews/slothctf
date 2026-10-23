@@ -6,14 +6,16 @@ from unittest import mock
 
 from slothctf import execution as ex
 from slothctf.execution import (
-    DockerBackend,
+    DockerLinuxBackend,
     ExecResult,
     NativeBackend,
     ResourceLimits,
     SandboxUnavailable,
     build_docker_run_argv,
     get_backend,
+    resolve_backend,
 )
+from slothctf.targets import ELF, PE, get_target, host_native_target
 
 _HAS_GCC = shutil.which("gcc") is not None
 
@@ -63,7 +65,7 @@ class FactoryTests(unittest.TestCase):
     def test_docker_selected_when_available(self):
         with mock.patch.dict("os.environ", {}, clear=True), \
              mock.patch.object(ex, "docker_available", return_value=True):
-            self.assertIsInstance(get_backend(), DockerBackend)
+            self.assertIsInstance(get_backend(), DockerLinuxBackend)
 
     def test_native_requires_opt_in(self):
         with mock.patch.dict("os.environ", {}, clear=True):
@@ -77,27 +79,78 @@ class FactoryTests(unittest.TestCase):
 
     def test_native_backend_is_not_safe(self):
         self.assertFalse(NativeBackend().safe)
-        self.assertTrue(DockerBackend().safe)
+        self.assertTrue(DockerLinuxBackend().safe)
 
     def test_unknown_mode(self):
         with self.assertRaises(ValueError):
             get_backend("vm")
 
 
+class ResolveBackendTests(unittest.TestCase):
+    """The (target, isolation) resolver: both targets first-class, no silent fallback."""
+
+    def test_isolated_elf_needs_docker(self):
+        with mock.patch.object(ex, "docker_available", return_value=True):
+            self.assertIsInstance(resolve_backend("elf", "isolated"), DockerLinuxBackend)
+        with mock.patch.object(ex, "docker_available", return_value=False):
+            with self.assertRaises(SandboxUnavailable):
+                resolve_backend("elf", "isolated")  # explicit error, no native fallback
+
+    def test_isolated_pe_is_phase_b(self):
+        # even with Docker up, isolated PE is not available in Phase A -> explicit error
+        with mock.patch.object(ex, "docker_available", return_value=True):
+            with self.assertRaises(SandboxUnavailable):
+                resolve_backend("pe", "isolated")
+
+    def test_unsafe_native_requires_opt_in(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(SandboxUnavailable):
+                resolve_backend(host_native_target(), "unsafe-native")
+            b = resolve_backend(host_native_target(), "unsafe-native", allow_native=True)
+            self.assertIsInstance(b, NativeBackend)
+
+    def test_native_cannot_build_foreign_target(self):
+        # the non-host-native target cannot be built natively here -> explicit error
+        foreign = ELF if host_native_target().name == "pe" else PE
+        with self.assertRaises(SandboxUnavailable):
+            resolve_backend(foreign, "unsafe-native", allow_native=True)
+
+    def test_unknown_isolation(self):
+        with self.assertRaises(ValueError):
+            resolve_backend("elf", "sorta-isolated")
+
+
+class TargetSupportTests(unittest.TestCase):
+    def test_docker_linux_supports_only_elf(self):
+        b = DockerLinuxBackend()
+        self.assertTrue(b.can_build(ELF))
+        self.assertFalse(b.can_build(PE))
+
+    def test_native_supports_host_target_only(self):
+        b = NativeBackend()
+        self.assertIn(host_native_target().name, b.supported_targets)
+        self.assertEqual(len(b.supported_targets), 1)
+
+    def test_docker_refuses_pe_compile(self):
+        b = DockerLinuxBackend()
+        with self.assertRaises(SandboxUnavailable):
+            b.compile_c(Path("."), "src/c.c", "bin/c.exe", PE)
+
+
 class DockerInnerCommandTests(unittest.TestCase):
     """Container paths are /work-relative; verify the inner argv the backend runs."""
 
     def test_compile_maps_paths_into_work(self):
-        b = DockerBackend()
+        b = DockerLinuxBackend()
         with TemporaryDirectory() as tmp, \
              mock.patch.object(b, "_exec", return_value=ExecResult(True, "", "")) as m:
-            b.compile_c(Path(tmp), "src/challenge.c", "bin/challenge")
+            b.compile_c(Path(tmp), "src/challenge.c", "bin/challenge", ELF)
             inner = m.call_args.args[0]
             self.assertEqual(inner, ["gcc", "-O2", "-s", "-o", "/work/bin/challenge",
                                      "/work/src/challenge.c"])
 
     def test_run_python_uses_python3_isolated(self):
-        b = DockerBackend()
+        b = DockerLinuxBackend()
         with TemporaryDirectory() as tmp, \
              mock.patch.object(b, "_exec", return_value=ExecResult(True, "", "")) as m:
             b.run_python(Path(tmp), "organizer/extractor_1.py", ["/work/evidence/x.log"])
@@ -126,11 +179,11 @@ class NativeBackendRealTests(unittest.TestCase):
             (ws / "src" / "c.c").write_text(
                 '#include <stdio.h>\nint main(){printf("sloth{ok}");return 0;}',
                 encoding="utf-8")
-            c = b.compile_c(ws, "src/c.c", "bin/c")
+            tgt = host_native_target()
+            out_rel = f"bin/{tgt.out_name}"
+            c = b.compile_c(ws, "src/c.c", out_rel, tgt)
             self.assertTrue(c.ok, c.stderr)
-            # MinGW may append .exe
-            rel = "bin/c" if (ws / "bin" / "c").exists() else "bin/c.exe"
-            r = b.run_binary(ws, rel)
+            r = b.run_binary(ws, out_rel, tgt)
             self.assertTrue(r.ok)
             self.assertIn("sloth{ok}", r.stdout)
 
@@ -139,7 +192,7 @@ class NativeBackendRealTests(unittest.TestCase):
         with TemporaryDirectory() as tmp, \
              mock.patch.object(ex.subprocess, "run",
                                side_effect=ex.subprocess.TimeoutExpired("x", 1)):
-            r = b.run_binary(Path(tmp), "bin/c")
+            r = b.run_binary(Path(tmp), "bin/c", host_native_target())
             self.assertFalse(r.ok)
             self.assertTrue(r.timed_out)
 
