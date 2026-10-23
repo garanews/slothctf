@@ -219,10 +219,25 @@ def _validate_recover(challenge_dir: Path, metadata: dict, target: Target,
     except OSError as exc:
         return _fail("leak-check-failed", f"could not read the compiled binary\n{exc}")
 
-    run = backend.run_binary(challenge_dir, challenge_rel, target)
-    if not run.timed_out:
-        combined = (run.stdout or "") + "\n" + (run.stderr or "")
-        inner = flag[6:-1] if flag.startswith("sloth{") and flag.endswith("}") else ""
+    # The distributed program must work: accept the correct flag, reject wrong
+    # input, never crash/time out, and never reveal the flag (same as generation).
+    marker = str(metadata.get("success_marker", "")).strip()
+    if not marker:
+        return _fail("no-marker", "recover challenge missing success_marker")
+    good = backend.run_binary(challenge_dir, challenge_rel, target, stdin_text=flag + "\n")
+    bad = backend.run_binary(challenge_dir, challenge_rel, target,
+                             stdin_text="definitely_wrong_" + flag + "\n")
+    if good.timed_out or bad.timed_out:
+        return _fail("run-error", "the challenge did not finish within the time limit")
+    if not good.ok:
+        return _fail("run-error", f"the challenge crashed on valid input\n{good.stderr[:200]}")
+    if marker not in good.stdout:
+        return _fail("recover-rejects-correct", f"the correct flag was not accepted (expected marker {marker!r})")
+    if marker in bad.stdout:
+        return _fail("recover-accepts-wrong", "a wrong input was also accepted")
+    inner = flag[6:-1] if flag.startswith("sloth{") and flag.endswith("}") else ""
+    for r in (good, bad):
+        combined = (r.stdout or "") + "\n" + (r.stderr or "")
         if flag in combined or (inner and inner in combined):
             return _fail("too-trivial", "running the binary reveals the flag (that is a decode, not recover)")
 

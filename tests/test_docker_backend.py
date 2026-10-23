@@ -280,11 +280,29 @@ _REC_SOLVER = ("import sys, re\n"
                "print(m.group(0).decode() if m else '')\n")
 
 
-def _recover_response(flag, challenge=_REC_CHALLENGE, solver=_REC_SOLVER):
+def _recover_response(flag, challenge=_REC_CHALLENGE, solver=_REC_SOLVER, marker="Correct"):
     return {"title": "XOR Recover", "category": "Reverse Engineering", "difficulty": "easy",
             "description": "Recover the flag from the binary.", "flag": flag,
-            "challenge_kind": "recover", "encoder_code": _REC_ENCODER,
+            "challenge_kind": "recover", "success_marker": marker, "encoder_code": _REC_ENCODER,
             "challenge_code": challenge, "solver_code": solver}
+
+
+# A challenge that IGNORES its input and always prints the marker — a broken
+# validator that must be rejected even though encoder and solver are fine. It uses
+# `data` (via a volatile sum) so the array is NOT optimised away: the embedded
+# bytes are present, so verification reaches the functional check and rejects it
+# there (a wrong input is accepted), not merely for missing data.
+_REC_IGNORES_INPUT = ("#include <stdio.h>\n"
+                      "static unsigned char data[]={ /*__ENCODED_ARRAY__*/ };\n"
+                      "int main(void){ volatile unsigned s=0;"
+                      "for(unsigned i=0;i<sizeof data;i++) s+=data[i];"
+                      "(void)s; printf(\"Correct\\n\"); return 0; }\n")
+
+# A solver that tries to EXECUTE the artifact instead of reading it — must fail
+# (the artifact is mounted read-only with no execute bit; /tmp is noexec).
+_REC_EXEC_SOLVER = ("import os, sys\n"
+                    "os.execv(sys.argv[1], [sys.argv[1]])  # attempt to run the binary\n"
+                    "print('unreachable')\n")
 
 
 @contextlib.contextmanager
@@ -340,6 +358,24 @@ class RecoverGenreTests(unittest.TestCase):
             self.assertTrue(report.success, report.as_text())
             result = validate_challenge(cdir, backend=DockerLinuxBackend())
             self.assertTrue(result.success, str(result))
+
+    def test_program_ignoring_input_is_rejected(self):
+        # encoder + solver are fine, but the binary ignores stdin and always prints
+        # the marker -> the functional check rejects it (a wrong input is accepted).
+        with _generate_recover("rec_ignore", "elf", DockerLinuxBackend(),
+                               _recover_response("sloth{rec_ignore}", challenge=_REC_IGNORES_INPUT)
+                               ) as (report, _):
+            self.assertFalse(report.success)
+            self.assertEqual(report.attempts[-1].stage, "recover-accepts-wrong")
+
+    def test_solver_cannot_execute_the_binary(self):
+        # A solver that tries to exec the ELF cannot (read-only, no exec bit, noexec
+        # /tmp): it fails to recover the flag -> the challenge is rejected.
+        with _generate_recover("rec_exec", "elf", DockerLinuxBackend(),
+                               _recover_response("sloth{rec_exec}", solver=_REC_EXEC_SOLVER)
+                               ) as (report, _):
+            self.assertFalse(report.success)
+            self.assertIn(report.attempts[-1].stage, {"solver-error", "solver-mismatch"})
 
 
 @unittest.skipUnless(_WIN_READY and _READY, _WIN_SKIP)

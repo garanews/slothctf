@@ -392,6 +392,8 @@ Return ONE JSON object (no prose, no fences) with EXACTLY these keys:
   "description"    : 1-2 sentences the player sees (do NOT reveal the secret/method)
   "flag"           : the SECRET, formatted sloth{...}
   "challenge_kind" : "recover"
+  "success_marker" : the EXACT text the program prints when the input equals the
+                     flag, e.g. "Access Granted" (must NOT contain the flag)
   "encoder_code"   : a COMPLETE C program (organizer tool; players never see it)
   "challenge_code" : a COMPLETE C program given to the player
   "solver_code"    : a COMPLETE Python 3 program (organizer tool; players never see it)
@@ -406,16 +408,20 @@ HARD REQUIREMENTS (breaking any is rejected and sent back to you to fix):
      One token PER BYTE; split wide values into individual bytes.
    - process the WHOLE flag; do not require a fixed length.
 
-2. challenge_code:
+2. challenge_code (an input VALIDATOR that hides the flag):
    - compiles with: gcc -O2 -s -o challenge challenge.c
    - contains the EXACT token %(ph)s where the embedded byte array is initialised
      (the machine substitutes the encoder's output there — put NO numbers there);
    - MUST embed and use that array so the obfuscated flag really is present in the
      compiled binary (that is what the solver recovers from).
-   - When run, it MUST NOT print the flag or the plaintext secret. It may print a
-     banner, read and check input, or use the decoded value internally — but a
-     normal run reveals nothing that hands over the flag. The plaintext secret
-     must NOT appear as a readable literal anywhere in challenge_code.
+   - reads ONE line from stdin, strips the trailing newline, and prints EXACTLY
+     success_marker if and only if the input equals the flag; for any other input
+     it prints a DIFFERENT message (e.g. "Denied"). It must accept the correct
+     flag and reject wrong input — not always accept, not always reject.
+   - it MUST NOT print the flag or the plaintext secret under ANY input, and the
+     plaintext secret must NOT appear as a readable literal anywhere in
+     challenge_code. Running the program never hands over the flag: the player has
+     to RECOVER it from the binary, then can confirm it by typing it in.
 
 3. solver_code (the reference solution, proving a recovery path exists):
    - runs as: python solver.py <path-to-compiled-binary>
@@ -575,6 +581,15 @@ def _random_flag() -> str:
     return f"sloth{{{token}}}"
 
 
+def _distinct_random_flag(exclude: str) -> str:
+    """A random flag guaranteed different from `exclude` (used for the recover
+    flag-swap, so the independence check really builds a DIFFERENT challenge)."""
+    f = _random_flag()
+    while f == exclude:
+        f = _random_flag()
+    return f
+
+
 def _build_generation_prompt(
     user_prompt: str,
     difficulty: str,
@@ -656,7 +671,7 @@ def _write_challenge_files(base_dir: Path, data: dict[str, Any]) -> None:
         "challenge_kind": data.get("challenge_kind", "decode"),
         "target": data.get("target", DEFAULT_TARGET),
     }
-    if data.get("challenge_kind") == "check":
+    if data.get("challenge_kind") in ("check", "recover"):
         meta["success_marker"] = data.get("success_marker", "Access Granted")
     if data.get("challenge_kind") == "log":
         kept = data.get("tasks", [])
@@ -728,6 +743,7 @@ def _normalize_challenge(
         data.setdefault("category", category or "Reverse Engineering")
         data.setdefault("description", "Recover the flag by analysing the binary (do not just run it).")
         data["challenge_kind"] = "recover"
+        data.setdefault("success_marker", "Access Granted")
         data.setdefault("solution", "See organizer/solver.py for how the flag is recovered.")
         for k in ("encoder_code", "challenge_code"):
             if k in data:
@@ -1141,15 +1157,23 @@ def _run_solver_isolated(solver_code: str, artifact_host: Path, solver_backend: 
     with tempfile.TemporaryDirectory() as tmp:
         ws = Path(tmp)
         (ws / "solver.py").write_text(solver_code, encoding="utf-8")
-        artifact_rel = "artifact.bin"  # neutral name; not an executable path
-        dst = ws / artifact_rel
-        dst.write_bytes(artifact_host.read_bytes())
         try:
-            os.chmod(dst, 0o444)  # read-only, no execute bit (best-effort on Windows)
-        except OSError:
-            pass
-        try:
-            res = solver_backend.run_python(ws, "solver.py", [artifact_rel])
+            if hasattr(solver_backend, "run_solver"):
+                # Hardened path (Docker): solver workspace + artifact mounted
+                # read-only, only /tmp (noexec) writable — the solver cannot execute
+                # the binary, only read its bytes.
+                res = solver_backend.run_solver(ws, "solver.py", artifact_host)
+            else:
+                # Fallback (native, dev only): copy the artifact in read-only, no
+                # execute bit; best-effort isolation without a container.
+                artifact_rel = "artifact.bin"
+                dst = ws / artifact_rel
+                dst.write_bytes(artifact_host.read_bytes())
+                try:
+                    os.chmod(dst, 0o444)
+                except OSError:
+                    pass
+                res = solver_backend.run_python(ws, "solver.py", [artifact_rel])
         except Exception as exc:  # backend/infra failure, not a solver verdict
             return False, "", f"solver backend error: {type(exc).__name__}: {exc}"
         if res.timed_out:
@@ -1229,15 +1253,40 @@ def _verify_recover_challenge(base_dir: Path, data: dict[str, Any], backend: "Ex
                              "binary, so the solver has nothing to recover — ensure challenge_code "
                              "embeds and uses the array (do not let the compiler drop it).")
 
-    # 5. Non-triviality: running the challenge must NOT reveal the flag.
-    run = backend.run_binary(base_dir, challenge_rel, target)
-    if not run.timed_out:
-        combined = (run.stdout or "") + "\n" + (run.stderr or "")
+    # 5. The distributed program must actually WORK: it accepts the correct flag
+    #    (prints the marker) and rejects wrong input (does not), and never reveals
+    #    the flag. A crash/timeout, an always-accept or an always-reject program is
+    #    a failure — not a pass. (So we never bless a challenge just because the
+    #    solver works while the binary is unusable.)
+    marker = str(data.get("success_marker", "")).strip()
+    if not marker:
+        return AttemptResult(0, False, "no-marker",
+                             "a recover challenge needs a non-empty success_marker.")
+    if marker in expected or expected in marker:
+        return AttemptResult(0, False, "bad-marker", "success_marker must not contain the flag.")
+    good = backend.run_binary(base_dir, challenge_rel, target, stdin_text=expected + "\n")
+    bad = backend.run_binary(base_dir, challenge_rel, target,
+                             stdin_text="definitely_wrong_" + expected + "\n")
+    if good.timed_out or bad.timed_out:
+        return AttemptResult(0, False, "challenge-timeout", "the challenge did not finish in time.")
+    if not good.ok:
+        return AttemptResult(0, False, "challenge-crash", f"the challenge crashed on valid input: {good.stderr[:200]}")
+    if marker not in good.stdout:
+        return AttemptResult(0, False, "recover-rejects-correct",
+                             f"feeding the correct flag did not print the marker {marker!r} "
+                             f"(got {good.stdout.strip()[:120]!r}); the validator must accept the flag.")
+    if marker in bad.stdout:
+        return AttemptResult(0, False, "recover-accepts-wrong",
+                             "a wrong input also printed the success marker; the validator must only "
+                             "accept the exact flag (it must not ignore its input or always accept).")
+    # Non-triviality: no run may hand over the flag.
+    for label, r in (("valid", good), ("wrong", bad)):
+        combined = (r.stdout or "") + "\n" + (r.stderr or "")
         if expected in combined or (expected[6:-1] and expected[6:-1] in combined):
             return AttemptResult(0, False, "too-trivial",
-                                 "running the binary reveals the flag — that is a 'decode' "
-                                 "challenge, not 'recover'. The flag must require analysis, not "
-                                 "just execution.")
+                                 f"running the binary on {label} input reveals the flag — recover "
+                                 "challenges must hide it; the flag is obtained by analysis, not by "
+                                 "running the program.")
 
     # 6. The reference solver recovers the real flag from the artifact alone.
     ok, out, detail = _run_solver_isolated(solver_code, challenge_bin, solver_backend)
@@ -1252,7 +1301,8 @@ def _verify_recover_challenge(base_dir: Path, data: dict[str, Any], backend: "Ex
     #    model), built from the SAME template in a throwaway workspace, must be
     #    recovered by the SAME unmodified solver — and the two binaries must differ.
     swap = _recover_flag_swap(base_dir, template, data.get("encoder_code", ""), solver_code,
-                              backend, target, solver_backend, original_bin=challenge_bin)
+                              backend, target, solver_backend, original_bin=challenge_bin,
+                              original_flag=expected)
     if swap is not None:
         return swap
 
@@ -1262,15 +1312,14 @@ def _verify_recover_challenge(base_dir: Path, data: dict[str, Any], backend: "Ex
 
 def _recover_flag_swap(base_dir: Path, template: str, encoder_code: str, solver_code: str,
                        backend: "ExecutionBackend", target: "Target",
-                       solver_backend: "ExecutionBackend", original_bin: Path) -> AttemptResult | None:
+                       solver_backend: "ExecutionBackend", original_bin: Path,
+                       original_flag: str) -> AttemptResult | None:
     """Build the SAME challenge template with a fresh harness-chosen flag in a
     separate temp workspace, confirm the artifact really differs, and require the
     SAME solver to recover the new flag. Returns a failure AttemptResult or None.
     The original challenge directory is not modified."""
     import tempfile
-    flag2 = _random_flag()
-    if flag2 == template:  # degenerate guard; _random_flag is random so effectively never
-        flag2 = _random_flag()
+    flag2 = _distinct_random_flag(original_flag)  # guaranteed != the original flag
     with tempfile.TemporaryDirectory() as tmp:
         ws = Path(tmp)
         (ws / "organizer").mkdir(parents=True, exist_ok=True)

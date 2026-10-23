@@ -15,12 +15,21 @@ from slothctf.execution import NativeBackend
 
 
 class SchemaAndNormalizeTests(unittest.TestCase):
-    def test_schema_describes_recover_and_solver(self):
+    def test_schema_describes_recover_solver_and_marker(self):
         s = g._SCHEMA_RULES_RECOVER
         self.assertIn('"challenge_kind" : "recover"', s)
         self.assertIn('"solver_code"', s)
+        self.assertIn('"success_marker"', s)
         self.assertIn("MUST NOT print the flag", s)
         self.assertIn(g.ENCODED_PLACEHOLDER, s)
+
+    def test_distinct_random_flag_never_equals_exclude(self):
+        # Regression for the flag-swap bug: the second flag must differ from the
+        # original (it was wrongly compared to the challenge template before).
+        import unittest.mock as mock
+        seq = iter(["sloth{same}", "sloth{same}", "sloth{different}"])
+        with mock.patch.object(g, "_random_flag", side_effect=lambda: next(seq)):
+            self.assertEqual(g._distinct_random_flag("sloth{same}"), "sloth{different}")
 
     def test_normalize_recover_sets_kind_and_keeps_solver(self):
         data = g._normalize_challenge(

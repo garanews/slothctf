@@ -6,6 +6,7 @@
   "flag": "sloth{r3covered_from_pe}",
   "challenge_kind": "recover",
   "target": "pe",
+  "success_marker": "Correct",
   "generation": {
     "prompt": "recover xor",
     "genre": "recover",
