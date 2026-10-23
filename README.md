@@ -253,16 +253,30 @@ python main.py install-toolchain --dry-run   # print MinGW/MSYS2 steps
 python main.py install-toolchain             # attempt the install (Windows)
 ```
 
-## Security note
+## Targets and the execution sandbox
 
 SlothCTF **compiles and runs code written by the model** (C programs, and Python
-generators/extractors for the log genre), and the web GUI can trigger that from
-the browser. There is no sandbox: steps run as your user with ordinary process
-timeouts, not resource/syscall isolation. That's fine for local, single-user use
-with a trusted local model, which is the intended setup. If you expose it to
-others or run untrusted prompts/models, run it inside a container or VM with CPU,
-memory, filesystem and network limits. The web server binds to `127.0.0.1` by
-default; don't expose it on an untrusted network.
+generators/extractors for the log genre), so *where* that runs matters. Every such
+step goes through an **ExecutionBackend**, and generation/validation are **isolated
+by default with no silent fallback**.
+
+- **Targets are first-class and independent of your host OS:** `--target elf` (Linux
+  ELF) and `--target pe` (Windows PE `.exe`). The target is recorded in
+  `challenge.json`; older challenges are recognised from the binary's magic bytes.
+- **Isolated ELF** runs in a locked-down Docker container (no network, non-root,
+  read-only root fs + small tmpfs, CPU/RAM/PID/time/output caps, cleanup on error).
+  One-time: `python main.py sandbox-build`; check with `python main.py sandbox-check`.
+- **Windows PE** today builds via the host MinGW toolchain with an explicit
+  `--unsafe-native` opt-in (no isolation — development use). *Isolated* PE (MinGW +
+  Wine in a container) is the next phase.
+- If a (target, isolation) combination isn't available you get an explicit error —
+  SlothCTF never runs model code unsandboxed on its own, and never converts PE to ELF.
+
+**A container is not a VM** (it shares the host kernel). For hostile inputs, run
+SlothCTF inside a dedicated VM. The web GUI obeys the same rules and binds to
+`127.0.0.1`; don't expose it on an untrusted network. Full design and limits:
+[docs/sandbox-architecture.md](docs/sandbox-architecture.md); usage:
+[docs/sandbox.md](docs/sandbox.md).
 
 ## Roadmap
 
