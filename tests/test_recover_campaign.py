@@ -93,16 +93,26 @@ class HeuristicTests(unittest.TestCase):
             self.assertIn("xor", t["families"])
             self.assertIn("position_dependent", t["families"])
 
-    def test_naive_attacker_finds_single_xor(self):
+    def test_naive_attacker_recovers_exact_flag(self):
         blob = b"\x00\x01" + bytes(c ^ 0x5a for c in b"sloth{easy}") + b"\x02"
-        hit = camp.naive_attacker(blob)
-        self.assertIsNotNone(hit)
-        self.assertEqual(hit["flag"], "sloth{easy}")
+        hit = camp.naive_attacker(blob, "sloth{easy}")
+        self.assertTrue(hit["recovered_expected"])
+        self.assertEqual(hit["op"], "xor")
+
+    def test_naive_attacker_candidate_not_expected_is_not_shortcut(self):
+        # a single-XOR reveals SOME sloth{...} but NOT the expected flag -> not a
+        # shortcut (false positive avoided); the candidate is recorded instead.
+        blob = b"\x00" + bytes(c ^ 0x5a for c in b"sloth{other}") + b"\x00"
+        hit = camp.naive_attacker(blob, "sloth{the_real_one}")
+        self.assertFalse(hit["recovered_expected"])
+        self.assertIsNotNone(hit["candidate"])
+        self.assertEqual(hit["candidate"]["text"], "sloth{other}")
 
     def test_naive_attacker_misses_position_dependent(self):
         flag = b"sloth{not_single_op}"
         blob = b"junk" + bytes(((flag[i] + 7 * (i + 1)) ^ (0x3b + i)) & 0xFF for i in range(len(flag)))
-        self.assertIsNone(camp.naive_attacker(blob))
+        hit = camp.naive_attacker(blob, flag.decode())
+        self.assertFalse(hit["recovered_expected"])
 
     def test_entropy_bounds(self):
         self.assertEqual(camp._shannon_entropy(b""), 0.0)
@@ -134,9 +144,16 @@ class AggregateAnonymizeTests(unittest.TestCase):
         self.assertEqual(s["obvious_shortcuts"]["naive_single_op"], 1)
         self.assertEqual(s["category_counts"]["ok"], 2)
         self.assertEqual(s["success_by_difficulty"]["hard"], 50.0)
+        # per-scenario and failure-by-stage distributions
+        self.assertEqual(s["per_scenario"]["elf-easy"], {"ok": 1, "total": 1, "rate_pct": 100.0})
+        self.assertEqual(s["per_scenario"]["elf-hard"], {"ok": 0, "total": 1, "rate_pct": 0.0})
+        self.assertEqual(s["fail_stage_histogram"].get("solver-mismatch"), 1)
+        self.assertEqual(s["attempts_histogram"].get("2"), 2)
         md = camp.render_markdown(s)
-        self.assertIn("technical success rate", md)
-        self.assertIn("heuristic", md.lower())
+        self.assertIn("Technical metrics", md)
+        self.assertIn("Heuristics (NOT ground truth)", md)
+        self.assertIn("Success per scenario", md)
+        self.assertIn("Failure distribution by stage", md)
 
     def test_csv_roundtrip(self):
         with TemporaryDirectory() as tmp:
@@ -155,6 +172,28 @@ class AggregateAnonymizeTests(unittest.TestCase):
         # original untouched
         self.assertEqual(recs[0]["flag"], "sloth{a}")
         self.assertIn("platform", recs[0]["provenance"])
+
+    def test_anonymize_scrubs_flag_and_paths_from_diagnostics(self):
+        # flag + inner secret + Windows paths planted in diagnostic fields must all
+        # be scrubbed from the FULL anonymised JSONL, not just the `flag` field.
+        rec = {
+            "run_id": "elf-easy#rep1", "scenario": "elf-easy", "target": "elf",
+            "difficulty": "easy", "rep": 1, "success": False, "category": "model-reject",
+            "fail_stage": "solver-mismatch", "flag": "sloth{leaky_secret_123}",
+            "detail": "solver recovered 'sloth{leaky_secret_123}' at C:\\Users\\garan\\gen\\challenge.c",
+            "quality_error": "KeyError leaky_secret_123 while reading C:\\Temp\\x\\challenge.json",
+            "quality": {"naive_attacker": {"candidate": {"text": "sloth{leaky_secret_123}"}}},
+        }
+        anon = camp.anonymize([rec])
+        blob = json.dumps(anon[0])
+        self.assertNotIn("leaky_secret_123", blob)          # flag + inner gone everywhere
+        self.assertNotIn("sloth{leaky_secret_123}", blob)
+        self.assertNotIn("C:\\\\Users", json.dumps(anon[0]))  # windows paths redacted
+        self.assertNotIn("C:\\Temp", anon[0]["quality_error"])
+        self.assertIn("<flag>", anon[0]["detail"])
+        self.assertIn("<path>", anon[0]["detail"])
+        # raw record untouched
+        self.assertIn("leaky_secret_123", rec["detail"])
 
 
 class ReplayAndFailureTests(unittest.TestCase):
@@ -182,6 +221,25 @@ class ReplayAndFailureTests(unittest.TestCase):
                                      caller_factory=factory, log=lambda *a: None)
             self.assertEqual(recs[0]["category"], "infra")
             self.assertEqual(recs[0]["exception"], "RuntimeError")
+
+    def test_fingerprint_mismatch_refuses_resume(self):
+        with TemporaryDirectory() as tmp:
+            jsonl = Path(tmp) / "raw.jsonl"
+            factory = camp.replay_caller_factory({"*": [{"__raise__": "GenerationError", "msg": "x"}]})
+            camp.run_campaign(_one_scenario_campaign(), tmp, jsonl, caller_factory=factory, log=lambda *a: None)
+            # change the frozen prompt -> different fingerprint -> must refuse
+            changed = _one_scenario_campaign()
+            changed["scenarios"][0]["prompt"] = "a DIFFERENT prompt"
+            with self.assertRaises(RuntimeError):
+                camp.run_campaign(changed, tmp, jsonl, caller_factory=factory, log=lambda *a: None)
+
+    def test_torn_last_line_does_not_lose_records(self):
+        with TemporaryDirectory() as tmp:
+            p = Path(tmp) / "raw.jsonl"
+            p.write_text(json.dumps({"run_id": "a#rep1", "success": True}) + "\n"
+                         + '{"run_id": "b#rep1", "succ', encoding="utf-8")  # torn last line
+            recs = camp._read_records(p)
+            self.assertEqual([r["run_id"] for r in recs], ["a#rep1"])  # valid record kept
 
     def test_resume_skips_completed(self):
         with TemporaryDirectory() as tmp:

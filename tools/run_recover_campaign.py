@@ -67,18 +67,45 @@ def _git_commit() -> str | None:
         return None
 
 
+def _ollama_base(ollama_url: str) -> str:
+    base = ollama_url.rstrip("/")
+    if base.endswith("/api/generate"):
+        base = base[: -len("/api/generate")]
+    return base
+
+
 def _ollama_model_digest(model: str, ollama_url: str) -> str | None:
-    """Best effort: the model's digest from Ollama /api/show (None when offline)."""
+    """Best effort: the model's digest from Ollama. Tries /api/show, then falls back
+    to /api/tags (matching the model name). None when offline/unavailable."""
+    from urllib import request
+    base = _ollama_base(ollama_url)
     try:
-        from urllib import request
-        base = ollama_url.rstrip("/")
-        if base.endswith("/api/generate"):
-            base = base[: -len("/api/generate")]
         req = request.Request(base + "/api/show", data=json.dumps({"name": model}).encode(),
                               headers={"Content-Type": "application/json"}, method="POST")
         with request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
-        return (data.get("details", {}) or {}).get("digest") or data.get("digest")
+        dig = (data.get("details", {}) or {}).get("digest") or data.get("digest")
+        if dig:
+            return dig
+    except Exception:
+        pass
+    try:  # fallback: /api/tags lists local models with their digests
+        with request.urlopen(request.Request(base + "/api/tags"), timeout=10) as resp:
+            tags = json.loads(resp.read().decode()).get("models", [])
+        for m in tags:
+            if m.get("name") == model or m.get("model") == model:
+                return m.get("digest")
+    except Exception:
+        pass
+    return None
+
+
+def _docker_image_id(image: str) -> str | None:
+    """Best effort local image id (digest) for provenance; None if docker/image absent."""
+    try:
+        r = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", image],
+                           capture_output=True, text=True, timeout=15)
+        return r.stdout.strip() or None if r.returncode == 0 else None
     except Exception:
         return None
 
@@ -100,6 +127,43 @@ def provenance(model: str, ollama_url: str, online: bool) -> dict:
 # --------------------------------------------------------------------------- #
 def load_campaign(path: str | Path) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def campaign_fingerprint(campaign: dict, prov: dict) -> str:
+    """A stable hash of everything that defines the campaign: scenarios + prompts,
+    model, reps, max_attempts, inference params, tool version and code commit. On
+    resume a different fingerprint means a changed config/code and the runner
+    refuses to append to the same dataset."""
+    payload = {
+        "scenarios": [{k: sc.get(k) for k in ("id", "target", "difficulty", "prompt")}
+                      for sc in campaign.get("scenarios", [])],
+        "model": prov.get("model"),
+        "reps": campaign.get("reps"),
+        "max_attempts": campaign.get("max_attempts"),
+        "inference": prov.get("inference"),
+        "tool_version": prov.get("tool_version"),
+        "git_commit": prov.get("git_commit"),
+    }
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def _existing_fingerprint(jsonl_path: str | Path) -> str | None:
+    """The campaign_fp of the first readable record, or None for an empty/absent set."""
+    p = Path(jsonl_path)
+    if not p.exists():
+        return None
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if "campaign_fp" in rec:
+            return rec["campaign_fp"]
+    return None
 
 
 def run_specs(campaign: dict) -> list[dict]:
@@ -184,20 +248,26 @@ def _shannon_entropy(data: bytes) -> float:
     return round(-sum((c / n) * math.log2(c / n) for c in counts if c), 3)
 
 
-def naive_attacker(blob: bytes) -> dict | None:
+def naive_attacker(blob: bytes, expected: str) -> dict:
     """A deliberately WEAK attacker: try every single-byte XOR and every single-byte
-    ADD over the whole binary and look for a sloth{...}. If it finds the flag, the
-    challenge is a trivial single-op obfuscation (an obvious shortcut). Failing to
-    find it does NOT mean the challenge is hard — it only rules out the laziest attack."""
+    ADD over the whole binary. A shortcut counts ONLY when the EXACT expected flag is
+    recovered — a stray `sloth{...}` that is not the real flag is recorded as a
+    `candidate` but is NOT a shortcut (it would be a false positive). Failing to
+    recover the flag does NOT mean the challenge is hard — it only rules out the
+    laziest attack."""
     pat = re.compile(rb"sloth\{[ -~]{1,62}\}")
+    exp = expected.encode("utf-8")
+    candidate = None
     for k in range(256):
-        m = pat.search(bytes(b ^ k for b in blob))
-        if m:
-            return {"op": "xor", "key": k, "flag": m.group().decode("latin1")}
-        m = pat.search(bytes((b - k) & 0xFF for b in blob))
-        if m:
-            return {"op": "add", "key": k, "flag": m.group().decode("latin1")}
-    return None
+        for op, x in (("xor", bytes(b ^ k for b in blob)),
+                      ("add", bytes((b - k) & 0xFF for b in blob))):
+            if exp and exp in x:
+                return {"recovered_expected": True, "op": op, "key": k}
+            if candidate is None:
+                m = pat.search(x)
+                if m:
+                    candidate = {"op": op, "key": k, "text": m.group().decode("latin1")}
+    return {"recovered_expected": False, "op": None, "key": None, "candidate": candidate}
 
 
 def analyze_quality(challenge_dir: Path, flag: str, artifact_rel: str) -> dict:
@@ -212,8 +282,8 @@ def analyze_quality(challenge_dir: Path, flag: str, artifact_rel: str) -> dict:
             out["strings_shortcut"] = bool(_flag_leaks_recover(binp, flag))
         except OSError:
             out["strings_shortcut"] = None
-        na = naive_attacker(blob)
-        out["naive_attacker_shortcut"] = na is not None
+        na = naive_attacker(blob, flag)
+        out["naive_attacker_shortcut"] = bool(na.get("recovered_expected"))
         out["naive_attacker"] = na
     else:
         out["binary_present"] = False
@@ -240,10 +310,13 @@ def run_one(spec: dict, out_dir: Path, *, caller, model: str, ollama_url: str,
     run_dir = Path(out_dir) / spec["run_id"].replace("#", "_")
     run_dir.mkdir(parents=True, exist_ok=True)
     name = "ch_" + spec["run_id"].replace("#", "_").replace("-", "_")
+    backend = _backend_for(sc["target"])
     record = {
         "run_id": spec["run_id"], "scenario": sc["id"], "target": sc["target"],
         "difficulty": sc["difficulty"], "rep": spec["rep"],
         "provenance": prov, "timestamp": time.time(),
+        "backend": backend.name, "image": getattr(backend, "image", None),
+        "image_id": _docker_image_id(getattr(backend, "image", "")),
     }
     prev = os.getcwd()
     os.chdir(run_dir)
@@ -251,7 +324,7 @@ def run_one(spec: dict, out_dir: Path, *, caller, model: str, ollama_url: str,
     try:
         report = generate_challenge(
             name, prompt=sc["prompt"], genre="recover", difficulty=sc["difficulty"],
-            target=sc["target"], backend=_backend_for(sc["target"]),
+            target=sc["target"], backend=backend,
             model=model, ollama_url=ollama_url, caller=caller,
             max_attempts=max_attempts, return_report=True)
         record["success"] = bool(report.success)
@@ -298,6 +371,14 @@ def run_campaign(campaign: dict, out_dir: str | Path, jsonl_path: str | Path, *,
     max_attempts = int(campaign.get("max_attempts", 3))
     online = (caller_factory is None) if online is None else online
     prov = provenance(model, ollama_url, online)
+    fp = campaign_fingerprint(campaign, prov)
+
+    existing_fp = _existing_fingerprint(jsonl_path)
+    if existing_fp is not None and existing_fp != fp:
+        raise RuntimeError(
+            f"campaign fingerprint mismatch: the dataset {jsonl_path} was produced with a "
+            f"different configuration/code (existing {existing_fp}, current {fp}). Refusing to "
+            "mix configurations in one dataset — start a new JSONL (and bump scenarios 'version').")
 
     done = completed_run_ids(jsonl_path)
     specs = [s for s in run_specs(campaign) if s["run_id"] not in done]
@@ -311,6 +392,7 @@ def run_campaign(campaign: dict, out_dir: str | Path, jsonl_path: str | Path, *,
         caller = caller_factory(spec) if caller_factory else None
         record = run_one(spec, Path(out_dir), caller=caller, model=model,
                          ollama_url=ollama_url, max_attempts=max_attempts, prov=prov)
+        record["campaign_fp"] = fp
         append_record(jsonl_path, record)   # recorded only after it completed
         produced.append(record)
         log(f"    -> {record['category']} ({record.get('fail_stage') or 'passed'}, "
@@ -362,6 +444,21 @@ def aggregate(records: list[dict]) -> dict:
         if r.get("success"):
             by_target[r["target"]][0] += 1
             by_diff[r["difficulty"]][0] += 1
+    per_scenario: dict[str, list[int]] = {}
+    fail_stage_hist: dict[str, int] = {}
+    attempts_hist: dict[str, int] = {}
+    for r in records:
+        sid = r.get("scenario", "?")
+        per_scenario.setdefault(sid, [0, 0])
+        per_scenario[sid][1] += 1
+        if r.get("success"):
+            per_scenario[sid][0] += 1
+        else:
+            fs = r.get("fail_stage") or "unknown"
+            fail_stage_hist[fs] = fail_stage_hist.get(fs, 0) + 1
+        if "attempts_used" in r:
+            key = str(r["attempts_used"])
+            attempts_hist[key] = attempts_hist.get(key, 0) + 1
     fam_hist: dict[str, int] = {}
     strings_short = naive_short = 0
     for r in ok:
@@ -377,8 +474,12 @@ def aggregate(records: list[dict]) -> dict:
         "total_runs": total,
         "success_rate_pct": _rate(len(ok), total),
         "category_counts": by_cat,
+        "per_scenario": {s: {"ok": v[0], "total": v[1], "rate_pct": _rate(v[0], v[1])}
+                         for s, v in sorted(per_scenario.items())},
         "success_by_target": {t: _rate(v[0], v[1]) for t, v in sorted(by_target.items())},
         "success_by_difficulty": {d: _rate(v[0], v[1]) for d, v in sorted(by_diff.items())},
+        "fail_stage_histogram": dict(sorted(fail_stage_hist.items(), key=lambda kv: -kv[1])),
+        "attempts_histogram": dict(sorted(attempts_hist.items())),
         "transform_family_histogram": dict(sorted(fam_hist.items(), key=lambda kv: -kv[1])),
         "distinct_family_signatures": len(fam_hist),
         "variety_ratio": round(len(fam_hist) / len(ok), 3) if ok else 0.0,
@@ -393,19 +494,34 @@ def render_markdown(summary: dict) -> str:
     L = ["# recover campaign — aggregate report", "",
          f"Runs: **{summary['total_runs']}**  ·  technical success rate: "
          f"**{summary['success_rate_pct']}%**", "",
-         "> Heuristic measures below (transform family, shortcuts) are labelled heuristics. "
-         "A challenge is not 'hard' just because the naive attacker failed; real difficulty "
-         "comes from the human playtest scorecard.", "",
-         "## Outcomes", ""]
+         "---", "", "# Technical metrics", "", "## Outcomes", ""]
     for k, v in summary["category_counts"].items():
         L.append(f"- {k}: {v}")
+    L += ["", "## Success per scenario (target × difficulty)", "",
+          "| scenario | ok / total | rate |", "|---|---|---|"]
+    for s, v in summary["per_scenario"].items():
+        L.append(f"| {s} | {v['ok']}/{v['total']} | {v['rate_pct']}% |")
     L += ["", "## Success by target", ""]
     for t, r in summary["success_by_target"].items():
         L.append(f"- {t}: {r}%")
     L += ["", "## Success by difficulty", ""]
     for d, r in summary["success_by_difficulty"].items():
         L.append(f"- {d}: {r}%")
-    L += ["", "## Transform variety (heuristic)", "",
+    L += ["", "## Failure distribution by stage", ""]
+    if summary["fail_stage_histogram"]:
+        L += ["| stage | count |", "|---|---|"]
+        for stg, c in summary["fail_stage_histogram"].items():
+            L.append(f"| {stg} | {c} |")
+    else:
+        L.append("- (no failures)")
+    L += ["", "## Attempts used (distribution)", ""]
+    for a, c in summary["attempts_histogram"].items():
+        L.append(f"- {a} attempt(s): {c}")
+    L += [f"", f"Mean attempts: {summary['mean_attempts']}  ·  mean time: {summary['mean_time_s']}s", "",
+          "---", "", "# Heuristics (NOT ground truth)", "",
+          "> A challenge is not 'hard' just because the naive attacker failed; these are "
+          "signals only. Real difficulty/interest comes from the human playtest scorecard.", "",
+          "## Transform variety (heuristic)", "",
           f"Distinct family signatures: **{summary['distinct_family_signatures']}** over "
           f"{summary['obvious_shortcuts']['of_successful']} successful "
           f"(variety ratio {summary['variety_ratio']}).", "",
@@ -415,8 +531,8 @@ def render_markdown(summary: dict) -> str:
     sc = summary["obvious_shortcuts"]
     L += ["", "## Obvious shortcuts (heuristic)", "",
           f"- recoverable by `strings`: {sc['strings']}/{sc['of_successful']}",
-          f"- recoverable by a single-byte XOR/ADD sweep: {sc['naive_single_op']}/{sc['of_successful']}",
-          "", f"Mean attempts: {summary['mean_attempts']}  ·  mean time: {summary['mean_time_s']}s", ""]
+          f"- recoverable by a single-byte XOR/ADD sweep (exact flag): "
+          f"{sc['naive_single_op']}/{sc['of_successful']}", ""]
     return "\n".join(L)
 
 
@@ -446,19 +562,48 @@ def write_csv(records: list[dict], path: str | Path) -> None:
 # --------------------------------------------------------------------------- #
 # Anonymisation for publication (never alters the original dataset)
 # --------------------------------------------------------------------------- #
+_WIN_PATH_RE = re.compile(r"[A-Za-z]:\\\\[^\s\"']+|[A-Za-z]:\\[^\s\"']+")
+
+
+def _scrub_text(s: str, secrets: list[str]) -> str:
+    """Redact known secrets (flag + inner) and local Windows paths from a string."""
+    for sec in secrets:
+        if sec and len(sec) >= 3:
+            s = s.replace(sec, "<flag>")
+    return _WIN_PATH_RE.sub("<path>", s)
+
+
+def _scrub(obj, secrets: list[str]):
+    if isinstance(obj, str):
+        return _scrub_text(obj, secrets)
+    if isinstance(obj, list):
+        return [_scrub(x, secrets) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _scrub(v, secrets) for k, v in obj.items()}
+    return obj
+
+
 def anonymize(records: list[dict]) -> list[dict]:
-    """Return publication-safe copies: no local paths, no plaintext flags, no host
-    details. Metrics and categories are preserved. The original dataset is untouched."""
+    """Return publication-safe copies: the plaintext flag is hashed, and the flag
+    (and its inner secret) plus any local Windows path are redacted from EVERY
+    string field — including detail, quality_error and the naive-attacker candidate —
+    not just the top-level `flag`. Host details are dropped. Metrics and categories
+    are preserved. The original dataset is never mutated."""
     out = []
     for r in records:
-        c = json.loads(json.dumps(r))  # deep copy
-        if "flag" in c:
-            c["flag"] = "sha256:" + hashlib.sha256(c["flag"].encode()).hexdigest()[:12]
-        q = c.get("quality", {})
-        if isinstance(q.get("naive_attacker"), dict) and "flag" in q["naive_attacker"]:
-            q["naive_attacker"]["flag"] = "<redacted>"
+        c = json.loads(json.dumps(r))  # deep copy; original untouched
+        flag = r.get("flag", "")
+        secrets = [flag]
+        m = re.match(r"sloth\{(.*)\}$", flag or "")
+        if m and m.group(1):
+            secrets.append(m.group(1))
+        c = _scrub(c, secrets)  # redact flag/paths everywhere first
+        if flag:
+            c["flag"] = "sha256:" + hashlib.sha256(flag.encode()).hexdigest()[:12]  # then hash the field
+        c.pop("directory", None)
         prov = c.get("provenance", {})
-        prov.pop("platform", None)  # host detail
+        if isinstance(prov, dict):
+            prov.pop("platform", None)  # host detail
         out.append(c)
     return out
 
@@ -467,7 +612,18 @@ def anonymize(records: list[dict]) -> list[dict]:
 # CLI
 # --------------------------------------------------------------------------- #
 def _read_records(jsonl_path: str | Path) -> list[dict]:
-    return [json.loads(l) for l in Path(jsonl_path).read_text(encoding="utf-8").splitlines() if l.strip()]
+    """Read all valid JSONL records, skipping blank lines and a torn final line
+    (a hard interruption can leave one) without losing earlier valid records."""
+    recs = []
+    lines = [l for l in Path(jsonl_path).read_text(encoding="utf-8").splitlines() if l.strip()]
+    for i, line in enumerate(lines):
+        try:
+            recs.append(json.loads(line))
+        except Exception:
+            if i == len(lines) - 1:
+                break  # tolerate only a damaged LAST line
+            raise ValueError(f"corrupt JSONL record at line {i + 1} (not the last line)")
+    return recs
 
 
 def main(argv=None):

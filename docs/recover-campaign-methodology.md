@@ -26,7 +26,16 @@ verifiers and backends **unchanged**.
 - The dataset is an **append-only JSONL**; the runner is **resumable** (it skips
   run_ids already present), so an interrupted campaign neither duplicates nor loses
   results. Records are written only after a run completes; an interruption mid-run
-  simply re-runs that one on resume.
+  simply re-runs that one on resume. A torn final line (from a hard kill) is
+  tolerated on read without losing earlier valid records.
+- Each record carries a **campaign fingerprint** (a hash of scenarios + prompts +
+  model + reps + max_attempts + inference params + tool version + git commit). On
+  resume, if the current fingerprint does not match the dataset's, the runner
+  **refuses with an explicit error** rather than mixing configurations/code into one
+  dataset — bump `version` and start a new JSONL instead.
+- Provenance also records the **backend** actually used and, when available, the
+  **Docker image id**; the model digest is read from Ollama `/api/show` with a
+  fallback to `/api/tags`.
 
 ## What is recorded per run
 
@@ -48,7 +57,9 @@ heuristics, never as ground truth:
   successful set.
 - **Obvious shortcuts** — whether the plaintext flag is recoverable by a `strings`
   scan (UTF-8/UTF-16LE), or by a **single-byte XOR/ADD sweep** of the whole binary.
-  These catch the laziest attacks only.
+  A sweep counts as a shortcut ONLY when it recovers the **exact expected flag**; a
+  stray `sloth{...}` that is not the real flag is recorded as a `candidate`, not a
+  shortcut (false positives are not counted). These catch the laziest attacks only.
 - **Structural** — binary size and byte entropy.
 
 **Important:** a challenge is **not** labelled hard because the naive attacker
@@ -85,7 +96,12 @@ exactly that variety across real generations is the point of this campaign.
 
 - **Raw dataset** (JSONL) is kept **locally** and is the source of truth; it contains
   the plaintext flags and local paths and is not published.
-- **Aggregate report** (Markdown) and **CSV** are produced by `aggregate`.
-- **Publication** uses `anonymize`, which writes a separate copy with flags hashed,
-  host details dropped and recovered-flag fields redacted — **without altering the
-  original dataset**. Scrubbed, publishable datasets live under `campaign/`.
+- **Aggregate report** (Markdown) and **CSV** are produced by `aggregate`. The report
+  keeps **technical metrics** (success per scenario — all six target × difficulty —
+  by target, by difficulty, failure distribution by stage, attempts used) clearly
+  separated from the **heuristics** (variety, shortcuts).
+- **Publication** uses `anonymize`, which writes a separate copy with the flag hashed
+  and the flag (plus its inner secret) and any local Windows path **redacted from
+  every string field** — `detail`, `quality_error`, the naive-attacker candidate,
+  everything — not just the top-level `flag`. Host details are dropped. It **never
+  alters the original dataset**. Scrubbed, publishable datasets live under `campaign/`.
