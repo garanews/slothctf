@@ -240,6 +240,50 @@ class ReplayAndFailureTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 camp.run_campaign(changed, tmp, jsonl, caller_factory=factory, log=lambda *a: None)
 
+    def test_fingerprint_depends_on_model_digest(self):
+        # Same model NAME, different DIGEST (weights re-pulled under the same tag) ->
+        # different fingerprint, so the runner will not mix them in one dataset.
+        campaign = _one_scenario_campaign()
+        prov_a = {"model": "qwen2.5-coder:32b", "model_digest": "sha256:aaaa",
+                  "inference": {"temperature": 0.7}, "tool_version": "1.0", "git_commit": "c0"}
+        prov_b = dict(prov_a, model_digest="sha256:bbbb")  # only the digest changes
+        self.assertNotEqual(camp.campaign_fingerprint(campaign, prov_a),
+                            camp.campaign_fingerprint(campaign, prov_b))
+
+    def test_model_digest_change_blocks_resume(self):
+        # End-to-end: a dataset produced with digest A must refuse to resume once the
+        # same tag resolves to digest B (the model was updated under us).
+        with TemporaryDirectory() as tmp:
+            jsonl = Path(tmp) / "raw.jsonl"
+            factory = camp.replay_caller_factory({"*": [{"__raise__": "GenerationError", "msg": "x"}]})
+            orig = camp._ollama_model_digest
+            try:
+                camp._ollama_model_digest = lambda model, url: "sha256:AAAA"
+                camp.run_campaign(_one_scenario_campaign(), tmp, jsonl,
+                                  caller_factory=factory, online=True, log=lambda *a: None)
+                camp._ollama_model_digest = lambda model, url: "sha256:BBBB"  # re-pulled
+                with self.assertRaises(RuntimeError):
+                    camp.run_campaign(_one_scenario_campaign(), tmp, jsonl,
+                                      caller_factory=factory, online=True, log=lambda *a: None)
+            finally:
+                camp._ollama_model_digest = orig
+
+    def test_online_campaign_requires_model_digest(self):
+        # Online but the digest cannot be resolved -> refuse to start rather than
+        # record runs that are not fully identifiable.
+        with TemporaryDirectory() as tmp:
+            jsonl = Path(tmp) / "raw.jsonl"
+            factory = camp.replay_caller_factory({"*": [{"__raise__": "GenerationError", "msg": "x"}]})
+            orig = camp._ollama_model_digest
+            try:
+                camp._ollama_model_digest = lambda model, url: None  # unavailable
+                with self.assertRaises(RuntimeError):
+                    camp.run_campaign(_one_scenario_campaign(), tmp, jsonl,
+                                      caller_factory=factory, online=True, log=lambda *a: None)
+                self.assertFalse(jsonl.exists())  # nothing recorded
+            finally:
+                camp._ollama_model_digest = orig
+
     def test_torn_last_line_does_not_lose_records(self):
         with TemporaryDirectory() as tmp:
             p = Path(tmp) / "raw.jsonl"
@@ -270,6 +314,20 @@ class ReplayAndFailureTests(unittest.TestCase):
             original = (json.dumps({"run_id": "a#rep1"}) + "\n"
                         + '{"run_id": "b#re\n'                       # corrupt MIDDLE line
                         + json.dumps({"run_id": "c#rep1"}) + "\n")   # valid record after it
+            p.write_text(original, encoding="utf-8")
+            before = p.read_bytes()
+            with self.assertRaises(ValueError):
+                camp.repair_jsonl(p)
+            self.assertEqual(p.read_bytes(), before)  # not modified at all
+
+    def test_repair_refuses_complete_but_invalid_final_line(self):
+        # An unparseable FINAL line that IS newline-terminated is a complete, corrupt
+        # record — a crash could not have written that terminating newline — so it is
+        # real corruption, not a torn fragment: raise and leave the file untouched.
+        with TemporaryDirectory() as tmp:
+            p = Path(tmp) / "raw.jsonl"
+            original = (json.dumps({"run_id": "a#rep1"}) + "\n"
+                        + '{"run_id": "b#re\n')          # invalid BUT newline-terminated
             p.write_text(original, encoding="utf-8")
             before = p.read_bytes()
             with self.assertRaises(ValueError):
