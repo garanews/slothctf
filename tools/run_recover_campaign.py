@@ -132,13 +132,16 @@ def load_campaign(path: str | Path) -> dict:
 
 def campaign_fingerprint(campaign: dict, prov: dict) -> str:
     """A stable hash of everything that defines the campaign: scenarios + prompts,
-    model, reps, max_attempts, inference params, tool version and code commit. On
-    resume a different fingerprint means a changed config/code and the runner
-    refuses to append to the same dataset."""
+    model NAME and DIGEST, reps, max_attempts, inference params, tool version and
+    code commit. The digest pins the actual weights, so a model re-pulled under the
+    same tag (same name, different digest) changes the fingerprint. On resume a
+    different fingerprint means a changed config/code/model and the runner refuses
+    to append to the same dataset."""
     payload = {
         "scenarios": [{k: sc.get(k) for k in ("id", "target", "difficulty", "prompt")}
                       for sc in campaign.get("scenarios", [])],
         "model": prov.get("model"),
+        "model_digest": prov.get("model_digest"),  # the ACTUAL weights, not just the tag
         "reps": campaign.get("reps"),
         "max_attempts": campaign.get("max_attempts"),
         "inference": prov.get("inference"),
@@ -199,25 +202,54 @@ def completed_run_ids(jsonl_path: str | Path) -> set[str]:
 def repair_jsonl(jsonl_path: str | Path) -> int:
     """Make the dataset safe to append to after a crash: drop a torn trailing
     fragment (an incomplete final line, or any trailing bytes not terminated by a
-    newline) so the next append starts on a clean line, WITHOUT losing any complete
-    record. Returns the number of valid records kept. Rewrites only if a repair is
-    needed, via a temp file + atomic replace so the repair itself is crash-safe."""
+    newline) so the next append starts on a clean line, WITHOUT losing or altering
+    any complete record.
+
+    ONLY a torn, UNTERMINATED final fragment may be repaired. A crash during
+    `append_record` can leave at most one half-written line, and it is always the
+    last one — and because the terminating newline is written last, that fragment
+    never ends in a newline. So the sole repairable case is an unparseable final
+    line with no trailing newline. Any other unparseable line is real corruption,
+    not a crash artefact, and repair_jsonl raises ValueError leaving the file
+    byte-for-byte untouched:
+    - a line that fails to parse ANYWHERE BEFORE THE END (mid-dataset damage);
+    - a final line that fails to parse but IS newline-terminated (a complete,
+      corrupt record — a crash could not have written that newline).
+
+    Returns the number of valid records kept. Rewrites only if a repair is needed,
+    via a temp file + atomic replace so the repair itself is crash-safe."""
     p = Path(jsonl_path)
     if not p.exists():
         return 0
     raw = p.read_text(encoding="utf-8")
+    if raw == "":
+        return 0
+    lines = raw.split("\n")
+    # Index of the last non-empty line: only THAT line can be a torn fragment, and
+    # only when the file is unterminated (a crash cannot have written the newline).
+    last_content = max((i for i, line in enumerate(lines) if line != ""), default=-1)
+    unterminated = not raw.endswith("\n")
     kept: list[str] = []
-    torn = False
-    for line in raw.split("\n"):
+    torn_tail = False
+    for i, line in enumerate(lines):
         if line == "":
             continue
         try:
             json.loads(line)
             kept.append(line)
         except Exception:
-            torn = True  # a damaged fragment (only ever the trailing one in practice)
-    # Repair if anything was damaged, or the file did not end on a clean newline.
-    if torn or (raw and not raw.endswith("\n")):
+            if i == last_content and unterminated:
+                torn_tail = True  # the single half-written final append — safe to drop
+            else:
+                why = ("it is newline-terminated, so it is a complete record, not a "
+                       "half-written crash fragment" if i == last_content
+                       else "it is in the middle of the dataset, not the final line")
+                raise ValueError(
+                    f"corrupt JSON at line {i + 1} of {p}: refusing to repair ({why}). This "
+                    "is real data corruption, not a crash artefact; the file is left untouched. "
+                    "Inspect or restore it manually before resuming.")
+    # Repair if the trailing fragment was torn, or the file did not end on a clean newline.
+    if torn_tail or not raw.endswith("\n"):
         tmp = p.with_suffix(p.suffix + ".repair")
         tmp.write_text(("".join(l + "\n" for l in kept)), encoding="utf-8")
         with tmp.open("r+", encoding="utf-8") as fh:
@@ -415,6 +447,11 @@ def run_campaign(campaign: dict, out_dir: str | Path, jsonl_path: str | Path, *,
     max_attempts = int(campaign.get("max_attempts", 3))
     online = (caller_factory is None) if online is None else online
     prov = provenance(model, ollama_url, online)
+    if online and not prov.get("model_digest"):
+        raise RuntimeError(
+            f"model digest unavailable for '{model}' at {ollama_url}: refusing to start an "
+            "online campaign whose runs could not be fully identified. Check the Ollama "
+            "endpoint is reachable and the model is pulled (ollama show / ollama pull).")
     fp = campaign_fingerprint(campaign, prov)
 
     repair_jsonl(jsonl_path)  # crash-safe: drop a torn trailing line before appending
