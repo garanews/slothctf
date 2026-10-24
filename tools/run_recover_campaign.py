@@ -199,25 +199,46 @@ def completed_run_ids(jsonl_path: str | Path) -> set[str]:
 def repair_jsonl(jsonl_path: str | Path) -> int:
     """Make the dataset safe to append to after a crash: drop a torn trailing
     fragment (an incomplete final line, or any trailing bytes not terminated by a
-    newline) so the next append starts on a clean line, WITHOUT losing any complete
-    record. Returns the number of valid records kept. Rewrites only if a repair is
-    needed, via a temp file + atomic replace so the repair itself is crash-safe."""
+    newline) so the next append starts on a clean line, WITHOUT losing or altering
+    any complete record.
+
+    ONLY the final fragment may be repaired. A crash during `append_record` can
+    leave at most one half-written line, and it is always the last one. A line that
+    fails to parse ANYWHERE BEFORE THE END is therefore not a crash artefact — it is
+    real corruption in the middle of the dataset, and silently dropping it would be
+    undetected data loss. In that case repair_jsonl raises ValueError and leaves the
+    file byte-for-byte untouched, so the damage is surfaced instead of masked.
+
+    Returns the number of valid records kept. Rewrites only if a repair is needed,
+    via a temp file + atomic replace so the repair itself is crash-safe."""
     p = Path(jsonl_path)
     if not p.exists():
         return 0
     raw = p.read_text(encoding="utf-8")
+    if raw == "":
+        return 0
+    lines = raw.split("\n")
+    # Index of the last non-empty line: only THAT line is allowed to be torn.
+    last_content = max((i for i, line in enumerate(lines) if line != ""), default=-1)
     kept: list[str] = []
-    torn = False
-    for line in raw.split("\n"):
+    torn_tail = False
+    for i, line in enumerate(lines):
         if line == "":
             continue
         try:
             json.loads(line)
             kept.append(line)
         except Exception:
-            torn = True  # a damaged fragment (only ever the trailing one in practice)
-    # Repair if anything was damaged, or the file did not end on a clean newline.
-    if torn or (raw and not raw.endswith("\n")):
+            if i == last_content:
+                torn_tail = True  # the single half-written final append — safe to drop
+            else:
+                raise ValueError(
+                    f"corrupt JSON at line {i + 1} of {p} (not the final line): refusing to "
+                    "repair. A damaged record in the middle of the dataset is real data loss, "
+                    "not a crash artefact; the file is left untouched. Inspect or restore it "
+                    "manually before resuming.")
+    # Repair if the trailing fragment was torn, or the file did not end on a clean newline.
+    if torn_tail or not raw.endswith("\n"):
         tmp = p.with_suffix(p.suffix + ".repair")
         tmp.write_text(("".join(l + "\n" for l in kept)), encoding="utf-8")
         with tmp.open("r+", encoding="utf-8") as fh:

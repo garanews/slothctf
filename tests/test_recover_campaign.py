@@ -261,6 +261,51 @@ class ReplayAndFailureTests(unittest.TestCase):
             self.assertNotIn("c#re", text)                # torn fragment gone
             self.assertEqual([r["run_id"] for r in camp._read_records(p)], ["a#rep1", "b#rep1"])
 
+    def test_repair_refuses_middle_corruption_and_leaves_file_untouched(self):
+        # A corrupt line BEFORE the end is real data loss, not a crash artefact:
+        # repair_jsonl must raise and leave the dataset byte-for-byte unchanged
+        # (never silently drop a record from the middle).
+        with TemporaryDirectory() as tmp:
+            p = Path(tmp) / "raw.jsonl"
+            original = (json.dumps({"run_id": "a#rep1"}) + "\n"
+                        + '{"run_id": "b#re\n'                       # corrupt MIDDLE line
+                        + json.dumps({"run_id": "c#rep1"}) + "\n")   # valid record after it
+            p.write_text(original, encoding="utf-8")
+            before = p.read_bytes()
+            with self.assertRaises(ValueError):
+                camp.repair_jsonl(p)
+            self.assertEqual(p.read_bytes(), before)  # not modified at all
+
+    def test_repair_leaves_valid_records_unchanged(self):
+        # A clean, complete dataset must be returned intact: every valid record
+        # kept and the bytes untouched (no spurious rewrite).
+        with TemporaryDirectory() as tmp:
+            p = Path(tmp) / "raw.jsonl"
+            content = (json.dumps({"run_id": "a#rep1", "success": True}) + "\n"
+                       + json.dumps({"run_id": "b#rep1", "success": False}) + "\n")
+            p.write_text(content, encoding="utf-8")
+            before = p.read_bytes()
+            kept = camp.repair_jsonl(p)
+            self.assertEqual(kept, 2)
+            self.assertEqual(p.read_bytes(), before)  # valid records byte-for-byte intact
+            self.assertEqual([r["run_id"] for r in camp._read_records(p)], ["a#rep1", "b#rep1"])
+
+    def test_run_campaign_refuses_to_resume_middle_corrupted_dataset(self):
+        # run_campaign repairs before resuming; a mid-dataset corruption must abort
+        # the whole run (nothing generated, dataset left untouched) rather than
+        # resume on top of silently dropped records.
+        with TemporaryDirectory() as tmp:
+            jsonl = Path(tmp) / "raw.jsonl"
+            original = ('{"run_id": "elf-easy#rep1", "corru\n'                     # corrupt middle
+                        + json.dumps({"run_id": "elf-easy#rep2", "success": True}) + "\n")
+            jsonl.write_text(original, encoding="utf-8")
+            before = jsonl.read_bytes()
+            factory = camp.replay_caller_factory({"*": [{"__raise__": "GenerationError", "msg": "x"}]})
+            with self.assertRaises(ValueError):
+                camp.run_campaign(_one_scenario_campaign(reps=2), tmp, jsonl,
+                                  caller_factory=factory, log=lambda *a: None)
+            self.assertEqual(jsonl.read_bytes(), before)  # untouched, no runs appended
+
     def test_crash_safe_resume_end_to_end(self):
         # A valid record + a truncated final line, then resume: both complete records
         # readable afterwards, the missing run is executed once, no duplicate run_id.
