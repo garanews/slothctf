@@ -74,6 +74,7 @@ class AttemptResult:
     ok: bool
     stage: str  # which check failed (or "passed")
     detail: str = ""
+    diagnostics: dict = field(default_factory=dict)  # non-fatal signals (e.g. byte contiguity)
 
 
 @dataclass
@@ -412,8 +413,22 @@ HARD REQUIREMENTS (breaking any is rejected and sent back to you to fix):
    - compiles with: gcc -O2 -s -o challenge challenge.c
    - contains the EXACT token %(ph)s where the embedded byte array is initialised
      (the machine substitutes the encoder's output there — put NO numbers there);
-   - MUST embed and use that array so the obfuscated flag really is present in the
-     compiled binary (that is what the solver recovers from).
+   - declare that array as `static const unsigned char NAME[] = { %(ph)s };` at FILE
+     SCOPE (outside every function) and actually USE it in the comparison. File-scope
+     `static const` keeps the bytes together in the binary's data section, where the
+     solver can find them. An array declared as a local/automatic variable inside a
+     function is often compiled to scattered per-byte immediate stores, so the
+     sequence is NOT contiguous and is much harder to recover — avoid that. Do not
+     let the compiler drop the array.
+   - size every buffer correctly. To compare the typed input against decoded bytes,
+     either compare a known length with `memcmp(a, b, len)`, or make the decoded
+     string NUL-terminated before using `strcmp`/`strcpy`. A buffer sized to exactly
+     the raw byte count has NO terminator, so `strcmp` reads past it (undefined
+     behaviour that can wrongly reject the correct flag).
+   - use only C and headers available on the BUILD TARGET stated above. For a Linux
+     ELF target do NOT include <windows.h> or call Win32 APIs; for a Windows PE target
+     do NOT use POSIX-only headers. Prefer portable standard C (stdio.h, string.h,
+     stdint.h).
    - reads ONE line from stdin, strips the trailing newline, and prints EXACTLY
      success_marker if and only if the input equals the flag; for any other input
      it prints a DIFFERENT message (e.g. "Denied"). It must accept the correct
@@ -431,6 +446,9 @@ HARD REQUIREMENTS (breaking any is rejected and sent back to you to fix):
      must NOT read any other file (no challenge.json, no source, no encoder), and
      must NOT execute the binary. Standard library only; deterministic; must
      terminate quickly.
+   - MUST be valid Python 3 and nothing else: use `#` for comments (never C-style
+     `/* ... */` or `//`), no syntax from other languages, no imports outside the
+     standard library. It must run under: python3 -I solver.py <binary>.
    - Robust recovery: scan the binary for the embedded region and invert the
      transform; accept the window that yields a well-formed sloth{...}. Do NOT
      rely on a hardcoded absolute file offset (it changes between builds).
@@ -1300,13 +1318,19 @@ def _verify_recover_challenge(base_dir: Path, data: dict[str, Any], backend: "Ex
     except OSError as exc:
         return AttemptResult(0, False, "leak-check-failed", f"could not read the binary: {exc}")
 
-    # 4. The obfuscated bytes the solver needs must really be embedded in the binary.
+    # 4. DIAGNOSTIC ONLY (not a reject): whether the exact encoded sequence appears
+    #    contiguously in the binary. Contiguity is NOT a necessary condition for
+    #    recoverability — gcc materialises an automatic/local array as fragmented
+    #    immediate stores at every -O level, so the bytes can be fully present yet
+    #    non-contiguous. Recoverability is proven authoritatively below by the solver
+    #    (step 6, recovers the real flag from the artifact alone) and the independent
+    #    flag swap (step 7, the same solver recovers a second harness-chosen flag from
+    #    a different binary). We record contiguity as a signal and never fail on it, so
+    #    a working-but-non-contiguous challenge is no longer wrongly rejected, while a
+    #    challenge whose data is genuinely unrecoverable still fails at the solver step.
+    #    (See docs/recover-failure-analysis.md.)
     want = _tokens_to_bytes(body)
-    if len(want) >= 4 and want not in challenge_bin.read_bytes():
-        return AttemptResult(0, False, "data-missing",
-                             "the encoded byte array is not present contiguously in the compiled "
-                             "binary, so the solver has nothing to recover — ensure challenge_code "
-                             "embeds and uses the array (do not let the compiler drop it).")
+    encoded_contiguous = bool(len(want) >= 4 and want in challenge_bin.read_bytes())
 
     # 5. The distributed program must actually WORK: it accepts the correct flag
     #    (prints the marker) and rejects wrong input (does not), and never reveals
@@ -1345,7 +1369,8 @@ def _verify_recover_challenge(base_dir: Path, data: dict[str, Any], backend: "Ex
         return swap
 
     return AttemptResult(0, True, "passed", f"recover verified: solver recovers {expected} "
-                         "(and an independent second flag) from the artifact alone")
+                         "(and an independent second flag) from the artifact alone",
+                         diagnostics={"encoded_bytes_contiguous": encoded_contiguous})
 
 
 def _recover_flag_swap(base_dir: Path, template: str, encoder_code: str, solver_code: str,

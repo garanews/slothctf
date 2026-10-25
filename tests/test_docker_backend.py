@@ -304,6 +304,31 @@ _REC_EXEC_SOLVER = ("import os, sys\n"
                     "os.execv(sys.argv[1], [sys.argv[1]])  # attempt to run the binary\n"
                     "print('unreachable')\n")
 
+# A CORRECT validator that stores the encoded bytes in an AUTOMATIC (stack) array,
+# exactly like the campaign's elf-easy#rep3. gcc materialises such an array as
+# fragmented immediate stores at every -O level, so the encoder's exact sequence is
+# NOT present contiguously in the binary — even though the data is there and the
+# program works. The old 'data-missing' gate rejected this outright; under the fix
+# the (non-fatal) contiguity signal is recorded and the SOLVER decides recoverability.
+_REC_LOCAL_ARRAY = ("#include <stdio.h>\n#include <string.h>\n"
+                    "int main(void){unsigned char data[]={ /*__ENCODED_ARRAY__*/ };"
+                    "char b[256];if(!fgets(b,sizeof b,stdin)){printf(\"Denied\\n\");return 0;}"
+                    "size_t n=strlen(b);if(n&&b[n-1]=='\\n')b[--n]=0;"
+                    "if(n!=sizeof data){printf(\"Denied\\n\");return 0;}"
+                    "for(size_t i=0;i<n;i++)if(((unsigned char)b[i]^0x5a)!=data[i]){printf(\"Denied\\n\");return 0;}"
+                    "printf(\"Correct\\n\");return 0;}\n")
+
+# A validator that embeds and USES the array (data present, static, contiguous) but
+# decodes with the WRONG key (0x5b vs the encoder's 0x5a), so it rejects even the
+# correct flag — the functional contract must catch this (recover-rejects-correct).
+_REC_REJECTS_CORRECT = ("#include <stdio.h>\n#include <string.h>\n"
+                        "static unsigned char data[]={ /*__ENCODED_ARRAY__*/ };"
+                        "int main(void){char b[256];if(!fgets(b,sizeof b,stdin)){printf(\"Denied\\n\");return 0;}"
+                        "size_t n=strlen(b);if(n&&b[n-1]=='\\n')b[--n]=0;"
+                        "if(n!=sizeof data){printf(\"Denied\\n\");return 0;}"
+                        "for(size_t i=0;i<n;i++)if(((unsigned char)b[i]^0x5b)!=data[i]){printf(\"Denied\\n\");return 0;}"
+                        "printf(\"Correct\\n\");return 0;}\n")
+
 
 @contextlib.contextmanager
 def _generate_recover(name, target, backend, response):
@@ -378,6 +403,42 @@ class RecoverGenreTests(unittest.TestCase):
                                ) as (report, _):
             self.assertFalse(report.success)
             self.assertIn(report.attempts[-1].stage, {"solver-error", "solver-mismatch"})
+
+    # --- P1: contiguity is diagnostic-only; the solver+swap decide recoverability ---
+
+    def test_contiguous_recoverable_passes_and_reports_contiguity_diagnostic(self):
+        # A static-array challenge: the encoded bytes ARE contiguous and a simple
+        # solver recovers them. It passes, and the (now non-fatal) contiguity check
+        # is recorded as a diagnostic signal on the passing attempt.
+        with _generate_recover("rec_diag", "elf", DockerLinuxBackend(),
+                               _recover_response("sloth{rec_diag}")) as (report, _):
+            self.assertTrue(report.success, report.as_text())
+            self.assertIs(report.attempts[-1].diagnostics.get("encoded_bytes_contiguous"), True)
+
+    def test_noncontiguous_local_array_not_rejected_for_contiguity(self):
+        # Reproduces elf-easy#rep3: an automatic-array validator whose encoded bytes
+        # are NOT contiguous in the binary. The fix removes the 'data-missing' reject,
+        # so verification proceeds to the solver. A naive XOR-sweep solver cannot
+        # recover fragmented data, so the challenge fails at the SOLVER stage — it is
+        # NOT blessed merely for being non-contiguous, and NOT rejected for contiguity.
+        flag = "sloth{noncontiguous_local_demo}"
+        with _generate_recover("rec_local", "elf", DockerLinuxBackend(),
+                               _recover_response(flag, challenge=_REC_LOCAL_ARRAY)) as (report, cdir):
+            want = bytes(c ^ 0x5A for c in flag.encode())      # the encoder's exact output
+            blob = (cdir / "bin" / "challenge").read_bytes()
+            self.assertNotIn(want, blob, "premise: the encoded sequence must be non-contiguous here")
+            self.assertFalse(report.success)
+            self.assertNotEqual(report.attempts[-1].stage, "data-missing")
+            self.assertIn(report.attempts[-1].stage, {"solver-mismatch", "solver-error"})
+
+    def test_program_rejecting_correct_flag_is_rejected(self):
+        # Data is present and contiguous, but the validator decodes with the wrong key
+        # and rejects the correct flag: the functional contract must catch it.
+        with _generate_recover("rec_rej", "elf", DockerLinuxBackend(),
+                               _recover_response("sloth{rec_rej}", challenge=_REC_REJECTS_CORRECT)
+                               ) as (report, _):
+            self.assertFalse(report.success)
+            self.assertEqual(report.attempts[-1].stage, "recover-rejects-correct")
 
 
 @unittest.skipUnless(_WIN_READY and _READY, _WIN_SKIP)

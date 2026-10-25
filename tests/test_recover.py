@@ -79,6 +79,23 @@ class SchemaAndNormalizeTests(unittest.TestCase):
         self.assertIn("MUST NOT print the flag", s)
         self.assertIn(g.ENCODED_PLACEHOLDER, s)
 
+    def test_recover_schema_demands_robust_c_and_python(self):
+        # P0: the recover prompt must ask for the specific correctness properties the
+        # campaign failures exposed, WITHOUT pinning a fixed transform (xor/add stay
+        # examples only, so Qwen keeps inventing mechanics).
+        import re
+        flat = re.sub(r"\s+", " ", g._SCHEMA_RULES_RECOVER)
+        self.assertIn("static const unsigned char NAME[]", flat)   # contiguous in .rodata
+        self.assertIn("FILE SCOPE", flat)                          # not a local/automatic array
+        self.assertIn("memcmp(a, b, len)", flat)                   # correct comparison
+        self.assertIn("NUL-terminated", flat)                      # strcmp needs a terminator
+        self.assertIn("do NOT include <windows.h>", flat)          # target-compatible headers
+        self.assertIn("valid Python 3", flat)                      # no C-syntax solver
+        self.assertIn("C-style", flat)
+        # transform freedom preserved: still presented as the model's choice
+        self.assertIn("YOUR invertible transform", flat)
+        self.assertIn("xor, add, sbox, rolling key", flat)
+
     def test_distinct_random_flag_never_equals_exclude(self):
         # Regression for the flag-swap bug: the second flag must differ from the
         # original (it was wrongly compared to the challenge template before).
