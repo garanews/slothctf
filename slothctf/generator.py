@@ -74,6 +74,7 @@ class AttemptResult:
     ok: bool
     stage: str  # which check failed (or "passed")
     detail: str = ""
+    diagnostics: dict = field(default_factory=dict)  # non-fatal signals (e.g. byte contiguity)
 
 
 @dataclass
@@ -1300,13 +1301,19 @@ def _verify_recover_challenge(base_dir: Path, data: dict[str, Any], backend: "Ex
     except OSError as exc:
         return AttemptResult(0, False, "leak-check-failed", f"could not read the binary: {exc}")
 
-    # 4. The obfuscated bytes the solver needs must really be embedded in the binary.
+    # 4. DIAGNOSTIC ONLY (not a reject): whether the exact encoded sequence appears
+    #    contiguously in the binary. Contiguity is NOT a necessary condition for
+    #    recoverability — gcc materialises an automatic/local array as fragmented
+    #    immediate stores at every -O level, so the bytes can be fully present yet
+    #    non-contiguous. Recoverability is proven authoritatively below by the solver
+    #    (step 6, recovers the real flag from the artifact alone) and the independent
+    #    flag swap (step 7, the same solver recovers a second harness-chosen flag from
+    #    a different binary). We record contiguity as a signal and never fail on it, so
+    #    a working-but-non-contiguous challenge is no longer wrongly rejected, while a
+    #    challenge whose data is genuinely unrecoverable still fails at the solver step.
+    #    (See docs/recover-failure-analysis.md.)
     want = _tokens_to_bytes(body)
-    if len(want) >= 4 and want not in challenge_bin.read_bytes():
-        return AttemptResult(0, False, "data-missing",
-                             "the encoded byte array is not present contiguously in the compiled "
-                             "binary, so the solver has nothing to recover — ensure challenge_code "
-                             "embeds and uses the array (do not let the compiler drop it).")
+    encoded_contiguous = bool(len(want) >= 4 and want in challenge_bin.read_bytes())
 
     # 5. The distributed program must actually WORK: it accepts the correct flag
     #    (prints the marker) and rejects wrong input (does not), and never reveals
@@ -1345,7 +1352,8 @@ def _verify_recover_challenge(base_dir: Path, data: dict[str, Any], backend: "Ex
         return swap
 
     return AttemptResult(0, True, "passed", f"recover verified: solver recovers {expected} "
-                         "(and an independent second flag) from the artifact alone")
+                         "(and an independent second flag) from the artifact alone",
+                         diagnostics={"encoded_bytes_contiguous": encoded_contiguous})
 
 
 def _recover_flag_swap(base_dir: Path, template: str, encoder_code: str, solver_code: str,
