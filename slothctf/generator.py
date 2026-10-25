@@ -413,8 +413,22 @@ HARD REQUIREMENTS (breaking any is rejected and sent back to you to fix):
    - compiles with: gcc -O2 -s -o challenge challenge.c
    - contains the EXACT token %(ph)s where the embedded byte array is initialised
      (the machine substitutes the encoder's output there — put NO numbers there);
-   - MUST embed and use that array so the obfuscated flag really is present in the
-     compiled binary (that is what the solver recovers from).
+   - declare that array as `static const unsigned char NAME[] = { %(ph)s };` at FILE
+     SCOPE (outside every function) and actually USE it in the comparison. File-scope
+     `static const` keeps the bytes together in the binary's data section, where the
+     solver can find them. An array declared as a local/automatic variable inside a
+     function is often compiled to scattered per-byte immediate stores, so the
+     sequence is NOT contiguous and is much harder to recover — avoid that. Do not
+     let the compiler drop the array.
+   - size every buffer correctly. To compare the typed input against decoded bytes,
+     either compare a known length with `memcmp(a, b, len)`, or make the decoded
+     string NUL-terminated before using `strcmp`/`strcpy`. A buffer sized to exactly
+     the raw byte count has NO terminator, so `strcmp` reads past it (undefined
+     behaviour that can wrongly reject the correct flag).
+   - use only C and headers available on the BUILD TARGET stated above. For a Linux
+     ELF target do NOT include <windows.h> or call Win32 APIs; for a Windows PE target
+     do NOT use POSIX-only headers. Prefer portable standard C (stdio.h, string.h,
+     stdint.h).
    - reads ONE line from stdin, strips the trailing newline, and prints EXACTLY
      success_marker if and only if the input equals the flag; for any other input
      it prints a DIFFERENT message (e.g. "Denied"). It must accept the correct
@@ -432,6 +446,9 @@ HARD REQUIREMENTS (breaking any is rejected and sent back to you to fix):
      must NOT read any other file (no challenge.json, no source, no encoder), and
      must NOT execute the binary. Standard library only; deterministic; must
      terminate quickly.
+   - MUST be valid Python 3 and nothing else: use `#` for comments (never C-style
+     `/* ... */` or `//`), no syntax from other languages, no imports outside the
+     standard library. It must run under: python3 -I solver.py <binary>.
    - Robust recovery: scan the binary for the embedded region and invert the
      transform; accept the window that yields a well-formed sloth{...}. Do NOT
      rely on a hardcoded absolute file offset (it changes between builds).
