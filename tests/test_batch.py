@@ -202,6 +202,26 @@ class BatchMechanicsTests(unittest.TestCase):
                                  and set(r.keys()) == {"event", "id"} for r in after))
             self.assertTrue((camp / "report.md").exists())
 
+    def test_valid_final_line_without_newline_is_kept_not_dropped(self):
+        # A complete, valid attempt_result that merely lost its trailing newline must be
+        # KEPT (not treated as truncated) — otherwise the completed run would be repeated.
+        with TemporaryDirectory() as tmp, _cwd(tmp):
+            batch._generate = make_mock(lambda spec, n: "model-failure")
+            cfg = dict(BASE_CFG); cfg["repeats"] = 1
+            camp, _ = batch.cmd_run(_write_cfg(tmp, cfg), caller_factory=lambda *a: None, digest_fn=self._digest)
+            jl = camp / "campaign.jsonl"
+            recs = batch._read_jsonl(jl)
+            keep = [r for r in recs if r.get("event") != "campaign_done"]   # last kept record is the attempt_result
+            self.assertEqual(keep[-1].get("event"), "attempt_result")
+            jl.write_text("\n".join(json.dumps(r) for r in keep), encoding="utf-8")   # NO trailing newline
+            self.assertFalse(jl.read_text().endswith("\n"))
+            batch.cmd_resume(camp, caller_factory=lambda *a: None, digest_fn=self._digest)
+            after = batch._read_jsonl(jl)
+            ar = [r for r in after if r.get("event") == "attempt_result" and str(r.get("id", "")).endswith("_01")]
+            self.assertEqual(len(ar), 1, "completed run was repeated or its result was lost")
+            self.assertFalse(any(p.name.startswith("campaign.jsonl.corrupt-") for p in camp.iterdir()),
+                             "a valid final line must NOT be treated as corrupt")
+
     def test_midrecord_corruption_refused_with_diagnostic(self):
         # A malformed COMPLETE (newline-terminated) record in the middle is NOT auto-dropped:
         # preserved + BatchError, so no valid event vanishes silently.

@@ -168,12 +168,14 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 
 def _repair_jsonl(path: Path) -> None:
-    """Make the dataset safe before use. Only a TRUNCATED FINAL line (an interrupted
-    append that left bytes without a terminating newline) is recoverable: the full
-    original bytes are first preserved to a diagnostic copy, then the file is rewritten
-    with only the complete, newline-terminated, valid records — so no later append
-    concatenates onto damaged bytes. A malformed COMPLETE/intermediate record is NOT
-    silently dropped: the original is preserved and BatchError is raised."""
+    """Make the dataset safe before use. A malformed COMPLETE/intermediate record is NOT
+    silently dropped: the original is preserved and BatchError is raised. A final line that
+    lacks a terminating newline is handled by its CONTENT, not assumed truncated:
+      * valid JSON  -> a complete record that merely missed its newline: KEEP it (append the
+        newline). No event is lost; no diagnostic needed.
+      * non-empty but invalid JSON -> a genuinely truncated write: preserve the full bytes to
+        a diagnostic copy and drop only that tail.
+    After repair the file ends with a newline, so no later append concatenates onto it."""
     if not path.exists():
         return
     data = path.read_text(encoding="utf-8")
@@ -182,26 +184,25 @@ def _repair_jsonl(path: Path) -> None:
     ends_nl = data.endswith("\n")
     parts = data.split("\n")
     if ends_nl:
-        parts = parts[:-1]            # trailing "" after the final newline
-        complete, trailing = parts, None
+        complete, trailing = parts[:-1], None          # drop the "" after the final newline
     else:
-        complete, trailing = parts[:-1], parts[-1]   # last part is a truncated line
+        complete, trailing = parts[:-1], parts[-1]      # last part has no terminating newline
 
     bad = next((i for i, ln in enumerate(complete) if ln.strip() and not _is_json(ln)), None)
     if bad is not None:
         diag = _preserve_corrupt(path, data)
         raise BatchError(f"corrupt complete record on line {bad+1} of {path.name}; original preserved "
                          f"at {diag.name}. Refusing to continue (intermediate corruption is not auto-dropped).")
-    if trailing is not None and trailing.strip():
-        # recoverable: a single truncated final line from an interrupted write
-        _preserve_corrupt(path, data)
-        rebuilt = "".join(ln + "\n" for ln in complete if ln.strip())
-        _write_atomic(path, rebuilt)
-    elif trailing is not None:
-        # final newline missing but the trailing fragment is empty/whitespace -> normalise
-        rebuilt = "".join(ln + "\n" for ln in complete if ln.strip())
-        if rebuilt != data:
-            _write_atomic(path, rebuilt)
+
+    if trailing is None:
+        return                                          # already clean and newline-terminated
+
+    kept = [ln for ln in complete if ln.strip()]
+    if trailing.strip() and _is_json(trailing):
+        kept.append(trailing)                           # valid record, only the newline was missing -> keep it
+    elif trailing.strip():
+        _preserve_corrupt(path, data)                   # genuinely truncated tail -> preserve + drop
+    _write_atomic(path, "".join(ln + "\n" for ln in kept))
 
 
 def _is_json(line: str) -> bool:
