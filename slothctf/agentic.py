@@ -403,18 +403,27 @@ def _challenge_prompt(state: ProjectState) -> str:
         'Return ONE JSON object: {"challenge_code": "<C source>", "success_marker": "<exact text>"}.')
 
 
+def _binary_evidence_block(state: ProjectState) -> str:
+    ev = getattr(state, "binary_evidence", "") or ""
+    if not ev:
+        return ""
+    return ("\n\nReverse-engineering EVIDENCE from the DISTRIBUTED binary (standard tools, static "
+            "analysis only — this is exactly what a player with a disassembler sees):\n" + ev + "\n")
+
+
 def _solver_prompt(state: ProjectState) -> str:
     # INDEPENDENT solver: the generating model gets ONLY what a player has — the public
-    # description and the distributed binary (read at runtime). It must NOT receive the flag,
-    # the encoder, the challenge source, or the private inverse description. This keeps a
-    # passing solver genuine proof that the challenge is solvable from the binary alone.
+    # description and reverse-engineering evidence derived from the distributed binary. It must
+    # NOT receive the flag, the encoder, the challenge source, or the private inverse. This keeps
+    # a passing solver genuine proof that the challenge is solvable from the binary alone.
     return (
         "You are an INDEPENDENT solver with only what a normal CTF player receives. The challenge is a "
         f"{state.difficulty} '{state.name}' reverse-engineering binary for {_platform_line(state)}; the "
         "goal is to recover the hidden flag (format sloth{...}) by analysing the DISTRIBUTED BINARY "
         "alone. You are NOT given the flag, the encoder, the challenge source, or any description of the "
-        "transform — reverse-engineer it from the binary yourself.\n"
-        "Write solver_code: a COMPLETE Python 3 program run as `python3 -I solver.py <binary>`. It reads "
+        "transform — infer it from the binary evidence below and the raw bytes."
+        + _binary_evidence_block(state) +
+        "\nWrite solver_code: a COMPLETE Python 3 program run as `python3 -I solver.py <binary>`. It reads "
         "ONLY the binary's raw bytes from argv[1], recovers the flag, and prints EXACTLY the flag and "
         "nothing else. It must NOT hardcode the flag, read any other file, or execute the binary. Do all "
         "byte arithmetic mod 256. Valid Python 3 only (use # comments). "
@@ -443,8 +452,10 @@ def _repair_prompt(which: str, state: ProjectState, err: str) -> str:
                  "length, indices, casts, order and mod-256 arithmetic against the encoder and the "
                  "reported error — then return challenge_code that changes exactly that. Add no "
                  "operation the encoder does not perform.")
-    # NOTE: the "solver" repair is DELIBERATELY left as the bare, player-only base — it must not
-    # receive the encoder, the challenge source, the design or the flag (solver independence).
+    elif which == "solver":
+        # solver repairs stay player-only: the binary RE evidence is public, but NEVER the
+        # encoder, challenge source, design or flag.
+        base += _binary_evidence_block(state)
     return base
 
 
@@ -562,6 +573,27 @@ def _gate_solver(state, base_dir, backend, tgt, solver_backend) -> tuple[bool, s
             return False, swap.stage, _solver_feedback(swap.stage, "", "", state.flag)
         return False, swap.stage, _scrub(swap.detail, state.flag)
     return True, "solver-ok", ""
+
+
+def _ensure_binary_evidence(state, base_dir, backend, tgt) -> None:
+    """Compute + cache player-safe STATIC reverse-engineering evidence for the current
+    challenge binary, so the INDEPENDENT solver prompts can include it. Cached per challenge
+    signature (the binary only changes when the challenge does), so solver repairs reuse it
+    without re-running tools. Never raises — on any failure the solver just gets no evidence."""
+    try:
+        sig = state.sig("challenge")
+    except Exception:
+        sig = None
+    if getattr(state, "_evidence_sig", None) == sig and getattr(state, "binary_evidence", ""):
+        return
+    cbin = base_dir / _chal_rel(tgt)
+    if not cbin.exists():
+        return
+    try:
+        state.binary_evidence = backend.static_analysis(base_dir, _chal_rel(tgt), tgt)
+    except Exception as exc:
+        state.binary_evidence = f"(static analysis unavailable: {type(exc).__name__})"
+    state._evidence_sig = sig
 
 
 _GATES = {"encoder": _gate_encoder, "challenge": _gate_challenge, "solver": _gate_solver}
@@ -737,6 +769,8 @@ def generate_recover_agentic(
         the feedback and retries WITHOUT recompiling, all within budget. Returns
         (newcode, marker) once the code actually changes, or None when the component's
         repair budget is exhausted. Applying the returned code is the caller's job."""
+        if responsible == "solver":        # refresh the public binary evidence for the walled prompt
+            _ensure_binary_evidence(state, base_dir, backend, tgt)
         while True:
             c = state.comp(responsible)
             if c.repairs >= budget.max_repairs_per_stage:           # never issue an un-appliable call
@@ -778,6 +812,8 @@ def generate_recover_agentic(
             if which is None:
                 break  # B, C, D all verified against current artifacts
             comp = state.comp(which)
+            if which == "solver":   # independent solver sees public binary evidence, not sources
+                _ensure_binary_evidence(state, base_dir, backend, tgt)
             if not comp.code:  # first time we need this component
                 key = f"{which}_code"
                 payload = _ask(caller, model, budget, state, report, which, "generate",
@@ -827,13 +863,16 @@ def generate_recover_agentic(
                 break
             e_repairs += 1
             responsible = _RESPONSIBLE.get(e.stage, "challenge")
-            got = fetch_fix(responsible, e.detail)
+            # Stage E's authoritative detail may reveal the flag on a solver failure; when the
+            # solver is the culprit, hand it only WALLED public feedback (never e.detail directly).
+            fb = _solver_feedback(e.stage, "", e.detail or "", state.flag) if responsible == "solver" else e.detail
+            got = fetch_fix(responsible, fb)
             if got is None:
                 break
             newcode, marker = got
             if marker:
                 state.success_marker = marker
-            if not apply_fix(responsible, newcode, e.detail[:300]):
+            if not apply_fix(responsible, newcode, fb[:300]):
                 break
             # re-verify any now-invalidated upstream stages before the next E
             while True:

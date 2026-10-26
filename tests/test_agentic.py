@@ -356,19 +356,26 @@ class StateMachineTests(unittest.TestCase):
         self.assertIn("ENCODER_SECRET_MARKER", chal_rep)
         self.assertIn("INVERSE_SECRET_MARKER", chal_rep)
 
-        # the SOLVER generate + repair prompts must contain NONE of the private markers
+        # the solver sees the PUBLIC binary evidence (what a player with a disassembler sees)...
+        st.binary_evidence = "EVIDENCE_PUBLIC_MARKER sections/strings/disasm"
         sol = ag._solver_prompt(st)
+        sol_rep = ag._repair_prompt("solver", st, "your solver did not recover the correct flag")
+        self.assertIn("EVIDENCE_PUBLIC_MARKER", sol)
+        self.assertIn("EVIDENCE_PUBLIC_MARKER", sol_rep)
+        # ...but the solver generate + repair prompts must contain NONE of the private markers
         for s in secrets:
             self.assertNotIn(s, sol, f"solver generate prompt leaked {s!r}")
-        sol_rep = ag._repair_prompt("solver", st, "your solver did not recover the correct flag")
-        for s in secrets:
             self.assertNotIn(s, sol_rep, f"solver repair prompt leaked {s!r}")
 
-        # the solver-facing GATE feedback must not reveal the flag (even in a traceback)
-        fb_err = ag._solver_feedback("solver-error", "", "ValueError at flag sloth{FLAGSECRET}", st.flag)
-        fb_mis = ag._solver_feedback("solver-mismatch", "sloth{FLAGSECRET}", "", st.flag)
-        self.assertNotIn("sloth{FLAGSECRET}", fb_err)
-        self.assertNotIn("sloth{FLAGSECRET}", fb_mis)
+        # the solver-facing feedback must not reveal the flag on ANY path:
+        # generation/repair (above), flag-swap, solver-error, or Stage-E detail.
+        flag = "sloth{FLAGSECRET}"
+        stage_e_detail = f"the solver recovered 'x' but the flag is {flag!r}"   # what Stage E might say
+        for stg, out, raw in [("solver-error", "", f"ValueError near {flag}"),
+                              ("solver-mismatch", flag, stage_e_detail),
+                              ("solver-hardcoded", "", stage_e_detail)]:
+            fb = ag._solver_feedback(stg, out, raw, flag)
+            self.assertNotIn(flag, fb, f"{stg} feedback leaked the flag")
         # design prompt now asks for forward + inverse + order + invertibility
         dp = ag._design_prompt(st).lower()
         for kw in ("forward", "inverse", "order", "invertib"):

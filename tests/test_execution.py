@@ -203,6 +203,41 @@ class NativeBackendRealTests(unittest.TestCase):
             self.assertIn("sloth{ok}", r.stdout)
 
 
+_ELF_READY = ex.docker_available() and ex.image_available()
+_PE_READY = ex.docker_available() and ex.win_image_available()
+_TRIVIAL_C = '#include <stdio.h>\nint main(){printf("hello");return 0;}\n'
+
+
+@unittest.skipUnless(_ELF_READY, "needs Docker + the ELF sandbox image")
+class StaticAnalysisElfTests(unittest.TestCase):
+    def test_static_analysis_is_bounded_and_static(self):
+        b = DockerLinuxBackend()
+        with TemporaryDirectory() as tmp:
+            ws = Path(tmp); (ws / "src").mkdir()
+            (ws / "src" / "c.c").write_text(_TRIVIAL_C, encoding="utf-8")
+            self.assertTrue(b.compile_c(ws, "src/c.c", "bin/challenge", get_target("elf")).ok)
+            ev = b.static_analysis(ws, "bin/challenge", get_target("elf"))
+        self.assertIn("=== sections", ev)
+        self.assertIn("=== strings", ev)
+        self.assertIn("=== disassembly", ev)
+        self.assertLessEqual(len(ev), 9200)                    # bounded to the context budget
+
+
+@unittest.skipUnless(_PE_READY, "needs Docker + the Windows-compat sandbox image")
+class StaticAnalysisPeTests(unittest.TestCase):
+    def test_static_analysis_pe_uses_mingw_tools(self):
+        from slothctf.execution import DockerWinCompatBackend
+        b = DockerWinCompatBackend()
+        with TemporaryDirectory() as tmp:
+            ws = Path(tmp); (ws / "src").mkdir()
+            (ws / "src" / "c.c").write_text(_TRIVIAL_C, encoding="utf-8")
+            self.assertTrue(b.compile_c(ws, "src/c.c", "bin/challenge.exe", get_target("pe")).ok)
+            ev = b.static_analysis(ws, "bin/challenge.exe", get_target("pe"))
+        self.assertIn("=== sections", ev)
+        self.assertIn("=== disassembly", ev)
+        self.assertLessEqual(len(ev), 9200)
+
+
 class _EofPipe:
     """A pipe that is already at EOF — read() always yields no bytes."""
     def read(self, _n):

@@ -221,6 +221,47 @@ class ExecutionBackend(ABC):
                    stdin_text: str | None = None, limits: ResourceLimits | None = None) -> ExecResult:
         ...
 
+    def _run_tool(self, inner: list[str], workspace: Path, timeout: float,
+                  limits: ResourceLimits) -> ExecResult:  # pragma: no cover - overridden
+        raise SandboxUnavailable(f"backend {self.name!r} has no tool runner")
+
+    def static_analysis(self, workspace: Path, binary_rel: str, target: Target,
+                        limits: ResourceLimits | None = None) -> str:
+        """Player-equivalent STATIC reverse-engineering evidence from the DISTRIBUTED
+        binary, using standard binutils tools run IN ISOLATION. The binary is never
+        executed. Returns bounded, explicitly-truncated text (sections, strings,
+        disassembly). It is derived ONLY from the shipped binary — no organizer source,
+        encoder, design, inverse or flag is involved — so it is safe to show an
+        independent solver (a player with a disassembler sees the same)."""
+        limits = limits or ResourceLimits()
+        in_container = self.name.startswith("docker")
+        pin = str(PurePosixPath(_WORK) / binary_rel) if in_container else binary_rel
+        pre = "x86_64-w64-mingw32-" if self.name == "docker-wincompat" else ""
+        steps = [
+            ("sections", [f"{pre}objdump", "-h", pin], 60),
+            ("strings", [f"{pre}strings", "-n", "5", pin], 80),
+            ("disassembly", [f"{pre}objdump", "-d", "-M", "intel", pin], 240),
+        ]
+        parts: list[str] = []
+        for label, inner, max_lines in steps:
+            try:
+                r = self._run_tool(inner, workspace, min(limits.run_timeout, 30.0), limits)
+                text = (r.stdout or "").strip()
+                if not text and r.stderr:
+                    text = f"(no output; {inner[0]} stderr: {r.stderr[:160]})"
+            except Exception as exc:
+                text = f"(tool {inner[0]} unavailable: {type(exc).__name__})"
+            lines = text.splitlines()
+            clipped = "\n".join(lines[:max_lines])
+            if len(lines) > max_lines:
+                clipped += f"\n[... {label}: {len(lines) - max_lines} more lines truncated ...]"
+            parts.append(f"=== {label} ({inner[0]}) ===\n{clipped}")
+        blob = "\n\n".join(parts)
+        budget = 9000
+        if len(blob) > budget:
+            blob = blob[:budget] + "\n[... evidence truncated to fit the context budget ...]"
+        return blob
+
 
 # --------------------------------------------------------------------------- #
 # Native (unsafe) backend — current host behaviour
@@ -275,6 +316,9 @@ class NativeBackend(ExecutionBackend):
         limits = limits or ResourceLimits()
         return self._run(["python", "-I", script_rel, *(args or [])],
                          limits.run_timeout, limits, workspace, stdin_text=stdin_text)
+
+    def _run_tool(self, inner, workspace, timeout, limits):
+        return self._run(inner, timeout, limits, workspace)
 
 
 # --------------------------------------------------------------------------- #
@@ -393,6 +437,9 @@ class DockerLinuxBackend(ExecutionBackend):
         limits = limits or ResourceLimits()
         inner = ["python3", "-I", str(PurePosixPath(_WORK) / script_rel), *(args or [])]
         return self._exec(inner, workspace, limits.run_timeout, limits, stdin_text=stdin_text)
+
+    def _run_tool(self, inner, workspace, timeout, limits):
+        return self._exec(inner, workspace, timeout, limits)
 
     def run_solver(self, solver_ws: Path, script_rel: str, artifact_host: Path,
                    limits: ResourceLimits | None = None) -> ExecResult:
@@ -520,6 +567,13 @@ class DockerWinCompatBackend(ExecutionBackend):
         raise SandboxUnavailable(
             "the Windows-compat backend runs PE binaries only; Python steps use the "
             "Linux backend (target 'elf').")
+
+    def _run_tool(self, inner, workspace, timeout, limits):
+        # static analysis only (MinGW binutils); no Wine, no execution of the PE
+        limits = self._limits(limits)
+        name = f"slothctf-{uuid.uuid4().hex[:12]}"
+        argv = build_docker_run_argv(self.image, inner, workspace, limits, name)
+        return self._capped(argv, name, timeout, limits)
 
 
 # --------------------------------------------------------------------------- #
