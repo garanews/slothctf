@@ -356,11 +356,20 @@ def _design_prompt(state: ProjectState) -> str:
     return (
         f"{_FREEDOM}\n\nDesign a {state.difficulty} 'recover' reverse-engineering "
         f"challenge for {_platform_line(state)}. The player must RECOVER a hidden flag by "
-        "ANALYSING the compiled binary; running it must not reveal the flag. Describe the "
-        "mechanic, the transform and its inverse, the program structure, the expected "
-        "behaviour, the obfuscation, and why it fits the difficulty. "
+        "ANALYSING the compiled binary; running it must not reveal the flag.\n"
+        "Inversion-first: before anything else, pin down the MATH so the forward and inverse "
+        "transforms are provably consistent. In the design, state EXPLICITLY:\n"
+        "  1. the FORWARD transform (what the encoder does to each byte), as precise step-by-step ops;\n"
+        "  2. the exact INVERSE transform (each forward op undone);\n"
+        "  3. the ORDER of operations and the ORDER the inverse must undo them (reverse order);\n"
+        "  4. the INVERTIBILITY conditions (e.g. all byte arithmetic is mod 256; any multiply is by an "
+        "odd constant; any per-index/position or state term is reproducible; no information is lost).\n"
+        "Composed transforms, permutations, state machines and inter-byte dependencies are all allowed "
+        "— but only if you can write their exact inverse. Also describe the program structure, expected "
+        "behaviour, the obfuscation, and why it fits the difficulty.\n"
         f"User request: {state.prompt}\n"
-        'Return ONE JSON object: {"design": "<your technical design as text>"}.')
+        'Return ONE JSON object: {"design": "<your technical design, including forward, inverse, order '
+        'and invertibility conditions, as text>"}.')
 
 
 def _encoder_prompt(state: ProjectState) -> str:
@@ -387,16 +396,28 @@ def _challenge_prompt(state: ProjectState) -> str:
         "the flag, and keep no plaintext flag literal. Size buffers correctly (memcmp with a known "
         "length, or NUL-terminate before strcmp). Use only headers available on "
         f"{_platform_line(state)}. "
+        "Mathematical consistency is mandatory: the check must invert the encoder's transform EXACTLY — "
+        "undo each operation, in reverse order, with the same mod-256 / position / state semantics. Do NOT "
+        "add, drop or reorder any operation that is not in the encoder's transform; introduce no step the "
+        "encoder did not perform. "
         'Return ONE JSON object: {"challenge_code": "<C source>", "success_marker": "<exact text>"}.')
 
 
 def _solver_prompt(state: ProjectState) -> str:
+    # INDEPENDENT solver: the generating model gets ONLY what a player has — the public
+    # description and the distributed binary (read at runtime). It must NOT receive the flag,
+    # the encoder, the challenge source, or the private inverse description. This keeps a
+    # passing solver genuine proof that the challenge is solvable from the binary alone.
     return (
-        f"Your design:\n{state.design}\n\nThe challenge C source:\n{state.challenge.code}\n\n"
-        "Write solver_code: a COMPLETE Python 3 program run as `python3 -I solver.py <binary>`. "
-        "It reads ONLY the binary's raw bytes from argv[1] and recovers the flag by inverting your "
-        "transform, then prints EXACTLY the flag and nothing else. It must NOT hardcode the flag, "
-        "read any other file, or execute the binary. Valid Python 3 only (use # comments). "
+        "You are an INDEPENDENT solver with only what a normal CTF player receives. The challenge is a "
+        f"{state.difficulty} '{state.name}' reverse-engineering binary for {_platform_line(state)}; the "
+        "goal is to recover the hidden flag (format sloth{...}) by analysing the DISTRIBUTED BINARY "
+        "alone. You are NOT given the flag, the encoder, the challenge source, or any description of the "
+        "transform — reverse-engineer it from the binary yourself.\n"
+        "Write solver_code: a COMPLETE Python 3 program run as `python3 -I solver.py <binary>`. It reads "
+        "ONLY the binary's raw bytes from argv[1], recovers the flag, and prints EXACTLY the flag and "
+        "nothing else. It must NOT hardcode the flag, read any other file, or execute the binary. Do all "
+        "byte arithmetic mod 256. Valid Python 3 only (use # comments). "
         'Return ONE JSON object: {"solver_code": "<python source>"}.')
 
 
@@ -413,27 +434,18 @@ _REPAIR_PROMPTS = {
 def _repair_prompt(which: str, state: ProjectState, err: str) -> str:
     base = _REPAIR_PROMPTS[which].format(err=err[:1500], code=state.comp(which).code)
     if which == "challenge":
-        # Stage C repairs need the verified encoder + design, and must diagnose, not guess.
+        # Stage C repairs are organizer-side: the verified encoder + design are provided so the
+        # challenge can be made mathematically consistent with the encoder transform.
         base += ("\n\nThe VERIFIED encoder whose transform you MUST invert exactly (derive the length "
                  f"from the embedded array, never a fixed constant):\n{state.encoder.code}\n"
                  f"Your design:\n{state.design}\n"
                  "First determine the SINGLE concrete cause of the divergence — compare your decode "
-                 "length, indices, casts and types against the encoder and the reported error — then "
-                 "return challenge_code that changes exactly that.")
-    elif which == "solver":
-        base += (f"\n\nThe challenge C source you must invert:\n{state.challenge.code}\n"
-                 f"The verified encoder:\n{state.encoder.code}\n")
+                 "length, indices, casts, order and mod-256 arithmetic against the encoder and the "
+                 "reported error — then return challenge_code that changes exactly that. Add no "
+                 "operation the encoder does not perform.")
+    # NOTE: the "solver" repair is DELIBERATELY left as the bare, player-only base — it must not
+    # receive the encoder, the challenge source, the design or the flag (solver independence).
     return base
-
-
-def _diagnose_prompt(state: ProjectState, err: str) -> str:
-    return (
-        "A verification step failed and the cause is ambiguous. Decide which component is "
-        "responsible and fix it. The harness reported:\n" + err[:1500] + "\n\n"
-        f"design:\n{state.design}\n\nencoder_code:\n{state.encoder.code}\n\n"
-        f"challenge_code:\n{state.challenge.code}\n\nsolver_code:\n{state.solver.code}\n\n"
-        'Return ONE JSON object: {"component": "encoder|challenge|solver", '
-        '"code": "<fixed source for that component>", "reason": "<why>"}.')
 
 
 # --------------------------------------------------------------------------- #
@@ -508,67 +520,27 @@ def _gate_challenge(state, base_dir, backend, tgt, solver_backend) -> tuple[bool
     return True, "challenge-ok", ""
 
 
-def _solver_evidence(state, cbin) -> tuple:
-    """Observable, organizer-side evidence shared by both solver diagnostics: the
-    binary size, the expected encoded-byte count, and whether those bytes appear
-    contiguously. Never reveals how to locate or invert them."""
-    want_len = state.encoder.artifacts.get("want_len")
-    try:
-        bin_sz = cbin.stat().st_size
-    except OSError:
-        bin_sz = None
-    contig = state.challenge.artifacts.get("encoded_bytes_contiguous")
-    return want_len, bin_sz, contig
+def _scrub(text: str, flag: str) -> str:
+    """Remove the secret flag from any solver-facing text (solver independence)."""
+    if not text:
+        return text or ""
+    return text.replace(flag, "<redacted-flag>") if flag else text
 
 
-def _solver_mismatch_detail(state, cbin, got: str) -> str:
-    """Build a DIAGNOSTIC (not a solution) for a solver that produced the WRONG flag.
-    It separates OBSERVED facts from HYPOTHESES and from what is NOT DETERMINABLE
-    without instrumenting the solver. In particular a correct output LENGTH does NOT
-    prove the bytes were extracted correctly. It never reveals how to parse the binary
-    or invert the transform, and does not change any acceptance condition."""
-    want_len, bin_sz, contig = _solver_evidence(state, cbin)
-    obs = (f"OBSERVED: the solver printed {len(got)} characters; the flag is {len(state.flag)}; the binary is "
-           f"{bin_sz} bytes and {want_len} encoded bytes are expected"
-           f"{', present contiguously' if contig else ''}.")
-    if not got:
-        hyp = ("POSSIBLE CAUSE (hypothesis): the solver did not locate/extract the data (it produced nothing); "
-               "re-examine how it finds the bytes in the binary.")
-    elif len(got) != len(state.flag):
-        hyp = "POSSIBLE CAUSE (hypothesis): the extracted region or length is wrong."
-    else:
-        hyp = ("POSSIBLE CAUSES (hypotheses, not certainties): a correct output LENGTH does NOT prove correct "
-               "extraction — the region read may still be wrong, OR the inverse transform may be wrong (check "
-               "8-bit masking / operation order). Weigh both.")
-    undet = ("NOT DETERMINABLE from outside the solver: the exact offset you read and the bytes you extracted — "
-             "the harness cannot see inside your solver, so state your assumption explicitly.")
-    return (f"the solver recovered {got[:80]!r} but the flag is {state.flag!r}. Its inverse must match the "
-            f"encoder's transform. | {obs} {hyp} {undet}")
-
-
-def _solver_error_detail(state, cbin, raw: str) -> str:
-    """Build a DIAGNOSTIC for a solver that RAISED (exited non-zero). Preserves the
-    exception/traceback within a safe limit and adds the same observed evidence, framed
-    as facts vs hypotheses. An out-of-range byte is explicitly NOT attributed to the
-    inverse algorithm alone — it may equally come from reading the wrong region. Never
-    provides an implementation; asks the model to diagnose before fixing."""
-    want_len, bin_sz, contig = _solver_evidence(state, cbin)
-    raw = raw or ""
-    low = raw.lower()
-    obs = (f"OBSERVED: the solver raised an exception (traceback below). The binary is {bin_sz} bytes and "
-           f"{want_len} encoded bytes are expected"
-           f"{', present contiguously' if contig else ''}.")
-    if "range(0, 256)" in raw or "byte must be in range" in low or "out of range" in low:
-        hyp = ("POSSIBLE CAUSES (hypotheses, not certainties): an out-of-range byte can come EITHER from reading "
-               "the WRONG region of the binary (the values are then not your encoded bytes) OR from 8-bit "
-               "arithmetic that is not normalised (a subtract/rotate without mod-256 / &0xFF). Check BOTH the "
-               "extraction region and the 8-bit handling; do not assume the inverse algorithm alone is at fault.")
-    else:
-        hyp = ("POSSIBLE CAUSES (hypotheses): the region you read, the extracted length, the inverse arithmetic, "
-               "or a plain Python mistake — decide which from the traceback.")
-    undet = ("NOT DETERMINABLE from outside the solver: the exact offset you read and the bytes you extracted. "
-             "First state the single concrete cause, then return a corrected solver.")
-    return f"solver exited non-zero. | {obs} {hyp} {undet}\n--- traceback (truncated) ---\n{raw[:800]}"
+def _solver_feedback(stage: str, out: str, raw: str, flag: str) -> str:
+    """Player-EQUIVALENT feedback for the independent solver: only what a player running
+    their own solver would see — its own output or its own traceback, plus pass/fail. It
+    reveals NO flag, NO flag length, NO encoded-byte count/contiguity, and nothing from the
+    encoder, challenge source or private inverse. Keeps the solver genuinely independent."""
+    if stage == "solver-error":
+        return ("your solver exited with an error. Recover the flag ONLY from the binary's raw bytes, and do "
+                "all byte arithmetic mod 256.\n--- traceback ---\n" + _scrub(raw, flag)[:800])
+    if stage == "solver-mismatch":
+        return (f"your solver ran but did not recover the correct flag (it printed {_scrub(out, flag)[:80]!r}). "
+                "Reverse-engineer the transform from the binary's bytes and invert it; print exactly the flag.")
+    # flag-swap / hardcode failures: the solver relied on something outside the binary
+    return ("your solver does not recover the flag from the binary alone — it failed when the challenge was "
+            "rebuilt with a different secret. Do not hardcode or assume the flag; derive it from the bytes.")
 
 
 def _gate_solver(state, base_dir, backend, tgt, solver_backend) -> tuple[bool, str, str]:
@@ -577,14 +549,18 @@ def _gate_solver(state, base_dir, backend, tgt, solver_backend) -> tuple[bool, s
         return False, "challenge-compile", "challenge binary missing (re-verify challenge)."
     ok, out, detail = g._run_solver_isolated(state.solver.code, cbin, solver_backend)
     if not ok:
-        return False, "solver-error", _solver_error_detail(state, cbin, detail)
+        return False, "solver-error", _solver_feedback("solver-error", "", detail, state.flag)
     if out.strip() != state.flag:
-        return False, "solver-mismatch", _solver_mismatch_detail(state, cbin, out.strip())
+        return False, "solver-mismatch", _solver_feedback("solver-mismatch", out.strip(), "", state.flag)
     # mini anti-hardcode swap DURING construction (reuses the authoritative helper)
     swap = g._recover_flag_swap(base_dir, state.challenge.code, state.encoder.code, state.solver.code,
                                 backend, tgt, solver_backend, original_bin=cbin, original_flag=state.flag)
     if swap is not None:
-        return False, swap.stage, swap.detail
+        # a solver-culprit swap failure gets WALLED feedback; an upstream (encoder/challenge)
+        # swap failure gets the scrubbed organizer detail (it is repaired organizer-side).
+        if swap.stage in ("solver-hardcoded", "swap-solver-error"):
+            return False, swap.stage, _solver_feedback(swap.stage, "", "", state.flag)
+        return False, swap.stage, _scrub(swap.detail, state.flag)
     return True, "solver-ok", ""
 
 
@@ -634,19 +610,21 @@ def _stage_e(state, base_dir, backend, tgt, solver_backend) -> g.AttemptResult:
 # --------------------------------------------------------------------------- #
 # Orchestrator
 # --------------------------------------------------------------------------- #
-# Which component an unambiguous stage failure belongs to. Ambiguous stages (the
-# solver recovering the wrong flag, or the flag-swap failing) are diagnosed by the
-# model, which may backtrack to the encoder, challenge or solver.
-_UNAMBIGUOUS = {
+# Every stage failure maps to the component responsible for it. By the time the solver
+# stage runs, the challenge is already gate-verified, so a solver failure (wrong flag,
+# crash, or a hardcoded solver caught by the swap) is the solver's own problem and is
+# repaired with the WALLED, player-only solver prompt — never the leaking diagnose prompt
+# (removed). Only swap failures that implicate the encoder/challenge route upstream.
+_RESPONSIBLE = {
     "encoder-compile": "encoder", "encoder-crash": "encoder", "encoder-output": "encoder",
     "challenge-compile": "challenge", "missing-placeholder": "challenge", "flag-leak": "challenge",
     "no-marker": "challenge", "bad-marker": "challenge", "recover-rejects-correct": "challenge",
     "recover-accepts-wrong": "challenge", "challenge-crash": "challenge",
     "challenge-bad-exit": "challenge", "too-trivial": "challenge", "output-truncated": "challenge",
-    "solver-error": "solver",
+    "solver-error": "solver", "solver-mismatch": "solver", "solver-hardcoded": "solver",
+    "swap-solver-error": "solver", "swap-encoder": "encoder", "swap-identical": "encoder",
+    "swap-compile": "challenge",
 }
-_AMBIGUOUS = {"solver-mismatch", "solver-hardcoded", "swap-solver-error", "swap-encoder",
-              "swap-compile", "swap-identical"}
 
 
 def _record_call(state, budget, report, stage, kind, prompt, payload, toks, wall_s, outcome):
@@ -781,53 +759,10 @@ def generate_recover_agentic(
                                                    f"{responsible}: identical reply; escalating feedback"[:300]))
             state.log({"type": "repair-no-progress", "component": responsible,
                        "repairs": c.repairs, "detail": detail[:600]})
-            escalate[responsible] = ("\n\nNOTE: your previous reply was byte-for-byte identical and did NOT fix "
-                                     "the defect — do not resend the same code. Name the ONE concrete cause of the "
-                                     "divergence (check the decode length/indices/casts against the encoder) and "
-                                     "change exactly that.")
+            escalate[responsible] = ("\n\nNOTE: your previous reply was byte-for-byte IDENTICAL and fixed "
+                                     "nothing — do not resend the same code. Name the ONE concrete cause of the "
+                                     "failure and change exactly that part.")
             state.save()
-
-    def fetch_diagnose_fix(stage_label: str, detail: str, default_resp: str):
-        """No-progress-aware repair for the AMBIGUOUS path (solver-mismatch, flag-swap,
-        ambiguous Stage-E). The model still CHOOSES which component to change. A diagnose
-        call is never issued once no component has repair budget left; an identical reply
-        is recorded as `repair-no-progress`, escalated and retried WITHOUT recompiling,
-        bounded by max_repairs_per_stage no-progress rounds; a changed fix for an already
-        -exhausted component is refused rather than applied. Returns (responsible, newcode,
-        reason) or None when nothing applicable remains."""
-        extra = ""
-        np_rounds = 0
-        while True:
-            if all(state.comp(s).repairs >= budget.max_repairs_per_stage for s in STAGES):
-                report.attempts.append(g.AttemptResult(0, False, "max-repairs", f"diagnose: {detail[:150]}"[:300]))
-                state.log({"type": "max-repairs", "component": "diagnose"})
-                return None
-            payload = _ask(caller, model, budget, state, report, stage_label, "diagnose",
-                           _diagnose_prompt(state, detail + extra))
-            resp = str(payload.get("component", default_resp))
-            resp = resp if resp in STAGES else default_resp
-            newcode = str(payload.get("code", state.comp(resp).code))
-            reason = str(payload.get("reason", detail))[:300]
-            if _normalize(newcode) != _normalize(state.comp(resp).code):       # real change
-                if state.comp(resp).repairs >= budget.max_repairs_per_stage:   # but no budget to apply it
-                    report.attempts.append(g.AttemptResult(0, False, "max-repairs", f"{resp}: diagnose"[:300]))
-                    state.log({"type": "max-repairs", "component": resp})
-                    return None
-                return resp, newcode, reason
-            # no progress: record against the chosen component, escalate, bound, retry
-            np_rounds += 1
-            np = report.telemetry.setdefault("no_progress", {})     # type: ignore[union-attr]
-            np[resp] = np.get(resp, 0) + 1
-            report.attempts.append(g.AttemptResult(0, False, "repair-no-progress",
-                                                   f"{resp}: identical diagnosis; escalating feedback"[:300]))
-            state.log({"type": "repair-no-progress", "component": resp, "detail": detail[:600]})
-            extra = ("\n\nNOTE: your previous diagnosis returned code IDENTICAL to the current version of that "
-                     "component and fixed nothing — do not resend the same code. Identify the REAL culprit "
-                     "component and change exactly the part that is wrong.")
-            state.save()
-            if np_rounds >= budget.max_repairs_per_stage:
-                report.attempts.append(g.AttemptResult(0, False, "max-repairs", f"diagnose no-progress: {resp}"[:300]))
-                return None
 
     try:
         # Stage A — design
@@ -860,30 +795,19 @@ def generate_recover_agentic(
                 state.mark_verified(which, stage_name)
                 state.save()
                 continue
-            # failed -> repair (LLM-authored), possibly backtracking
-            if stage_name in _AMBIGUOUS:
-                # ambiguous (solver-mismatch / swap): the model picks the responsible component.
-                got = fetch_diagnose_fix(which, detail, which)
-                if got is None:
-                    state.save()
-                    return report
-                responsible, newcode, reason = got
-                if not apply_fix(responsible, newcode, reason):
-                    state.save()
-                    return report
-            else:
-                # unambiguous: known responsible component; fetch a CHANGED fix within budget.
-                responsible = _UNAMBIGUOUS.get(stage_name, which)
-                got = fetch_fix(responsible, detail)
-                if got is None:
-                    state.save()
-                    return report  # repair budget exhausted for this component
-                newcode, marker = got
-                if marker:
-                    state.success_marker = marker
-                if not apply_fix(responsible, newcode, detail[:300]):
-                    state.save()
-                    return report
+            # failed -> repair. Every stage maps to a responsible component; the solver's
+            # repair prompt + feedback are walled (player-only), so no private info leaks to it.
+            responsible = _RESPONSIBLE.get(stage_name, which)
+            got = fetch_fix(responsible, detail)
+            if got is None:
+                state.save()
+                return report  # repair budget exhausted for this component
+            newcode, marker = got
+            if marker:
+                state.success_marker = marker
+            if not apply_fix(responsible, newcode, detail[:300]):
+                state.save()
+                return report
 
         # Stage E — authoritative, unchanged verifier
         e_repairs = 0
@@ -902,23 +826,15 @@ def generate_recover_agentic(
                 report.attempts.append(g.AttemptResult(0, False, "max-repairs", f"final: {e.stage}"))
                 break
             e_repairs += 1
-            if e.stage in _AMBIGUOUS or e.stage.startswith("swap") or e.stage == "solver-mismatch":
-                got = fetch_diagnose_fix("final", e.detail, "solver")
-                if got is None:
-                    break
-                responsible, newcode, reason = got
-                if not apply_fix(responsible, newcode, reason):
-                    break
-            else:
-                responsible = _UNAMBIGUOUS.get(e.stage, "challenge")
-                got = fetch_fix(responsible, e.detail)
-                if got is None:
-                    break
-                newcode, marker = got
-                if marker:
-                    state.success_marker = marker
-                if not apply_fix(responsible, newcode, e.detail[:300]):
-                    break
+            responsible = _RESPONSIBLE.get(e.stage, "challenge")
+            got = fetch_fix(responsible, e.detail)
+            if got is None:
+                break
+            newcode, marker = got
+            if marker:
+                state.success_marker = marker
+            if not apply_fix(responsible, newcode, e.detail[:300]):
+                break
             # re-verify any now-invalidated upstream stages before the next E
             while True:
                 budget.check()
@@ -932,27 +848,17 @@ def generate_recover_agentic(
                     state.save()
                 else:
                     # fold back into the same repair machinery via a fresh fix
-                    if sn in _AMBIGUOUS:
-                        got = fetch_diagnose_fix(which, det, which)
-                        if got is None:
-                            state.save()
-                            return report
-                        resp, nc, rs = got
-                        if not apply_fix(resp, nc, rs):
-                            state.save()
-                            return report
-                    else:
-                        resp = _UNAMBIGUOUS.get(sn, which)
-                        got = fetch_fix(resp, det)
-                        if got is None:
-                            state.save()
-                            return report
-                        nc, marker = got
-                        if marker:
-                            state.success_marker = marker
-                        if not apply_fix(resp, nc, det[:300]):
-                            state.save()
-                            return report
+                    resp = _RESPONSIBLE.get(sn, which)
+                    got = fetch_fix(resp, det)
+                    if got is None:
+                        state.save()
+                        return report
+                    nc, marker = got
+                    if marker:
+                        state.success_marker = marker
+                    if not apply_fix(resp, nc, det[:300]):
+                        state.save()
+                        return report
     except BudgetExhausted as be:
         _classify(report, "budget-exhausted", be.reason)
     except (KeyboardInterrupt, SystemExit):
