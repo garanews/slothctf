@@ -115,7 +115,9 @@ def _run_generate_job(job_id: str, payload: dict) -> None:
 # Files that reveal the solution / how the challenge is built. Everything else
 # (the binary, the README, evidence the player receives) is player-facing.
 _AUTHOR_PREFIXES = ("organizer/", "src/")
-_AUTHOR_NAMES = ("solution.md", "challenge.json")
+# agentic_state.json / transcript.jsonl are organizer-only dev artifacts that hold
+# the flag, prompts, responses and the solver — never player-facing.
+_AUTHOR_NAMES = ("solution.md", "challenge.json", "agentic_state.json", "transcript.jsonl")
 _TEXT_EXT = {".c", ".h", ".py", ".md", ".json", ".txt", ".log", ".csv"}
 
 

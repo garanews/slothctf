@@ -156,6 +156,49 @@ class StateMachineTests(unittest.TestCase):
                 self.assertEqual(len(calls), n)      # exactly N reached the transport
                 self.assertEqual(budget.llm_calls, n)
 
+    def test_failed_calls_count_and_survive_resume(self):
+        # Regression: an invocation that was issued but FAILED (here a connection
+        # error) must count toward max_llm_calls and the count must survive resume,
+        # so the real number of transport hits across runs never exceeds N.
+        N = 2
+
+        class CountingCaller:
+            """1st call returns the design, every later call fails at the transport."""
+            def __init__(self):
+                self.n = 0
+
+            def __call__(self, prompt, model):
+                self.n += 1
+                if self.n == 1:
+                    return {"design": "d"}
+                raise ConnectionError("tunnel down")
+
+        caller = CountingCaller()
+        with TemporaryDirectory() as tmp:
+            prev = os.getcwd()
+            os.chdir(tmp)
+            try:
+                r1 = ag.generate_recover_agentic(
+                    "resfail", prompt="p", target="elf", backend=NativeBackend(),
+                    caller=caller, budget=ag.Budget(max_llm_calls=N), resume=False)
+                self.assertEqual(r1.attempts[-1].stage, "infra")   # design ok, encoder failed
+                self.assertEqual(caller.n, N)                      # 1 ok + 1 failed == N
+
+                # the persisted counter includes the failed invocation
+                sp = Path(tmp) / "generated" / "resfail" / "agentic_state.json"
+                self.assertEqual(ag.ProjectState.load(sp).budget_calls, N)
+
+                # resume: the cap is already reached, so NO further call is issued
+                before = caller.n
+                r2 = ag.generate_recover_agentic(
+                    "resfail", prompt="p", target="elf", backend=NativeBackend(),
+                    caller=caller, budget=ag.Budget(max_llm_calls=N), resume=True)
+                self.assertEqual(r2.attempts[-1].stage, "budget-exhausted")
+                self.assertEqual(caller.n, before)                 # no new transport hits
+            finally:
+                os.chdir(prev)
+        self.assertLessEqual(caller.n, N)                          # N never exceeded
+
     def test_max_repairs_terminates(self):
         # With a native backend the encoder gate can't compile, but the generate call
         # for the encoder already consumes a repair budget of 0 via a different path:

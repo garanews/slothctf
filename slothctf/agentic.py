@@ -88,6 +88,14 @@ class Budget:
             self.tokens += int(toks)
         self.check()
 
+    def count_failed(self) -> None:
+        """Count an invocation that WAS issued to the transport but failed (timeout,
+        connection error, or invalid model reply). It consumed an attempt against the
+        model, so it counts toward max_llm_calls exactly like a successful one. Its
+        token usage is unknown and is deliberately NOT recorded as zero. Never raises:
+        precheck() ran before the call, so this increment cannot exceed the cap."""
+        self.llm_calls += 1
+
     def precheck(self) -> None:
         """Enforce caps BEFORE a new LLM call is issued, so a limit of N permits at
         most N invocations — the (N+1)-th is refused rather than issued-then-rejected.
@@ -563,7 +571,11 @@ def _ask(caller, model, budget, state, report, stage, kind, prompt) -> dict:
     try:
         payload, toks = _invoke(caller, prompt, model)
     except (InfraError, InvalidModelResponse) as exc:
-        # a failed call still goes in the transcript, but does not charge the budget
+        # the call was ISSUED, so it counts toward the budget even though it failed;
+        # tokens are unknown (None), not zero. Persist so the count survives resume.
+        budget.count_failed()
+        state.budget_calls = budget.llm_calls
+        state.budget_tokens = budget.tokens
         state.log({"type": "llm", "stage": stage, "kind": kind, "prompt": prompt,
                    "response": "", "tokens": None, "wall_s": round(time.monotonic() - t0, 2),
                    "outcome": f"error:{type(exc).__name__}", "error": str(exc)[:600],
