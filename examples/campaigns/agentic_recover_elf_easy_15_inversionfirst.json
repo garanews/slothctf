@@ -1,0 +1,16 @@
+{
+  "model": "qwen2.5-coder:32b",
+  "ollama_url": "http://127.0.0.1:11434",
+  "prompt": "Design an original 'recover' reverse-engineering challenge; invent any invertible transform you like.",
+  "matrix": {
+    "genres": ["recover"],
+    "difficulties": ["easy"],
+    "targets": ["elf"],
+    "workflows": ["agentic"]
+  },
+  "repeats": 15,
+  "inference": { "temperature": 0.7, "num_ctx": 4096 },
+  "budget": { "max_llm_calls": 24, "max_repairs_per_stage": 4, "max_wall_seconds": 1800 },
+  "isolation": "isolated",
+  "dest": "agentic_recover_elf_easy_15_inversionfirst"
+}

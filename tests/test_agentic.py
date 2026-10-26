@@ -324,31 +324,62 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(rep.telemetry["final_stage"], "max-repairs")
         self.assertIsNotNone(rep.telemetry["budget"]["tokens"])
 
-    def test_solver_diagnostics_separate_facts_from_hypotheses(self):
-        # solver-error and solver-mismatch diagnostics must report OBSERVED facts, hedge
-        # the causes as hypotheses, and mark what is NOT DETERMINABLE from outside.
-        with TemporaryDirectory() as tmp:
-            cbin = Path(tmp) / "challenge"
-            cbin.write_bytes(b"\x00" * 1000)
-            st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{abcdefghijkl}")
-            st.encoder.artifacts = {"want_len": len(st.flag)}
-            st.challenge.artifacts = {"encoded_bytes_contiguous": True}
+    def test_solver_feedback_is_walled_player_equivalent(self):
+        # Under inversion-first the solver feedback is player-equivalent: the solver's OWN
+        # output/traceback and pass/fail only — never the flag, its length, or private evidence.
+        flag = "sloth{abcdefghijkl}"
+        err = ag._solver_feedback("solver-error", "", f"Traceback ... recovered {flag}", flag)
+        mis = ag._solver_feedback("solver-mismatch", flag, "", flag)
+        swp = ag._solver_feedback("solver-hardcoded", "", "", flag)
+        for fb in (err, mis, swp):
+            self.assertNotIn(flag, fb)                       # flag never leaked
+            self.assertNotIn(str(len(flag)), fb)             # flag length never leaked
+        self.assertIn("traceback", err.lower())              # the solver's own error is kept
+        self.assertIn("mod 256", err.lower())                # generic, player-safe guidance
+        self.assertIn("binary", mis.lower())
 
-            raw = "Traceback (most recent call last):\n  ...\nValueError: byte must be in range(0, 256)\n"
-            d = ag._solver_error_detail(st, cbin, raw)
-            self.assertIn("OBSERVED", d)
-            self.assertIn("1000", d)                 # binary size
-            self.assertIn(str(len(st.flag)), d)      # expected encoded-byte count
-            self.assertIn("ValueError", d)           # traceback preserved
-            self.assertIn("do not assume the inverse algorithm alone is at fault", d)   # both causes offered
-            self.assertIn("NOT DETERMINABLE", d)
+    def test_solver_independence_no_private_info_leaks(self):
+        # Inversion-first: the inverse/design, encoder and challenge sources and the flag must
+        # reach the challenge stage but NEVER the solver stage or its feedback.
+        st = ag.ProjectState(name="demo", target="elf", difficulty="easy", flag="sloth{FLAGSECRET}")
+        st.design = "FORWARD then INVERSE_SECRET_MARKER order invertibility"
+        st.set_code("encoder", "ENCODER_SECRET_MARKER"); st.mark_verified("encoder")
+        st.set_code("challenge", "CHALLENGE_SECRET_MARKER"); st.mark_verified("challenge")
+        st.set_code("solver", "print('x')")
+        secrets = ["INVERSE_SECRET_MARKER", "ENCODER_SECRET_MARKER", "CHALLENGE_SECRET_MARKER", "sloth{FLAGSECRET}"]
 
-            same_len = "y" * len(st.flag)            # correct LENGTH, wrong bytes
-            m = ag._solver_mismatch_detail(st, cbin, same_len)
-            self.assertIn("does NOT prove correct", m)   # length != correct extraction
-            self.assertIn("hypotheses", m.lower())
-            self.assertIn("NOT DETERMINABLE", m)
-            self.assertIn("did not locate", ag._solver_mismatch_detail(st, cbin, ""))  # empty -> locate hypothesis
+        # authorized stages (challenge) DO see design + encoder
+        chal = ag._challenge_prompt(st)
+        self.assertIn("ENCODER_SECRET_MARKER", chal)
+        self.assertIn("INVERSE_SECRET_MARKER", chal)
+        chal_rep = ag._repair_prompt("challenge", st, "recover-rejects-correct")
+        self.assertIn("ENCODER_SECRET_MARKER", chal_rep)
+        self.assertIn("INVERSE_SECRET_MARKER", chal_rep)
+
+        # the solver sees the PUBLIC binary evidence (what a player with a disassembler sees)...
+        st.binary_evidence = "EVIDENCE_PUBLIC_MARKER sections/strings/disasm"
+        sol = ag._solver_prompt(st)
+        sol_rep = ag._repair_prompt("solver", st, "your solver did not recover the correct flag")
+        self.assertIn("EVIDENCE_PUBLIC_MARKER", sol)
+        self.assertIn("EVIDENCE_PUBLIC_MARKER", sol_rep)
+        # ...but the solver generate + repair prompts must contain NONE of the private markers
+        for s in secrets:
+            self.assertNotIn(s, sol, f"solver generate prompt leaked {s!r}")
+            self.assertNotIn(s, sol_rep, f"solver repair prompt leaked {s!r}")
+
+        # the solver-facing feedback must not reveal the flag on ANY path:
+        # generation/repair (above), flag-swap, solver-error, or Stage-E detail.
+        flag = "sloth{FLAGSECRET}"
+        stage_e_detail = f"the solver recovered 'x' but the flag is {flag!r}"   # what Stage E might say
+        for stg, out, raw in [("solver-error", "", f"ValueError near {flag}"),
+                              ("solver-mismatch", flag, stage_e_detail),
+                              ("solver-hardcoded", "", stage_e_detail)]:
+            fb = ag._solver_feedback(stg, out, raw, flag)
+            self.assertNotIn(flag, fb, f"{stg} feedback leaked the flag")
+        # design prompt now asks for forward + inverse + order + invertibility
+        dp = ag._design_prompt(st).lower()
+        for kw in ("forward", "inverse", "order", "invertib"):
+            self.assertIn(kw, dp)
 
     def test_small_change_is_progress_not_blocked(self):
         # A one-token change must count as progress (not a no-op repair).
@@ -472,15 +503,15 @@ class AgenticElfTests(unittest.TestCase):
     def test_solver_mismatch_then_corrected(self):
         items = [{"design": "d"}, {"encoder_code": ENC_GOOD},
                  {"challenge_code": CHAL_GOOD, "success_marker": "Correct"}, {"solver_code": SOL_WRONG},
-                 {"component": "solver", "code": SOL_GOOD, "reason": "fix inverse"}]
+                 {"solver_code": SOL_GOOD}]
         with _run("ag_sol_fix", "elf", self._backend(), items) as (rep, caller, _):
             self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
             self.assertTrue(any(a.stage == "solver-mismatch" for a in rep.attempts))
 
     def test_solver_error_then_repaired_to_valid(self):
-        # Phase 1/2: a crashing solver (ValueError: byte out of range) gets STRUCTURED,
-        # hedged feedback (traceback + observed evidence + both possible causes); the next
-        # LLM repair produces a working solver and Stage E passes.
+        # Inversion-first: a crashing solver gets WALLED, player-equivalent feedback (its own
+        # traceback + generic guidance), with NO private info (no design/encoder/challenge/flag),
+        # and the next LLM repair produces a working solver so Stage E passes.
         items = [{"design": "d"}, {"encoder_code": ENC_GOOD},
                  {"challenge_code": CHAL_GOOD, "success_marker": "Correct"},
                  {"solver_code": SOL_RANGE_ERR},
@@ -488,9 +519,12 @@ class AgenticElfTests(unittest.TestCase):
         with _run("ag_solver_err", "elf", self._backend(), items) as (rep, caller, _):
             self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
             self.assertTrue(any(a.stage == "solver-error" for a in rep.attempts))
-            self.assertTrue(any("OBSERVED" in p and "ValueError" in p for p in caller.calls),
-                            "structured solver-error feedback with traceback was not fed to the model")
-            self.assertTrue(any("do not assume the inverse algorithm alone is at fault" in p for p in caller.calls))
+            # the solver repair prompt carries the solver's own traceback + mod-256 guidance...
+            self.assertTrue(any("traceback" in p.lower() and "mod 256" in p.lower() for p in caller.calls),
+                            "walled solver-error feedback was not fed to the model")
+            # ...but NEVER the encoder, the challenge source, or the design (solver independence)
+            self.assertFalse(any(ENC_GOOD.strip() in p or CHAL_GOOD.strip() in p
+                                 for p in caller.calls if "solver" in p.lower() and "python" in p.lower()))
 
     def test_solver_no_progress_then_effective_repair(self):
         # Phase 2/3 on the ambiguous solver-mismatch path: an identical diagnose reply is
@@ -499,8 +533,8 @@ class AgenticElfTests(unittest.TestCase):
         items = [{"design": "d"}, {"encoder_code": ENC_GOOD},
                  {"challenge_code": CHAL_GOOD, "success_marker": "Correct"},
                  {"solver_code": SOL_WRONG},
-                 {"component": "solver", "code": SOL_WRONG, "reason": "unchanged"},   # no-progress
-                 {"component": "solver", "code": SOL_GOOD, "reason": "fix inverse"}]  # effective
+                 {"solver_code": SOL_WRONG},   # no-progress (identical)
+                 {"solver_code": SOL_GOOD}]  # effective
         with _run("ag_solver_np", "elf", self._backend(), items) as (rep, caller, _):
             self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
             self.assertTrue(any(a.stage == "repair-no-progress" for a in rep.attempts))
@@ -515,8 +549,8 @@ class AgenticElfTests(unittest.TestCase):
         hc = f"print({flag!r})\n"  # ignores the binary; recovers only this flag
         items = [{"design": "d"}, {"encoder_code": ENC_GOOD},
                  {"challenge_code": CHAL_GOOD, "success_marker": "Correct"}, {"solver_code": hc},
-                 {"component": "solver", "code": hc, "reason": "unchanged"},
-                 {"component": "solver", "code": hc, "reason": "unchanged"}]
+                 {"solver_code": hc},
+                 {"solver_code": hc}]
         with _run("ag_hardcode", "elf", self._backend(), items,
                   budget=ag.Budget(max_repairs_per_stage=1), flag=flag) as (rep, caller, _):
             self.assertFalse(rep.success)
