@@ -6,6 +6,7 @@ solver always isolated. The Docker-free class tests the state machine: dependenc
 invalidation, crash/resume bookkeeping, persistence, and budget limits.
 """
 import contextlib
+import json
 import os
 import sys
 import unittest
@@ -114,8 +115,9 @@ class StateMachineTests(unittest.TestCase):
             self.assertFalse(st2.is_verified("solver"))
 
     def test_budget_exhaustion_terminates(self):
-        # max_llm_calls=1: design is call 1, the encoder generate is call 2 -> abort
-        # BEFORE any compile, so no Docker is needed and there is no infinite loop.
+        # max_llm_calls=1: design is call 1; the encoder generate would be call 2 and
+        # is REFUSED before it is issued (budget enforced pre-call), so exactly one
+        # invocation happens. No compile is reached, so no Docker and no infinite loop.
         with TemporaryDirectory() as tmp:
             prev = __import__("os").getcwd()
             __import__("os").chdir(tmp)
@@ -128,7 +130,31 @@ class StateMachineTests(unittest.TestCase):
                 __import__("os").chdir(prev)
         self.assertFalse(rep.success)
         self.assertEqual(rep.attempts[-1].stage, "budget-exhausted")
-        self.assertEqual(len(caller.calls), 2)   # design + encoder, then stopped
+        self.assertEqual(len(caller.calls), 1)   # design only, encoder refused pre-call
+
+    def test_budget_never_exceeds_limit(self):
+        # Regression (unit) for the pre-call budget gate: with limit N, EXACTLY N
+        # invocations may be issued and the (N+1)-th is refused before it reaches the
+        # transport. Driving _ask directly keeps this independent of any backend.
+        for n in (0, 1, 2, 3, 5):
+            with self.subTest(n=n):
+                calls = []
+
+                def caller(prompt, model):
+                    calls.append(prompt)
+                    return {"ok": True}
+
+                st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}")
+                budget = ag.Budget(max_llm_calls=n)
+                rep = ag.g.GenerationReport(name="x", model="m", directory=".", success=False)
+                issued = 0
+                with self.assertRaises(ag.BudgetExhausted):
+                    for _ in range(n + 5):          # attempt more calls than the cap
+                        ag._ask(caller, "m", budget, st, rep, "s", "generate", "p")
+                        issued += 1
+                self.assertEqual(issued, n)          # exactly N succeeded before refusal
+                self.assertEqual(len(calls), n)      # exactly N reached the transport
+                self.assertEqual(budget.llm_calls, n)
 
     def test_max_repairs_terminates(self):
         # With a native backend the encoder gate can't compile, but the generate call
@@ -149,6 +175,78 @@ class StateMachineTests(unittest.TestCase):
                 __import__("os").chdir(prev)
         self.assertFalse(rep.success)
         self.assertIn(rep.attempts[-1].stage, {"max-repairs", "budget-exhausted", "infra"})
+
+    # -- Fix 2: persistent, integral, local transcript --------------------- #
+    def test_transcript_is_integral_and_local(self):
+        with TemporaryDirectory() as tmp:
+            p = Path(tmp) / "agentic_state.json"
+            st = ag.ProjectState(name="x", target="elf", difficulty="easy",
+                                 flag="sloth{secret}", path=str(p))
+            budget = ag.Budget()
+            rep = ag.g.GenerationReport(name="x", model="m", directory=tmp, success=False)
+            # an LLM call is recorded VERBATIM (full prompt + response), not just sizes
+            ag._record_call(st, budget, rep, "design", "generate",
+                            "PROMPT-TEXT", {"design": "DESIGN-TEXT"}, 42, 0.1, "ok")
+            # a code revision records the feedback that drove it AND the new source
+            st.log({"type": "revision", "component": "encoder", "repairs": 1,
+                    "reason": "encoder.c failed to compile", "code": ENC_GOOD})
+            st.save()
+
+            # persisted in-state and survives a save/load round-trip
+            st2 = ag.ProjectState.load(p)
+            llm = next(e for e in st2.transcript if e.get("type") == "llm")
+            self.assertEqual(llm["prompt"], "PROMPT-TEXT")
+            self.assertIn("DESIGN-TEXT", llm["response"])
+            self.assertEqual(llm["tokens"], 42)
+            rev = next(e for e in st2.transcript if e.get("type") == "revision")
+            self.assertEqual(rev["code"], ENC_GOOD)
+            self.assertIn("failed to compile", rev["reason"])
+
+            # mirrored to a LOCAL append-only transcript.jsonl beside the state file
+            jl = Path(tmp) / "transcript.jsonl"
+            self.assertTrue(jl.exists())
+            self.assertEqual(jl.parent, p.parent)       # organizer-local, not distributable
+            lines = [json.loads(x) for x in jl.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(lines[0]["prompt"], "PROMPT-TEXT")
+
+    # -- Fix 3: three disjoint error classes ------------------------------- #
+    def _run_offline(self, name, items, backend):
+        prev = os.getcwd()
+        with TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            try:
+                return ag.generate_recover_agentic(name, prompt="p", target="elf",
+                                                   backend=backend, caller=Replay(items),
+                                                   resume=False)
+            finally:
+                os.chdir(prev)
+
+    def test_error_class_infra_connection(self):
+        # a connection fault from the transport -> category 'infra' (before any compile)
+        rep = self._run_offline("e_infra", [{"design": "d"}, ConnectionError], NativeBackend())
+        self.assertFalse(rep.success)
+        self.assertEqual(rep.attempts[-1].stage, "infra")
+        self.assertEqual(rep.telemetry.get("error", {}).get("category"), "infra")
+
+    def test_error_class_invalid_model_response(self):
+        # the model returns something that is not a JSON object -> 'model-invalid'
+        rep = self._run_offline("e_model", [{"design": "d"}, ["not", "a", "dict"]], NativeBackend())
+        self.assertFalse(rep.success)
+        self.assertEqual(rep.attempts[-1].stage, "model-invalid")
+        self.assertEqual(rep.telemetry.get("error", {}).get("category"), "model-invalid")
+
+    def test_error_class_verifier_fault(self):
+        # an unexpected exception INSIDE a gate -> 'verifier-error' (not 'infra')
+        class Boom:
+            name = "boom"
+            def compile_c(self, *a, **k):
+                raise RuntimeError("compiler exploded")
+        rep = self._run_offline("e_verif", [{"design": "d"}, {"encoder_code": ENC_GOOD}], Boom())
+        self.assertFalse(rep.success)
+        self.assertEqual(rep.attempts[-1].stage, "verifier-error")
+        self.assertEqual(rep.telemetry.get("error", {}).get("category"), "verifier-error")
+        self.assertIn("compiler exploded", rep.attempts[-1].detail)
 
 
 class CliTests(unittest.TestCase):

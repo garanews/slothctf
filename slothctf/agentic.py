@@ -45,6 +45,29 @@ class BudgetExhausted(Exception):
         self.reason = reason
 
 
+# --------------------------------------------------------------------------- #
+# Error taxonomy — three disjoint failure classes, reported as distinct
+# categories so a run's outcome says WHERE it broke (env vs model vs our checks).
+# --------------------------------------------------------------------------- #
+class InfraError(Exception):
+    """Environment/transport failure outside the model and outside our checks:
+    Ollama HTTP, a connection refused/timeout/DNS error, a malformed Ollama
+    stream, or the sandbox being unavailable. Reported as category 'infra'."""
+
+
+class InvalidModelResponse(Exception):
+    """The model replied with something unusable: not JSON, not a JSON object,
+    or (on a first generation) missing the required field. This is the model's
+    fault, not the environment's. Reported as category 'model-invalid'."""
+
+
+class VerifierError(Exception):
+    """An UNEXPECTED exception raised *inside* a verification gate or the Stage-E
+    verifier — a harness/checker fault, not a legitimate 'challenge rejected'
+    (gates signal rejection by returning, never by raising). Reported as
+    category 'verifier-error'. SandboxUnavailable is infra, not this."""
+
+
 @dataclass
 class Budget:
     """Hard caps so an agentic run can never loop forever or be 'valid' only
@@ -64,6 +87,17 @@ class Budget:
         if toks:
             self.tokens += int(toks)
         self.check()
+
+    def precheck(self) -> None:
+        """Enforce caps BEFORE a new LLM call is issued, so a limit of N permits at
+        most N invocations — the (N+1)-th is refused rather than issued-then-rejected.
+        This is the authoritative budget gate; `check()` remains a post-condition."""
+        if self.llm_calls >= self.max_llm_calls:
+            raise BudgetExhausted(f"max_llm_calls ({self.max_llm_calls})")
+        if self.max_tokens is not None and self.tokens >= self.max_tokens:
+            raise BudgetExhausted(f"max_tokens ({self.max_tokens})")
+        if (time.monotonic() - self._t0) > self.max_wall_seconds:
+            raise BudgetExhausted(f"max_wall_seconds ({self.max_wall_seconds})")
 
     def check(self) -> None:
         if self.llm_calls > self.max_llm_calls:
@@ -89,6 +123,22 @@ class Component:
 
 
 _DEPS = {"encoder": [], "challenge": ["encoder"], "solver": ["challenge", "encoder"]}
+
+
+def _jsonl_append(path: Optional[Path], obj: dict) -> None:
+    """Append one JSON record to a LOCAL append-only transcript. Best-effort: the
+    transcript must never fail a run, so a write error is swallowed. Local only —
+    nothing here is ever transmitted, so it may hold flags/organizer code."""
+    if not path:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError:
+        pass
 
 
 @dataclass
@@ -169,6 +219,23 @@ class ProjectState:
             os.fsync(fh.fileno())
         os.replace(tmp, p)
 
+    def transcript_path(self) -> Optional[Path]:
+        return Path(self.path).with_name("transcript.jsonl") if self.path else None
+
+    def log(self, entry: dict) -> dict:
+        """Append an INTEGRAL record to the persistent transcript. The full text of
+        prompts, responses, code revisions, feedback, stages and telemetry is kept —
+        in `self.transcript` (saved atomically inside agentic_state.json, so it
+        survives resume) and mirrored to a local append-only transcript.jsonl (which
+        survives even a crash between saves). Both are organizer-local; neither is
+        ever published."""
+        entry = dict(entry)
+        entry.setdefault("ts", time.time())
+        entry["seq"] = len(self.transcript)
+        self.transcript.append(entry)
+        _jsonl_append(self.transcript_path(), entry)
+        return entry
+
     @classmethod
     def load(cls, path: str | Path) -> "ProjectState":
         d = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -195,19 +262,29 @@ class ProjectState:
 # LLM transport (token-aware) + test hook
 # --------------------------------------------------------------------------- #
 def _invoke(caller: Callable, prompt: str, model: str) -> tuple[dict, Optional[int]]:
-    """Call the LLM. `caller(prompt, model)` may return a dict (tests / offline) or
-    a (dict, token_count) tuple (token-aware real transport)."""
-    out = caller(prompt, model)
-    if isinstance(out, tuple):
-        data, toks = out
-        return dict(data), toks
-    return dict(out), None
+    """Call the LLM and classify any failure. `caller(prompt, model)` may return a
+    dict (tests / offline) or a (dict, token_count) tuple (token-aware real transport).
+    Connection/HTTP/OS faults surface as InfraError; a non-JSON / non-object reply
+    surfaces as InvalidModelResponse. Control-flow exceptions pass through."""
+    try:
+        out = caller(prompt, model)
+    except (InfraError, InvalidModelResponse, BudgetExhausted, KeyboardInterrupt, SystemExit):
+        raise
+    except (ConnectionError, TimeoutError, OSError) as exc:
+        raise InfraError(f"{type(exc).__name__}: {exc}") from exc
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise InvalidModelResponse(f"model reply was not valid JSON: {exc}") from exc
+    data, toks = out if isinstance(out, tuple) else (out, None)
+    if not isinstance(data, dict):
+        raise InvalidModelResponse(f"model did not return a JSON object (got {type(data).__name__})")
+    return dict(data), toks
 
 
 def ollama_transport(base_url: str, temperature: float = 0.7):
     """Real token-aware transport around Ollama, reusing generator's JSON coercion.
     Returns a caller(prompt, model) -> (dict, total_tokens)."""
     from urllib import request
+    from urllib.error import URLError
 
     endpoint = g._generate_endpoint(base_url)
 
@@ -219,17 +296,36 @@ def ollama_transport(base_url: str, temperature: float = 0.7):
                               headers={"Content-Type": "application/json"}, method="POST")
         chunks: list[str] = []
         toks = 0
-        with request.urlopen(req, timeout=600) as resp:
-            for raw in resp:
-                raw = raw.strip()
-                if not raw:
-                    continue
-                piece = json.loads(raw.decode("utf-8"))
-                chunks.append(piece.get("response", ""))
-                if piece.get("done"):
-                    toks = int(piece.get("prompt_eval_count", 0)) + int(piece.get("eval_count", 0))
-                    break
-        return g._coerce_json("".join(chunks).strip()), (toks or None)
+        # Transport/protocol faults -> InfraError (Ollama/HTTP/connection layer).
+        try:
+            with request.urlopen(req, timeout=600) as resp:
+                for raw in resp:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        piece = json.loads(raw.decode("utf-8"))
+                    except (ValueError, UnicodeDecodeError) as exc:
+                        raise InfraError(f"malformed Ollama stream chunk: {exc}") from exc
+                    if piece.get("error"):
+                        raise InfraError(f"Ollama reported an error: {piece['error']}")
+                    chunks.append(piece.get("response", ""))
+                    if piece.get("done"):
+                        toks = int(piece.get("prompt_eval_count", 0)) + int(piece.get("eval_count", 0))
+                        break
+        except URLError as exc:  # HTTPError, connection refused, DNS, read timeout
+            raise InfraError(f"Ollama transport failed ({endpoint}): {exc}") from exc
+        except OSError as exc:
+            raise InfraError(f"Ollama connection failed ({endpoint}): {exc}") from exc
+        # Content validity is the MODEL's responsibility -> InvalidModelResponse.
+        text = "".join(chunks).strip()
+        try:
+            data = g._coerce_json(text)
+        except Exception as exc:
+            raise InvalidModelResponse(f"model did not return valid JSON: {exc}; head={text[:160]!r}") from exc
+        if not isinstance(data, dict):
+            raise InvalidModelResponse(f"model JSON was not an object (got {type(data).__name__})")
+        return data, (toks or None)
     return caller
 
 
@@ -399,6 +495,30 @@ def _gate_solver(state, base_dir, backend, tgt, solver_backend) -> tuple[bool, s
 _GATES = {"encoder": _gate_encoder, "challenge": _gate_challenge, "solver": _gate_solver}
 
 
+def _guard_verifier(fn, *args):
+    """Run a verification primitive (a stage gate or Stage E). A legitimate reject is
+    RETURNED by the gate as (False, stage, detail) / an AttemptResult; only an
+    UNEXPECTED exception raised inside the checker is reclassified as VerifierError.
+    Sandbox-unavailability and control-flow exceptions pass through unchanged."""
+    try:
+        return fn(*args)
+    except (SandboxUnavailable, InfraError, InvalidModelResponse, BudgetExhausted,
+            KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        raise VerifierError(f"{type(exc).__name__}: {exc}") from exc
+
+
+def _classify(report, category: str, detail: str) -> None:
+    """Record a terminal, classified failure: as the final attempt and in
+    telemetry['error'], so the failure class is visible without scanning attempts."""
+    report.attempts.append(g.AttemptResult(0, False, category, detail[:300]))
+    try:
+        report.telemetry["error"] = {"category": category, "detail": detail[:300]}  # type: ignore[index]
+    except Exception:
+        pass
+
+
 def _stage_e(state, base_dir, backend, tgt, solver_backend) -> g.AttemptResult:
     """Authoritative, model-independent final gate: the UNCHANGED recover verifier."""
     data = {"flag": state.flag, "success_marker": state.success_marker,
@@ -427,17 +547,29 @@ _AMBIGUOUS = {"solver-mismatch", "solver-hardcoded", "swap-solver-error", "swap-
 
 
 def _record_call(state, budget, report, stage, kind, prompt, payload, toks, wall_s, outcome):
-    resp = json.dumps(payload) if isinstance(payload, dict) else str(payload)
-    state.transcript.append({"stage": stage, "kind": kind, "prompt_chars": len(prompt),
-                             "resp_chars": len(resp), "tokens": toks, "wall_s": round(wall_s, 2),
-                             "outcome": outcome, "ts": time.time()})
+    resp = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else str(payload)
+    state.log({"type": "llm", "stage": stage, "kind": kind,
+               "prompt": prompt, "response": resp,            # integral, verbatim
+               "prompt_chars": len(prompt), "resp_chars": len(resp),
+               "tokens": toks, "wall_s": round(wall_s, 2), "outcome": outcome,
+               "llm_calls": budget.llm_calls, "budget_tokens": budget.tokens})
     state.budget_calls = budget.llm_calls
     state.budget_tokens = budget.tokens
 
 
 def _ask(caller, model, budget, state, report, stage, kind, prompt) -> dict:
+    budget.precheck()   # enforce the LLM-call cap BEFORE issuing the call
     t0 = time.monotonic()
-    payload, toks = _invoke(caller, prompt, model)
+    try:
+        payload, toks = _invoke(caller, prompt, model)
+    except (InfraError, InvalidModelResponse) as exc:
+        # a failed call still goes in the transcript, but does not charge the budget
+        state.log({"type": "llm", "stage": stage, "kind": kind, "prompt": prompt,
+                   "response": "", "tokens": None, "wall_s": round(time.monotonic() - t0, 2),
+                   "outcome": f"error:{type(exc).__name__}", "error": str(exc)[:600],
+                   "llm_calls": budget.llm_calls})
+        state.save()
+        raise
     budget.charge(toks)
     _record_call(state, budget, report, stage, kind, prompt, payload, toks, time.monotonic() - t0, "ok")
     return payload
@@ -451,8 +583,11 @@ def generate_recover_agentic(
 ) -> g.GenerationReport:
     """Agentic test-driven generation of a `recover` challenge. Returns a
     GenerationReport; a challenge is successful ONLY if the unchanged Stage-E gate
-    passes. Never raises for a model/verification failure; infra errors are caught
-    and recorded as category 'infra'. `caller` is the LLM hook (tests inject replay)."""
+    passes. Never raises for a model/verification failure. Terminal failures are
+    recorded under a classified category: 'budget-exhausted', 'infra' (Ollama/HTTP/
+    connection/sandbox), 'model-invalid' (unusable model reply), or 'verifier-error'
+    (an unexpected fault inside a check). `caller` is the LLM hook (tests inject
+    replay). Everything is logged to a local, never-published transcript."""
     base_dir = Path("generated") / name
     base_dir.mkdir(parents=True, exist_ok=True)
     tgt = g.get_target(target)
@@ -483,13 +618,30 @@ def generate_recover_agentic(
         c = state.comp(which)
         if c.repairs >= budget.max_repairs_per_stage:
             report.attempts.append(g.AttemptResult(0, False, "max-repairs", f"{which}: {reason}"[:300]))
+            state.log({"type": "revision", "component": which, "applied": False,
+                       "note": "max-repairs", "reason": str(reason)[:600], "repairs": c.repairs})
             return False
         state.set_code(which, code)
         c.repairs += 1
         c.gate_detail = reason
         report.telemetry["repairs"][which] = c.repairs  # type: ignore[index]
+        # integral: record the feedback that drove this revision AND the new code
+        state.log({"type": "revision", "component": which, "applied": True,
+                   "reason": str(reason)[:2000], "repairs": c.repairs,
+                   "sig": state.sig(which), "code": code})
         state.save()
         return True
+
+    def run_gate(which: str):
+        ok, sn, det = _guard_verifier(_GATES[which], state, base_dir, backend, tgt, solver_backend)
+        state.log({"type": "gate", "component": which, "stage": sn, "ok": ok, "detail": det[:600]})
+        return ok, sn, det
+
+    def run_stage_e():
+        e = _guard_verifier(_stage_e, state, base_dir, backend, tgt, solver_backend)
+        state.log({"type": "gate", "component": "final", "stage": e.stage,
+                   "ok": e.ok, "detail": (e.detail or "")[:600]})
+        return e
 
     try:
         # Stage A — design
@@ -515,7 +667,7 @@ def generate_recover_agentic(
                     state.success_marker = str(payload["success_marker"]).strip()
                 comp.status = "pending"
                 state.save()
-            ok, stage_name, detail = _GATES[which](state, base_dir, backend, tgt, solver_backend)
+            ok, stage_name, detail = run_gate(which)
             report.attempts.append(g.AttemptResult(0, ok, stage_name, detail[:300]))
             report.telemetry["stages"].append({which: stage_name})  # type: ignore[index]
             if ok:
@@ -547,7 +699,7 @@ def generate_recover_agentic(
         e_repairs = 0
         while True:
             budget.check()
-            e = _stage_e(state, base_dir, backend, tgt, solver_backend)
+            e = run_stage_e()
             e.index = 0
             report.attempts.append(e)
             report.telemetry["stages"].append({"final": e.stage})  # type: ignore[index]
@@ -581,7 +733,7 @@ def generate_recover_agentic(
                 which = next((s for s in STAGES if not state.is_verified(s)), None)
                 if which is None:
                     break
-                ok, sn, det = _GATES[which](state, base_dir, backend, tgt, solver_backend)
+                ok, sn, det = run_gate(which)
                 report.attempts.append(g.AttemptResult(0, ok, sn, det[:300]))
                 if ok:
                     state.mark_verified(which, sn)
@@ -604,18 +756,25 @@ def generate_recover_agentic(
                         state.save()
                         return report
     except BudgetExhausted as be:
-        report.attempts.append(g.AttemptResult(0, False, "budget-exhausted", be.reason))
+        _classify(report, "budget-exhausted", be.reason)
     except (KeyboardInterrupt, SystemExit):
         state.save()
         raise
-    except SandboxUnavailable as su:
-        report.attempts.append(g.AttemptResult(0, False, "infra", str(su)[:300]))
-    except Exception as exc:  # any other infra failure, recorded not raised
-        report.attempts.append(g.AttemptResult(0, False, "infra", f"{type(exc).__name__}: {exc}"[:300]))
+    except InvalidModelResponse as exc:            # the model's reply was unusable
+        _classify(report, "model-invalid", str(exc)[:300])
+    except InfraError as exc:                       # Ollama / HTTP / connection
+        _classify(report, "infra", str(exc)[:300])
+    except SandboxUnavailable as su:                # sandbox missing == infra
+        _classify(report, "infra", str(su)[:300])
+    except VerifierError as exc:                    # unexpected fault inside a check
+        _classify(report, "verifier-error", str(exc)[:300])
+    except Exception as exc:                         # unknown -> infra, recorded not raised
+        _classify(report, "infra", f"{type(exc).__name__}: {exc}"[:300])
 
     state.budget_calls = budget.llm_calls
     state.budget_tokens = budget.tokens
     report.telemetry["budget"] = {"llm_calls": budget.llm_calls, "tokens": budget.tokens}  # type: ignore[index]
+    state.log({"type": "telemetry", "success": report.success, "telemetry": report.telemetry})
     state.save()
     return report
 
