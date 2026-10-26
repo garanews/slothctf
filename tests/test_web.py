@@ -62,6 +62,9 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(web._classify("bin/challenge.exe"), "player")
         self.assertEqual(web._classify("bin/encoder.exe"), "author")  # organizer tool
         self.assertEqual(web._classify("evidence/server.log"), "player")
+        # agentic dev artifacts hold the flag/solver — must never be player-facing
+        self.assertEqual(web._classify("agentic_state.json"), "author")
+        self.assertEqual(web._classify("transcript.jsonl"), "author")
 
 
 class SafeFileTests(unittest.TestCase):

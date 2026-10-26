@@ -69,6 +69,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional free-form category/flavour hint passed to the model (e.g. 'cryptography', 'reverse engineering')",
     )
     gen.add_argument("--difficulty", choices=["easy", "medium", "hard"], default="easy", help="Difficulty level")
+    gen.add_argument(
+        "--workflow", choices=["monolithic", "agentic"], default="monolithic",
+        help="Generation workflow: 'monolithic' (default; one-shot JSON then verify/repair) or "
+             "'agentic' (EXPERIMENTAL; staged test-driven build with per-component verification "
+             "and backtracking repair). 'agentic' supports the 'recover' genre only.",
+    )
     gen.add_argument("--surprise", action="store_true", help="Let the model invent the scenario (ignores --prompt)")
     gen.add_argument("--input", type=str, default=None, help="Optional evidence file for file-based generation (reserved)")
     gen.add_argument("--context", type=str, default="", help="Extra context prepended to the prompt")
@@ -166,6 +172,27 @@ def main() -> None:
                 raise SystemExit(2)
             adv_budget = (a, s)
         backend = _resolve_cli_backend(args)
+        if getattr(args, "workflow", "monolithic") == "agentic":
+            # EXPERIMENTAL opt-in path; recover-only. Does not alter the monolithic path.
+            if args.genre != "recover":
+                print("--workflow agentic supports the 'recover' genre only", file=sys.stderr)
+                raise SystemExit(2)
+            from slothctf.agentic import generate_recover_agentic
+            report = generate_recover_agentic(
+                args.name, prompt=args.prompt, difficulty=args.difficulty, target=args.target,
+                backend=backend, model=args.model, ollama_url=args.ollama_url,
+            )
+            assert isinstance(report, GenerationReport)
+            print(report.as_text())
+            tele = getattr(report, "telemetry", None)
+            if tele:
+                b = tele.get("budget", {})
+                print(f"[agentic] final_stage={tele.get('final_stage')} "
+                      f"llm_calls={b.get('llm_calls')} tokens={b.get('tokens')} "
+                      f"repairs={tele.get('repairs', {})} no_progress={tele.get('no_progress', {})}")
+            if not report.success:
+                raise SystemExit(1)
+            return
         try:
             report = generate_challenge(
                 args.name,
