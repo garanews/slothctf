@@ -44,6 +44,24 @@ CHAL_BROKEN = ("#include <stdio.h>\nstatic const unsigned char d[]={ /*__ENCODED
                "int main(){ not valid c at all ; }\n")
 SOL_WRONG = "print('sloth{definitely_not_it}')\n"          # valid python, wrong output -> mismatch
 
+# XOR 0x5a challenge that hardcodes a wrong flag length (32) -> rejects the real flag,
+# reproducing the first A100 run's defect; marker matches CHAL_FIXED below.
+CHAL_BADLEN = ("#include <stdio.h>\n#include <string.h>\n"
+               "static const unsigned char data[]={ /*__ENCODED_ARRAY__*/ };\n"
+               "int main(void){char b[256];if(!fgets(b,sizeof b,stdin)){printf(\"no\\n\");return 0;}"
+               "size_t n=strlen(b);if(n&&b[n-1]=='\\n')b[--n]=0;"
+               "if(n!=32){printf(\"WRONG_INPUT\\n\");return 0;}"
+               "for(size_t i=0;i<n;i++)if(((unsigned char)b[i]^0x5a)!=data[i]){printf(\"WRONG_INPUT\\n\");return 0;}"
+               "printf(\"FLAG_RECOVERED\\n\");return 0;}\n")
+# the same challenge with the length derived from the embedded array (the correct fix).
+CHAL_FIXED = ("#include <stdio.h>\n#include <string.h>\n"
+              "static const unsigned char data[]={ /*__ENCODED_ARRAY__*/ };\n"
+              "int main(void){char b[256];if(!fgets(b,sizeof b,stdin)){printf(\"no\\n\");return 0;}"
+              "size_t n=strlen(b);if(n&&b[n-1]=='\\n')b[--n]=0;"
+              "if(n!=sizeof data){printf(\"WRONG_INPUT\\n\");return 0;}"
+              "for(size_t i=0;i<n;i++)if(((unsigned char)b[i]^0x5a)!=data[i]){printf(\"WRONG_INPUT\\n\");return 0;}"
+              "printf(\"FLAG_RECOVERED\\n\");return 0;}\n")
+
 
 def _mk(design="d", **payloads):
     return dict(payloads)
@@ -253,6 +271,58 @@ class StateMachineTests(unittest.TestCase):
             self.assertEqual(len(lines), 2)
             self.assertEqual(lines[0]["prompt"], "PROMPT-TEXT")
 
+    # -- Phase 2: Stage C can consult the verified encoder ----------------- #
+    def test_stage_c_prompt_includes_verified_encoder(self):
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}")
+        st.design = "DESIGN-TEXT"
+        st.set_code("encoder", ENC_GOOD); st.mark_verified("encoder")
+        gen = ag._challenge_prompt(st)
+        self.assertIn(ENC_GOOD.strip(), gen)                 # generate prompt carries the encoder
+        rep = ag._repair_prompt("challenge", st, "recover-rejects-correct: got 'WRONG_INPUT'")
+        self.assertIn(ENC_GOOD.strip(), rep)                 # repair prompt carries the encoder
+        self.assertIn("DESIGN-TEXT", rep)                    # ...and the design
+        self.assertIn("recover-rejects-correct", rep)        # ...and the actual error
+
+    # -- Phase 3/4: no-progress detection, no wasted call, full telemetry --- #
+    def test_no_progress_detected_no_superfluous_call_full_telemetry(self):
+        # A backend whose compile always fails, so the encoder gate keeps failing; the
+        # model resends identical code. We must detect no-progress, escalate, stop at the
+        # repair budget WITHOUT an un-appliable extra call, and still report telemetry.
+        class _R:
+            ok = False
+            stderr = "syntax error near 'this'"
+        class _CompileFail:
+            name = "fake"
+            def compile_c(self, *a, **k):
+                return _R()
+        with TemporaryDirectory() as tmp:
+            prev = os.getcwd()
+            os.chdir(tmp)
+            try:
+                items = [{"design": "d"}] + [{"encoder_code": ENC_BROKEN}] * 8
+                caller = Replay(items)
+                rep = ag.generate_recover_agentic(
+                    "np", prompt="p", target="elf", backend=_CompileFail(), caller=caller,
+                    budget=ag.Budget(max_repairs_per_stage=2, max_llm_calls=20), resume=False)
+            finally:
+                os.chdir(prev)
+        np = [a for a in rep.attempts if a.stage == "repair-no-progress"]
+        self.assertEqual(len(np), 2, [a.stage for a in rep.attempts])     # both identical repairs flagged
+        self.assertEqual(rep.telemetry.get("no_progress", {}).get("encoder"), 2)
+        self.assertEqual(rep.attempts[-1].stage, "max-repairs")
+        # design + encoder generate + exactly 2 repairs; the 3rd repair is NOT issued
+        self.assertEqual(len(caller.calls), 4)
+        # Phase 4: telemetry complete even on the max-repairs path
+        self.assertEqual(rep.telemetry["budget"]["llm_calls"], 4)
+        self.assertEqual(rep.telemetry["final_stage"], "max-repairs")
+        self.assertIsNotNone(rep.telemetry["budget"]["tokens"])
+
+    def test_small_change_is_progress_not_blocked(self):
+        # A one-token change must count as progress (not a no-op repair).
+        self.assertNotEqual(ag._normalize(ENC_GOOD), ag._normalize(ENC_GOOD.replace("0x5a", "0x5b")))
+        # pure trailing-whitespace / newline differences are NOT progress
+        self.assertEqual(ag._normalize(ENC_GOOD), ag._normalize(ENC_GOOD.rstrip() + "\n\n  "))
+
     # -- Fix 3: three disjoint error classes ------------------------------- #
     def _run_offline(self, name, items, backend):
         prev = os.getcwd()
@@ -386,6 +456,22 @@ class AgenticElfTests(unittest.TestCase):
             self.assertFalse(rep.success)
             self.assertTrue(any(a.stage == "solver-hardcoded" for a in rep.attempts),
                             [(a.stage, a.detail[:60]) for a in rep.attempts])
+
+    def test_badlen_challenge_repaired_with_diagnostic(self):
+        # Phase 2 end-to-end: a challenge that rejects the correct flag (hardcoded length)
+        # is repaired after the harness feeds back the concrete length diagnostic and the
+        # verified encoder. The LLM still authors the fix (replayed here).
+        items = [{"design": "d"}, {"encoder_code": ENC_GOOD},
+                 {"challenge_code": CHAL_BADLEN, "success_marker": "FLAG_RECOVERED"},
+                 {"challenge_code": CHAL_FIXED, "success_marker": "FLAG_RECOVERED"},
+                 {"solver_code": SOL_GOOD}]
+        with _run("ag_badlen_fix", "elf", self._backend(), items) as (rep, caller, _):
+            self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
+            self.assertTrue(any(a.stage == "recover-rejects-correct" for a in rep.attempts))
+            self.assertTrue(any("embedded array has" in p for p in caller.calls),
+                            "concrete length diagnostic was not fed to the model")
+            self.assertTrue(any(ENC_GOOD.strip() in p for p in caller.calls),
+                            "verified encoder was not provided to Stage C")
 
     def test_crash_then_resume(self):
         import os

@@ -375,10 +375,13 @@ def _encoder_prompt(state: ProjectState) -> str:
 def _challenge_prompt(state: ProjectState) -> str:
     return (
         f"Your design:\n{state.design}\n\n"
+        "The VERIFIED encoder (organizer tool) that produced the embedded bytes — your challenge "
+        f"MUST invert exactly this transform, byte for byte:\n{state.encoder.code}\n\n"
         f"The encoder output bytes will be substituted at the token {g.ENCODED_PLACEHOLDER}. "
         "Write challenge_code: a COMPLETE C program given to the player. Declare the embedded "
         f"array as a file-scope `static const unsigned char NAME[] = {{ {g.ENCODED_PLACEHOLDER} }};` "
-        "and actually use it. Read one line from stdin, strip the newline, print EXACTLY the "
+        "and actually use it. Derive the number of bytes from the array itself (e.g. sizeof(NAME)); "
+        "do NOT hardcode a flag length. Read one line from stdin, strip the newline, print EXACTLY the "
         "success marker iff the input equals the flag, otherwise a different message; never print "
         "the flag, and keep no plaintext flag literal. Size buffers correctly (memcmp with a known "
         "length, or NUL-terminate before strcmp). Use only headers available on "
@@ -407,7 +410,19 @@ _REPAIR_PROMPTS = {
 
 
 def _repair_prompt(which: str, state: ProjectState, err: str) -> str:
-    return _REPAIR_PROMPTS[which].format(err=err[:600], code=state.comp(which).code)
+    base = _REPAIR_PROMPTS[which].format(err=err[:1500], code=state.comp(which).code)
+    if which == "challenge":
+        # Stage C repairs need the verified encoder + design, and must diagnose, not guess.
+        base += ("\n\nThe VERIFIED encoder whose transform you MUST invert exactly (derive the length "
+                 f"from the embedded array, never a fixed constant):\n{state.encoder.code}\n"
+                 f"Your design:\n{state.design}\n"
+                 "First determine the SINGLE concrete cause of the divergence — compare your decode "
+                 "length, indices, casts and types against the encoder and the reported error — then "
+                 "return challenge_code that changes exactly that.")
+    elif which == "solver":
+        base += (f"\n\nThe challenge C source you must invert:\n{state.challenge.code}\n"
+                 f"The verified encoder:\n{state.encoder.code}\n")
+    return base
 
 
 def _diagnose_prompt(state: ProjectState, err: str) -> str:
@@ -475,7 +490,17 @@ def _gate_challenge(state, base_dir, backend, tgt, solver_backend) -> tuple[bool
     bad = backend.run_binary(base_dir, _chal_rel(tgt), tgt, stdin_text="definitely_wrong_" + state.flag + "\n")
     prob = g._recover_execution_problem(good, bad, marker, state.flag)
     if prob is not None:
-        return False, prob[0], prob[1]
+        # Phase 2: attach a concrete, transform-agnostic diagnostic from the probe — the
+        # real lengths (data we already hold) and what the program actually printed — so
+        # the repair has something to act on besides "the correct flag was rejected".
+        want_len = state.encoder.artifacts.get("want_len")
+        first = ((good.stdout or "").strip().splitlines() or [""])[0][:48]
+        diag = (f" | diagnostic from feeding the correct flag: the flag is {len(state.flag)} bytes and the "
+                f"embedded array has {want_len} bytes (one encoded byte per flag byte); the program printed "
+                f"{first!r} instead of the marker {marker!r}. Derive the number of bytes from the embedded "
+                f"array itself (e.g. sizeof), never a fixed constant, and invert the encoder transform "
+                f"byte-for-byte.")
+        return False, prob[0], prob[1] + diag
     # contiguity stays a non-fatal diagnostic (P1)
     want = g._tokens_to_bytes(body)
     state.challenge.artifacts = {"encoded_bytes_contiguous": bool(len(want) >= 4 and want in cbin.read_bytes())}
@@ -525,6 +550,13 @@ def _classify(report, category: str, detail: str) -> None:
         report.telemetry["error"] = {"category": category, "detail": detail[:300]}  # type: ignore[index]
     except Exception:
         pass
+
+
+def _normalize(code: str) -> str:
+    """Whitespace-insensitive view of source, for no-progress detection. Trailing
+    whitespace and a trailing newline do not count as a change, but ANY token change
+    does — so a legitimate one-character fix is still treated as progress."""
+    return "\n".join(line.rstrip() for line in (code or "").strip().splitlines())
 
 
 def _stage_e(state, base_dir, backend, tgt, solver_backend) -> g.AttemptResult:
@@ -655,6 +687,43 @@ def generate_recover_agentic(
                    "ok": e.ok, "detail": (e.detail or "")[:600]})
         return e
 
+    escalate: dict[str, str] = {}   # per-component extra feedback after a no-progress repair
+
+    def fetch_fix(responsible: str, detail: str):
+        """Obtain a CHANGED fix for a known-responsible component (Phase 2/3). Pre-checks
+        the repair budget so a call that could no longer be applied is never issued; when
+        the model resends identical code it records a `repair-no-progress` event, escalates
+        the feedback and retries WITHOUT recompiling, all within budget. Returns
+        (newcode, marker) once the code actually changes, or None when the component's
+        repair budget is exhausted. Applying the returned code is the caller's job."""
+        while True:
+            c = state.comp(responsible)
+            if c.repairs >= budget.max_repairs_per_stage:           # never issue an un-appliable call
+                report.attempts.append(g.AttemptResult(0, False, "max-repairs", f"{responsible}: {detail[:160]}"[:300]))
+                state.log({"type": "max-repairs", "component": responsible})
+                return None
+            payload = _ask(caller, model, budget, state, report, responsible, "repair",
+                           _repair_prompt(responsible, state, detail + escalate.get(responsible, "")))
+            newcode = str(payload.get(f"{responsible}_code", c.code))
+            marker = (str(payload["success_marker"]).strip()
+                      if responsible == "challenge" and payload.get("success_marker") else None)
+            if _normalize(newcode) != _normalize(c.code):          # real change -> progress
+                escalate.pop(responsible, None)
+                return newcode, marker
+            # no progress: record, escalate the feedback, bound via the repair counter, retry
+            c.repairs += 1
+            np = report.telemetry.setdefault("no_progress", {})     # type: ignore[union-attr]
+            np[responsible] = np.get(responsible, 0) + 1
+            report.attempts.append(g.AttemptResult(0, False, "repair-no-progress",
+                                                   f"{responsible}: identical reply; escalating feedback"[:300]))
+            state.log({"type": "repair-no-progress", "component": responsible,
+                       "repairs": c.repairs, "detail": detail[:600]})
+            escalate[responsible] = ("\n\nNOTE: your previous reply was byte-for-byte identical and did NOT fix "
+                                     "the defect — do not resend the same code. Name the ONE concrete cause of the "
+                                     "divergence (check the decode length/indices/casts against the encoder) and "
+                                     "change exactly that.")
+            state.save()
+
     try:
         # Stage A — design
         if not state.design:
@@ -688,24 +757,32 @@ def generate_recover_agentic(
                 continue
             # failed -> repair (LLM-authored), possibly backtracking
             if stage_name in _AMBIGUOUS:
+                # ambiguous (solver-mismatch / swap): the model picks the responsible component.
+                if all(state.comp(s).repairs >= budget.max_repairs_per_stage for s in STAGES):
+                    report.attempts.append(g.AttemptResult(0, False, "max-repairs", f"{which}: {stage_name}"[:300]))
+                    return report
                 payload = _ask(caller, model, budget, state, report, which, "diagnose", _diagnose_prompt(state, detail))
                 responsible = str(payload.get("component", which))
                 if responsible not in STAGES:
                     responsible = which
                 newcode = str(payload.get("code", state.comp(responsible).code))
                 reason = str(payload.get("reason", detail))[:300]
+                if not apply_fix(responsible, newcode, reason):
+                    state.save()
+                    return report  # repair budget exhausted for a component
             else:
+                # unambiguous: known responsible component; fetch a CHANGED fix within budget.
                 responsible = _UNAMBIGUOUS.get(stage_name, which)
-                key = f"{responsible}_code"
-                payload = _ask(caller, model, budget, state, report, responsible, "repair",
-                               _repair_prompt(responsible, state, detail))
-                newcode = str(payload.get(key, state.comp(responsible).code))
-                if responsible == "challenge" and payload.get("success_marker"):
-                    state.success_marker = str(payload["success_marker"]).strip()
-                reason = detail[:300]
-            if not apply_fix(responsible, newcode, reason):
-                state.save()
-                return report  # repair budget exhausted for a component
+                got = fetch_fix(responsible, detail)
+                if got is None:
+                    state.save()
+                    return report  # repair budget exhausted for this component
+                newcode, marker = got
+                if marker:
+                    state.success_marker = marker
+                if not apply_fix(responsible, newcode, detail[:300]):
+                    state.save()
+                    return report
 
         # Stage E — authoritative, unchanged verifier
         e_repairs = 0
@@ -730,15 +807,18 @@ def generate_recover_agentic(
                 responsible = responsible if responsible in STAGES else "solver"
                 newcode = str(payload.get("code", state.comp(responsible).code))
                 reason = str(payload.get("reason", e.detail))[:300]
+                if not apply_fix(responsible, newcode, reason):
+                    break
             else:
                 responsible = _UNAMBIGUOUS.get(e.stage, "challenge")
-                key = f"{responsible}_code"
-                payload = _ask(caller, model, budget, state, report, responsible, "repair",
-                               _repair_prompt(responsible, state, e.detail))
-                newcode = str(payload.get(key, state.comp(responsible).code))
-                reason = e.detail[:300]
-            if not apply_fix(responsible, newcode, reason):
-                break
+                got = fetch_fix(responsible, e.detail)
+                if got is None:
+                    break
+                newcode, marker = got
+                if marker:
+                    state.success_marker = marker
+                if not apply_fix(responsible, newcode, e.detail[:300]):
+                    break
             # re-verify any now-invalidated upstream stages before the next E
             while True:
                 budget.check()
@@ -752,25 +832,29 @@ def generate_recover_agentic(
                     state.save()
                 else:
                     # fold back into the same repair machinery via a fresh fix
-                    resp = _UNAMBIGUOUS.get(sn, which)
                     if sn in _AMBIGUOUS:
+                        resp = _UNAMBIGUOUS.get(sn, which)
                         pl = _ask(caller, model, budget, state, report, which, "diagnose", _diagnose_prompt(state, det))
                         resp = str(pl.get("component", which)); resp = resp if resp in STAGES else which
                         nc = str(pl.get("code", state.comp(resp).code)); rs = str(pl.get("reason", det))[:300]
+                        if not apply_fix(resp, nc, rs):
+                            state.save()
+                            return report
                     else:
-                        k = f"{resp}_code"
-                        pl = _ask(caller, model, budget, state, report, resp, "repair", _repair_prompt(resp, state, det))
-                        nc = str(pl.get(k, state.comp(resp).code))
-                        if resp == "challenge" and pl.get("success_marker"):
-                            state.success_marker = str(pl["success_marker"]).strip()
-                        rs = det[:300]
-                    if not apply_fix(resp, nc, rs):
-                        state.save()
-                        return report
+                        resp = _UNAMBIGUOUS.get(sn, which)
+                        got = fetch_fix(resp, det)
+                        if got is None:
+                            state.save()
+                            return report
+                        nc, marker = got
+                        if marker:
+                            state.success_marker = marker
+                        if not apply_fix(resp, nc, det[:300]):
+                            state.save()
+                            return report
     except BudgetExhausted as be:
         _classify(report, "budget-exhausted", be.reason)
     except (KeyboardInterrupt, SystemExit):
-        state.save()
         raise
     except InvalidModelResponse as exc:            # the model's reply was unusable
         _classify(report, "model-invalid", str(exc)[:300])
@@ -782,12 +866,15 @@ def generate_recover_agentic(
         _classify(report, "verifier-error", str(exc)[:300])
     except Exception as exc:                         # unknown -> infra, recorded not raised
         _classify(report, "infra", f"{type(exc).__name__}: {exc}"[:300])
-
-    state.budget_calls = budget.llm_calls
-    state.budget_tokens = budget.tokens
-    report.telemetry["budget"] = {"llm_calls": budget.llm_calls, "tokens": budget.tokens}  # type: ignore[index]
-    state.log({"type": "telemetry", "success": report.success, "telemetry": report.telemetry})
-    state.save()
+    finally:
+        # Phase 4: telemetry (llm_calls, tokens, final stage) is populated on EVERY exit
+        # path — success, early max-repairs return, classified error, or interrupt.
+        state.budget_calls = budget.llm_calls
+        state.budget_tokens = budget.tokens
+        report.telemetry["budget"] = {"llm_calls": budget.llm_calls, "tokens": budget.tokens}  # type: ignore[index]
+        report.telemetry["final_stage"] = report.attempts[-1].stage if report.attempts else None  # type: ignore[index]
+        state.log({"type": "telemetry", "success": report.success, "telemetry": report.telemetry})
+        state.save()
     return report
 
 

@@ -187,8 +187,9 @@ def main() -> None:
             tele = getattr(report, "telemetry", None)
             if tele:
                 b = tele.get("budget", {})
-                print(f"[agentic] llm_calls={b.get('llm_calls')} tokens={b.get('tokens')} "
-                      f"repairs={tele.get('repairs', {})}")
+                print(f"[agentic] final_stage={tele.get('final_stage')} "
+                      f"llm_calls={b.get('llm_calls')} tokens={b.get('tokens')} "
+                      f"repairs={tele.get('repairs', {})} no_progress={tele.get('no_progress', {})}")
             if not report.success:
                 raise SystemExit(1)
             return
