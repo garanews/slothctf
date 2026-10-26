@@ -45,9 +45,11 @@ The plan is the Cartesian product of the matrix × `repeats`, each with a stable
 `"{genre}_{difficulty}_{target}_{workflow}_{NN}"`, executed in order. Each generation
 gets an independent random flag from the generator.
 
-Caveats (the generators are frozen, so these are honoured, not overridden):
-- **agentic** applies `inference.temperature`; `num_ctx` is the transport's fixed 4096 (recorded in the fingerprint for the record).
-- **monolithic** uses the generator's own transport; its `budget.max_attempts` is honoured, other inference params are recorded but applied via the generator defaults.
+Inference parameters are actually applied, so the fingerprint matches what is sent:
+- **agentic** applies both `inference.temperature` and `inference.num_ctx`.
+- **monolithic** uses the configured `ollama_url` and `budget.max_attempts`; it does **not**
+  support `temperature` / `num_ctx` overrides, so specifying them for a monolithic workflow
+  is **rejected at config time** rather than silently ignored.
 
 ## Fingerprint & reproducibility
 
@@ -62,12 +64,33 @@ as an `endpoint_change` in the operational log).
 ## Resume & interruptions
 
 - **Completed** model generations (`valid` / `model-failure`) are never repeated.
-- A caught transport fault is recorded as **`infra`**; the campaign stops (no auto-retry), everything is preserved.
-- A process **killed** mid-generation leaves an `attempt_start` with no result. On the next
-  `resume` it is classified as **`incomplete`**, preserved, and a fresh attempt is created —
-  it is *not* counted as a model failure, and the earlier attempt is not overwritten.
-- `campaign.jsonl` is **append-only** with per-line `fsync`; a truncated trailing line from
-  an interrupted write is tolerated on read.
+- Attempts are classified distinctly, and all preserve their artifacts:
+  - **`infra`** — a real transport/sandbox fault (connection, Docker, `InfraError`). Stops the campaign (no auto-retry).
+  - **`runner-error`** — an unexpected runner/verifier fault. Stops the campaign; **not** an infra problem and **not** a model failure.
+  - **`interrupted`** — an explicit Ctrl-C / `SystemExit`. Recorded, then propagated.
+  - **`incomplete`** — a process killed mid-generation (an `attempt_start` with no result). Detected on the next `resume`, preserved, a fresh attempt is created; **not** a model failure.
+  None of these count in the model success-rate denominator.
+
+### JSONL integrity (`campaign.jsonl`)
+
+Append-only, per-line `fsync`. Before a run/resume/report the dataset is made safe:
+- A **truncated final line** (an interrupted append with no terminating newline) is
+  recoverable: the full damaged bytes are first copied to `campaign.jsonl.corrupt-<ts>`,
+  then the file is rewritten with only the complete valid records (so a later append never
+  concatenates onto damaged bytes).
+- A malformed **complete / intermediate** record is **not** silently dropped: the original
+  is preserved to a `.corrupt-<ts>` copy and the command **refuses** with an error.
+- No valid event is ever silently lost.
+
+## Exit codes (`run` and `resume`)
+
+| code | meaning |
+|---|---|
+| `0` | campaign completed — even if some challenges failed for model-attributable reasons |
+| `2` | usage / config / fingerprint error |
+| `3` | stopped by a real infrastructure fault |
+| `4` | stopped by an unexpected runner/verifier error |
+| `130` | interrupted by the user (Ctrl-C) — data preserved, `resume` to continue |
 
 ## Outputs (all local, under `generated/<dest>/`)
 
@@ -84,7 +107,7 @@ as an `endpoint_change` in the operational log).
 `report.md` / `report.csv` separate, deliberately:
 - **Completed** model generations — the only success-rate denominator.
 - **Model** successes / failures, with failure-by-stage.
-- **Infra-interrupted** and **incomplete/killed** attempts — reported separately, excluded from the denominator.
+- **Infra**, **runner/verifier-error**, **user-interrupted** and **incomplete/killed** attempts — each reported separately and excluded from the denominator.
 - Calls / tokens / duration (median + range), effective repairs, no-progress events; cost per valid challenge.
 - A **heuristic** mechanic-family breakdown, clearly marked as not a verified property.
 - Unavailable token counts are left blank — never shown as zero.

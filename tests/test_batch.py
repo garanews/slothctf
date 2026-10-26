@@ -46,7 +46,7 @@ def make_mock(outcome_fn):
     returns a GenerationReport. `outcome_fn(spec, attempt_count)` -> outcome string."""
     counts = {}
 
-    def mock(spec, name, config, caller):
+    def mock(spec, name, config, caller, url=None):
         counts[spec["id"]] = counts.get(spec["id"], 0) + 1
         oc = outcome_fn(spec, counts[spec["id"]])
         if oc == "raise":
@@ -101,7 +101,7 @@ class BatchMechanicsTests(unittest.TestCase):
         with TemporaryDirectory() as tmp, _cwd(tmp):
             cfg = dict(BASE_CFG); cfg["repeats"] = 3
             batch._generate = make_mock(lambda spec, n: "valid" if spec["id"].endswith("_02") else "model-failure")
-            camp = batch.cmd_run(_write_cfg(tmp, cfg), caller_factory=lambda *a: None, digest_fn=self._digest)
+            camp, _ = batch.cmd_run(_write_cfg(tmp, cfg), caller_factory=lambda *a: None, digest_fn=self._digest)
             recs = batch._read_jsonl(camp / "campaign.jsonl")
             results = [r for r in recs if r.get("event") == "attempt_result"]
             self.assertEqual(len(results), 3)                         # all 3 completed
@@ -122,7 +122,7 @@ class BatchMechanicsTests(unittest.TestCase):
                 return "model-failure"
             batch._generate = make_mock(oc)
             cfg = _write_cfg(tmp)
-            camp = batch.cmd_run(cfg, caller_factory=lambda *a: None, digest_fn=self._digest)
+            camp, _ = batch.cmd_run(cfg, caller_factory=lambda *a: None, digest_fn=self._digest)
             recs = batch._read_jsonl(camp / "campaign.jsonl")
             # stopped at run_02 infra; run_03 not attempted
             self.assertTrue(any(r.get("event") == "STOP" for r in recs))
@@ -147,7 +147,7 @@ class BatchMechanicsTests(unittest.TestCase):
             batch._generate = make_mock(lambda spec, n: "model-failure")
             # start a campaign and let it finish, then simulate a KILLED run by hand:
             cfg = dict(BASE_CFG); cfg["repeats"] = 1
-            camp = batch.cmd_run(_write_cfg(tmp, cfg), caller_factory=lambda *a: None, digest_fn=self._digest)
+            camp, _ = batch.cmd_run(_write_cfg(tmp, cfg), caller_factory=lambda *a: None, digest_fn=self._digest)
             # fabricate a killed future attempt: an attempt_start with NO result for a fresh id
             # (simulate by appending a dangling start for run_01 attempt_02 as if the process died)
             batch._append(camp / "campaign.jsonl",
@@ -164,7 +164,7 @@ class BatchMechanicsTests(unittest.TestCase):
     def test_fingerprint_refuses_digest_change(self):
         with TemporaryDirectory() as tmp, _cwd(tmp):
             batch._generate = make_mock(lambda spec, n: "model-failure")
-            camp = batch.cmd_run(_write_cfg(tmp), caller_factory=lambda *a: None, digest_fn=self._digest)
+            camp, _ = batch.cmd_run(_write_cfg(tmp), caller_factory=lambda *a: None, digest_fn=self._digest)
             with self.assertRaises(batch.BatchError):
                 batch.cmd_resume(camp, caller_factory=lambda *a: None, digest_fn=lambda *_: "f00dface" * 8)
 
@@ -172,22 +172,148 @@ class BatchMechanicsTests(unittest.TestCase):
         with TemporaryDirectory() as tmp, _cwd(tmp):
             # run_02 infra so there's something to resume; same digest regardless of url
             batch._generate = make_mock(lambda spec, n: ("infra" if (spec["id"].endswith("_02") and n == 1) else "model-failure"))
-            camp = batch.cmd_run(_write_cfg(tmp), caller_factory=lambda *a: None, digest_fn=self._digest)
+            camp, _ = batch.cmd_run(_write_cfg(tmp), caller_factory=lambda *a: None, digest_fn=self._digest)
             batch.cmd_resume(camp, ollama_url="http://tunnel-2-NEW", caller_factory=lambda *a: None, digest_fn=self._digest)
             recs = batch._read_jsonl(camp / "campaign.jsonl")
             self.assertTrue(any(r.get("event") == "endpoint_change" and r.get("to") == "http://tunnel-2-NEW" for r in recs))
             self.assertEqual(json.loads((camp / "manifest.json").read_text())["url_current"], "http://tunnel-2-NEW")
 
-    def test_corrupt_trailing_line_tolerated(self):
+    def test_truncated_tail_recovered_with_diagnostic_and_resume(self):
+        # Simulate a crash in the MIDDLE of a write: the final line has no newline. The
+        # truncated tail is recoverable; the full damaged bytes are preserved, the tail is
+        # dropped, no valid event is lost, and resume completes with no concatenation.
         with TemporaryDirectory() as tmp, _cwd(tmp):
-            batch._generate = make_mock(lambda spec, n: "model-failure")
-            camp = batch.cmd_run(_write_cfg(tmp), caller_factory=lambda *a: None, digest_fn=self._digest)
-            with (camp / "campaign.jsonl").open("a", encoding="utf-8") as fh:
-                fh.write('{"event": "attempt_resu')          # truncated write (no newline)
-            recs = batch._read_jsonl(camp / "campaign.jsonl")  # must not raise
-            self.assertTrue(len(recs) > 0)
-            batch.write_report(camp)                           # report still generates
+            # run_02 infra so resume has work left to do
+            batch._generate = make_mock(lambda spec, n: ("infra" if (spec["id"].endswith("_02") and n == 1) else "model-failure"))
+            camp, _ = batch.cmd_run(_write_cfg(tmp), caller_factory=lambda *a: None, digest_fn=self._digest)
+            jl = camp / "campaign.jsonl"
+            before = batch._read_jsonl(jl)                     # clean, parses fine
+            with jl.open("a", encoding="utf-8") as fh:
+                fh.write('{"event":"attempt_start","id":"recover_easy_elf_agentic_03"')  # killed mid-write
+            with self.assertRaises(batch.BatchError):
+                batch._read_jsonl(jl)                          # strict read rejects the damaged file
+            batch.cmd_resume(camp, caller_factory=lambda *a: None, digest_fn=self._digest)
+            # damaged bytes preserved in a diagnostic artifact
+            self.assertTrue(any(p.name.startswith("campaign.jsonl.corrupt-") for p in camp.iterdir()))
+            after = batch._read_jsonl(jl)                      # now clean (no concatenation)
+            # every previously-complete event survived; the truncated tail is gone
+            self.assertTrue(len(after) >= len(before))
+            self.assertFalse(any(r.get("id") == "recover_easy_elf_agentic_03" and r.get("event") == "attempt_start"
+                                 and set(r.keys()) == {"event", "id"} for r in after))
             self.assertTrue((camp / "report.md").exists())
+
+    def test_midrecord_corruption_refused_with_diagnostic(self):
+        # A malformed COMPLETE (newline-terminated) record in the middle is NOT auto-dropped:
+        # preserved + BatchError, so no valid event vanishes silently.
+        with TemporaryDirectory() as tmp, _cwd(tmp):
+            batch._generate = make_mock(lambda spec, n: ("infra" if (spec["id"].endswith("_02") and n == 1) else "model-failure"))
+            camp, _ = batch.cmd_run(_write_cfg(tmp), caller_factory=lambda *a: None, digest_fn=self._digest)
+            jl = camp / "campaign.jsonl"
+            with jl.open("a", encoding="utf-8") as fh:
+                fh.write("THIS IS NOT JSON\n")                 # complete, but corrupt, record
+                fh.write('{"event":"note","ok":true}\n')       # a valid record after it
+            with self.assertRaises(batch.BatchError):
+                batch.cmd_resume(camp, caller_factory=lambda *a: None, digest_fn=self._digest)
+            self.assertTrue(any(p.name.startswith("campaign.jsonl.corrupt-") for p in camp.iterdir()))
+
+    def test_inference_applied_in_ollama_payload(self):
+        # the REAL payload sent to Ollama carries the configured temperature + num_ctx
+        import urllib.request as urllib_request
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def __iter__(self):
+                yield b'{"response":"{}","done":false}\n'
+                yield b'{"response":"","done":true,"prompt_eval_count":1,"eval_count":1}\n'
+        captured = {}
+        orig = urllib_request.urlopen
+        try:
+            urllib_request.urlopen = lambda req, timeout=None: (captured.update(body=req.data), _Resp())[1]
+            ag.ollama_transport("http://x", temperature=0.33, num_ctx=2048)("prompt", "model")
+        finally:
+            urllib_request.urlopen = orig
+        sent = json.loads(captured["body"].decode())
+        self.assertEqual(sent["options"]["temperature"], 0.33)
+        self.assertEqual(sent["options"]["num_ctx"], 2048)
+
+    def test_caller_factory_wires_inference(self):
+        rec = {}
+        orig = ag.ollama_transport
+        try:
+            ag.ollama_transport = lambda url, temperature=0.7, num_ctx=4096: rec.update(t=temperature, c=num_ctx) or "C"
+            c = batch._default_caller_factory("agentic", "http://e", {"temperature": 0.2, "num_ctx": 1024})
+        finally:
+            ag.ollama_transport = orig
+        self.assertEqual((rec["t"], rec["c"], c), (0.2, 1024, "C"))
+        self.assertIsNone(batch._default_caller_factory("monolithic", "http://e", {}))   # monolithic -> own transport
+
+    def test_monolithic_passes_configured_url(self):
+        captured = {}
+        orig_be, orig_gen = batch._resolve_isolated_backend, gen.generate_challenge
+        try:
+            batch._resolve_isolated_backend = lambda target, iso: object()
+
+            def fake_generate(name, **kw):
+                captured.update(kw)
+                rep = gen.GenerationReport(name=name, model=kw.get("model", "m"), directory=".", success=False)
+                rep.attempts = []; rep.telemetry = {}
+                return rep
+            gen.generate_challenge = fake_generate
+            spec = {"id": "reverse_easy_elf_monolithic_01", "genre": "reverse", "difficulty": "easy",
+                    "target": "elf", "workflow": "monolithic"}
+            batch._generate(spec, "n", {"model": "m", "prompt": "p", "budget": {}}, None, "http://CONFIGURED")
+        finally:
+            batch._resolve_isolated_backend, gen.generate_challenge = orig_be, orig_gen
+        self.assertEqual(captured.get("ollama_url"), "http://CONFIGURED")   # was defaulting before
+
+    def test_monolithic_rejects_inference_override(self):
+        with TemporaryDirectory() as tmp, _cwd(tmp):
+            cfg = dict(BASE_CFG)
+            cfg["matrix"] = {"genres": ["reverse"], "difficulties": ["easy"], "targets": ["elf"], "workflows": ["monolithic"]}
+            cfg["inference"] = {"temperature": 0.9}
+            with self.assertRaises(batch.BatchError):
+                batch.load_config(_write_cfg(tmp, cfg))
+
+    def test_error_classification_infra_runner_interrupt(self):
+        def one(exc_type):
+            with TemporaryDirectory() as tmp, _cwd(tmp):
+                batch._generate = (lambda spec, name, config, caller, url=None: (_ for _ in ()).throw(exc_type("boom")))
+                camp, status = batch.cmd_run(_write_cfg(tmp), caller_factory=lambda *a: None, digest_fn=self._digest)
+                res = [r for r in batch._read_jsonl(camp / "campaign.jsonl") if r.get("event") == "attempt_result"]
+                return status, res[-1]["outcome_class"]
+        self.assertEqual(one(ConnectionError), ("stopped-infra", "infra"))      # OSError subclass -> infra
+        self.assertEqual(one(RuntimeError), ("stopped-error", "runner-error"))  # unexpected -> runner-error
+        with TemporaryDirectory() as tmp, _cwd(tmp):
+            batch._generate = (lambda spec, name, config, caller, url=None: (_ for _ in ()).throw(KeyboardInterrupt()))
+            with self.assertRaises(KeyboardInterrupt):
+                batch.cmd_run(_write_cfg(tmp), caller_factory=lambda *a: None, digest_fn=self._digest)
+            res = [r for r in batch._read_jsonl(Path("generated/camp_test") / "campaign.jsonl") if r.get("event") == "attempt_result"]
+            self.assertEqual(res[-1]["outcome_class"], "interrupted")           # preserved, not a model result
+
+    def test_exit_codes_run(self):
+        orig = batch._live_digest
+        try:
+            batch._live_digest = lambda url, model: FAKE_DIGEST
+            with TemporaryDirectory() as tmp, _cwd(tmp):
+                batch._generate = make_mock(lambda spec, n: "model-failure")
+                self.assertEqual(batch.main(["run", "--config", _write_cfg(tmp)]), 0)   # done (with failures) -> 0
+            with TemporaryDirectory() as tmp, _cwd(tmp):
+                batch._generate = (lambda spec, name, config, caller, url=None: (_ for _ in ()).throw(ConnectionError("x")))
+                self.assertEqual(batch.main(["run", "--config", _write_cfg(tmp)]), 3)   # infra -> 3
+            with TemporaryDirectory() as tmp, _cwd(tmp):
+                batch._generate = (lambda spec, name, config, caller, url=None: (_ for _ in ()).throw(RuntimeError("x")))
+                self.assertEqual(batch.main(["run", "--config", _write_cfg(tmp)]), 4)   # runner-error -> 4
+            with TemporaryDirectory() as tmp, _cwd(tmp):
+                bad = dict(BASE_CFG); del bad["model"]
+                self.assertEqual(batch.main(["run", "--config", _write_cfg(tmp, bad)]), 2)   # config error -> 2
+            with TemporaryDirectory() as tmp, _cwd(tmp):
+                self.assertEqual(batch.main(["report", "--dir", "generated/nope"]), 2)       # no campaign -> 2
+            with TemporaryDirectory() as tmp, _cwd(tmp):
+                batch._live_digest = lambda url, model: (_ for _ in ()).throw(OSError("refused"))
+                self.assertEqual(batch.main(["run", "--config", _write_cfg(tmp)]), 2)         # unreachable endpoint -> 2
+        finally:
+            batch._live_digest = orig
 
     def test_no_native_fallback(self):
         with self.assertRaises(batch.BatchError):
@@ -213,7 +339,7 @@ class BatchMechanicsTests(unittest.TestCase):
     def test_tokens_unavailable_not_zeroed(self):
         # a run whose transcript has no token info must report tokens=None, not 0
         with TemporaryDirectory() as tmp, _cwd(tmp):
-            def mock(spec, name, config, caller):
+            def mock(spec, name, config, caller, url=None):
                 d = Path("generated") / name; d.mkdir(parents=True, exist_ok=True)
                 st = ag.ProjectState(name=name, target="elf", difficulty="easy", flag="sloth{x}",
                                      path=str(d / "agentic_state.json"), design="xor")
@@ -227,7 +353,7 @@ class BatchMechanicsTests(unittest.TestCase):
                 return rep
             batch._generate = mock
             cfg = dict(BASE_CFG); cfg["repeats"] = 1
-            camp = batch.cmd_run(_write_cfg(tmp, cfg), caller_factory=lambda *a: None, digest_fn=self._digest)
+            camp, _ = batch.cmd_run(_write_cfg(tmp, cfg), caller_factory=lambda *a: None, digest_fn=self._digest)
             res = [r for r in batch._read_jsonl(camp / "campaign.jsonl") if r.get("event") == "attempt_result"][0]
             self.assertIsNone(res["tokens"], "unknown tokens must be null, never 0")
             self.assertEqual(res["llm_calls"], 3)
@@ -252,7 +378,7 @@ class BatchDockerElfTests(unittest.TestCase):
         with TemporaryDirectory() as tmp, _cwd(tmp):
             cfg = dict(BASE_CFG); cfg["repeats"] = 1; cfg["dest"] = "camp_docker"
             cf = lambda wf, url, temp: Replay(list(items))   # fresh replay for the single run
-            camp = batch.cmd_run(_write_cfg(tmp, cfg), caller_factory=cf, digest_fn=lambda *_: FAKE_DIGEST)
+            camp, _ = batch.cmd_run(_write_cfg(tmp, cfg), caller_factory=cf, digest_fn=lambda *_: FAKE_DIGEST)
             res = [r for r in batch._read_jsonl(camp / "campaign.jsonl") if r.get("event") == "attempt_result"]
             self.assertEqual(len(res), 1)
             self.assertEqual(res[0]["outcome_class"], "valid", res[0].get("final_stage"))

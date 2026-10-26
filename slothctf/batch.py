@@ -42,9 +42,14 @@ from pathlib import Path
 from urllib import request
 
 import slothctf.generator as g
-from slothctf.agentic import ProjectState
+from slothctf.agentic import ProjectState, InfraError
+from slothctf.execution import SandboxUnavailable
 
 GENERATED = Path("generated")
+
+# Real infrastructure faults (transport/sandbox/OS). OSError already covers ConnectionError,
+# TimeoutError and urllib's URLError. Anything NOT in here is a runner/verifier fault.
+_INFRA_EXC = (InfraError, SandboxUnavailable, OSError)
 
 
 class BatchError(Exception):
@@ -70,11 +75,19 @@ def load_config(path: str | Path) -> dict:
     cfg.setdefault("inference", {})
     cfg.setdefault("budget", {})
     cfg.setdefault("prompt", g.DEFAULT_PROMPT)
+    inf = cfg.get("inference", {})
     for wf in m["workflows"]:
         if wf not in ("monolithic", "agentic"):
             raise BatchError(f"unknown workflow {wf!r}")
         if wf == "agentic" and any(gen != "recover" for gen in m["genres"]):
             raise BatchError("agentic workflow supports the 'recover' genre only")
+        if wf == "monolithic":
+            # monolithic's transport sets temperature internally and fixes num_ctx; it
+            # cannot honour these overrides, so reject them rather than fingerprint a lie.
+            unsupported = [k for k in ("temperature", "num_ctx") if k in inf]
+            if unsupported:
+                raise BatchError(f"inference override(s) {unsupported} are not supported by the monolithic "
+                                 f"workflow; remove them or use the agentic workflow")
     return cfg
 
 
@@ -136,17 +149,89 @@ def _append(path: Path, obj: dict) -> None:
 
 
 def _read_jsonl(path: Path) -> list[dict]:
+    """STRICT read of an already-clean dataset: every non-empty line must be valid JSON.
+    A malformed line raises (no valid event is ever silently dropped). Truncated trailing
+    lines are handled only by `_repair_jsonl`, which runs before a run/resume/report."""
     out: list[dict] = []
     if not path.exists():
         return out
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+    for i, raw in enumerate(path.read_text(encoding="utf-8").splitlines()):
+        line = raw.strip()
         if not line:
             continue
         try:
             out.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise BatchError(f"corrupt record on line {i+1} of {path.name}: {exc} "
+                             f"(run a repair / inspect the diagnostic copy)")
+    return out
+
+
+def _repair_jsonl(path: Path) -> None:
+    """Make the dataset safe before use. Only a TRUNCATED FINAL line (an interrupted
+    append that left bytes without a terminating newline) is recoverable: the full
+    original bytes are first preserved to a diagnostic copy, then the file is rewritten
+    with only the complete, newline-terminated, valid records — so no later append
+    concatenates onto damaged bytes. A malformed COMPLETE/intermediate record is NOT
+    silently dropped: the original is preserved and BatchError is raised."""
+    if not path.exists():
+        return
+    data = path.read_text(encoding="utf-8")
+    if data == "":
+        return
+    ends_nl = data.endswith("\n")
+    parts = data.split("\n")
+    if ends_nl:
+        parts = parts[:-1]            # trailing "" after the final newline
+        complete, trailing = parts, None
+    else:
+        complete, trailing = parts[:-1], parts[-1]   # last part is a truncated line
+
+    bad = next((i for i, ln in enumerate(complete) if ln.strip() and not _is_json(ln)), None)
+    if bad is not None:
+        diag = _preserve_corrupt(path, data)
+        raise BatchError(f"corrupt complete record on line {bad+1} of {path.name}; original preserved "
+                         f"at {diag.name}. Refusing to continue (intermediate corruption is not auto-dropped).")
+    if trailing is not None and trailing.strip():
+        # recoverable: a single truncated final line from an interrupted write
+        _preserve_corrupt(path, data)
+        rebuilt = "".join(ln + "\n" for ln in complete if ln.strip())
+        _write_atomic(path, rebuilt)
+    elif trailing is not None:
+        # final newline missing but the trailing fragment is empty/whitespace -> normalise
+        rebuilt = "".join(ln + "\n" for ln in complete if ln.strip())
+        if rebuilt != data:
+            _write_atomic(path, rebuilt)
+
+
+def _is_json(line: str) -> bool:
+    try:
+        json.loads(line)
+        return True
+    except json.JSONDecodeError:
+        return False
+
+
+def _preserve_corrupt(path: Path, data: str) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    diag = path.with_name(f"{path.name}.corrupt-{stamp}")
+    diag.write_bytes(data.encode("utf-8"))   # integral copy of the damaged bytes
+    return diag
+
+
+def _read_transcript(path: Path) -> list[dict]:
+    """Tolerant read for a per-run transcript (NOT the authoritative campaign dataset):
+    a run killed mid-write may leave a partial line — skip unparseable lines here."""
+    out: list[dict] = []
+    if not path.exists():
+        return out
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            out.append(json.loads(raw))
         except json.JSONDecodeError:
-            # tolerate a single truncated trailing line from an interrupted write
             continue
     return out
 
@@ -189,15 +274,21 @@ def _resolve_isolated_backend(target: str, isolation: str):
     return be
 
 
-def _default_caller_factory(workflow: str, url: str, temperature: float):
+def _default_caller_factory(workflow: str, url: str, inference: dict):
+    """Build the transport actually used, applying the configured inference params so the
+    real payload matches the fingerprint. Agentic: a parameterised Ollama transport
+    (temperature + num_ctx). Monolithic: None — the generator uses its own transport at
+    the configured endpoint (inference overrides are rejected at config time)."""
     from slothctf.agentic import ollama_transport
     if workflow == "agentic":
-        return ollama_transport(url, temperature=temperature)
-    return None   # monolithic uses its own internal transport
+        return ollama_transport(url, temperature=inference.get("temperature", 0.7),
+                                num_ctx=inference.get("num_ctx", 4096))
+    return None
 
 
-def _generate(spec: dict, name: str, config: dict, caller):
-    """Run ONE generation through the frozen generators. Injectable for tests."""
+def _generate(spec: dict, name: str, config: dict, caller, url: str):
+    """Run ONE generation through the frozen generators. Injectable for tests. `url` is the
+    CURRENT transport endpoint (may have been updated on resume)."""
     backend = _resolve_isolated_backend(spec["target"], config.get("isolation", "isolated"))
     b = config.get("budget", {})
     if spec["workflow"] == "agentic":
@@ -207,9 +298,10 @@ def _generate(spec: dict, name: str, config: dict, caller):
                         max_wall_seconds=b.get("max_wall_seconds", 1800))
         return generate_recover_agentic(name, prompt=config.get("prompt", ""), difficulty=spec["difficulty"],
                                         target=spec["target"], backend=backend, model=config["model"],
-                                        caller=caller, budget=budget, resume=False)
+                                        ollama_url=url, caller=caller, budget=budget, resume=False)
+    # monolithic: its own transport, but at the CONFIGURED endpoint (was defaulting before)
     return g.generate_challenge(name, prompt=config.get("prompt", g.DEFAULT_PROMPT), difficulty=spec["difficulty"],
-                                model=config["model"], genre=spec["genre"], target=spec["target"],
+                                model=config["model"], ollama_url=url, genre=spec["genre"], target=spec["target"],
                                 backend=backend, caller=caller, max_attempts=b.get("max_attempts", 8),
                                 return_report=True)
 
@@ -227,7 +319,7 @@ def _partial_metrics(run_dir: Path) -> dict:
         return out
     try:
         st = ProjectState.load(sp)
-        tr = _read_jsonl(run_dir / "transcript.jsonl")
+        tr = _read_transcript(run_dir / "transcript.jsonl")
         known = [e.get("tokens") for e in tr if e.get("type") == "llm" and isinstance(e.get("tokens"), int)]
         out["llm_calls"] = st.budget_calls
         out["tokens"] = sum(known) if known else None
@@ -240,12 +332,14 @@ def _metrics(rep, config: dict, spec: dict, name: str, wall_s: float) -> dict:
     tele = getattr(rep, "telemetry", {}) or {}
     cat = (tele.get("error") or {}).get("category")
     success = bool(getattr(rep, "success", False))
-    if cat in ("infra", "verifier-error"):
+    if cat == "infra":
         oc = "infra"
+    elif cat == "verifier-error":
+        oc = "runner-error"            # harness/verifier fault — NOT infra, NOT a model failure
     elif success:
         oc = "valid"
     else:
-        oc = "model-failure"
+        oc = "model-failure"           # includes 'model-invalid' (the model's own bad output)
     final_stage = tele.get("final_stage") or (rep.attempts[-1].stage if getattr(rep, "attempts", None) else None)
     m = {"outcome_class": oc, "success": success, "final_stage": final_stage,
          "attempts_used": len(getattr(rep, "attempts", []) or []), "wall_s": round(wall_s, 1),
@@ -257,7 +351,7 @@ def _metrics(rep, config: dict, spec: dict, name: str, wall_s: float) -> dict:
     if sp.exists():
         try:
             st = ProjectState.load(sp)
-            tr = _read_jsonl(d / "transcript.jsonl")
+            tr = _read_transcript(d / "transcript.jsonl")
             per = [e.get("tokens") for e in tr if e.get("type") == "llm"]
             known = [t for t in per if isinstance(t, int)]
             m["llm_calls"] = st.budget_calls
@@ -338,17 +432,30 @@ def _execute(camp_dir: Path, config: dict, manifest: dict, digest: str | None, c
         name = f"{config['dest']}/{pid}/attempt_{k:02d}"
         _append(camp, {"event": "attempt_start", "id": pid, "attempt": k, "name": name,
                        "ts": time.time(), "commit": manifest["commit"], "digest": digest, **spec})
-        temp = config.get("inference", {}).get("temperature", 0.7)
-        caller = caller_factory(spec["workflow"], manifest["url_current"], temp)
+        url = manifest["url_current"]
+        caller = caller_factory(spec["workflow"], url, config.get("inference", {}))
         t0 = time.time()
+
+        def _record(outcome, exc):   # preserve the attempt's artifacts + measurable cost
+            _append(camp, {"event": "attempt_result", "id": pid, "attempt": k, "outcome_class": outcome,
+                           "error": (f"{type(exc).__name__}: {exc}"[:300] if exc else None),
+                           "wall_s": round(time.time() - t0, 1), **spec,
+                           **_partial_metrics(_run_dir(config, pid, k))})
+
         try:
-            rep = _generate(spec, name, config, caller)
-        except BaseException as exc:   # killed, connection, docker, etc. -> infra; stop, preserve
-            _append(camp, {"event": "attempt_result", "id": pid, "attempt": k, "outcome_class": "infra",
-                           "error": f"{type(exc).__name__}: {exc}"[:300], "wall_s": round(time.time() - t0, 1),
-                           **spec, **_partial_metrics(_run_dir(config, pid, k))})
+            rep = _generate(spec, name, config, caller, url)
+        except (KeyboardInterrupt, SystemExit) as exc:   # explicit interruption: preserve + propagate
+            _record("interrupted", exc)
+            _append(camp, {"event": "STOP", "reason": "user interrupt", "id": pid})
+            raise
+        except _INFRA_EXC as exc:                          # real infrastructure fault
+            _record("infra", exc)
             _append(camp, {"event": "STOP", "reason": "infra exception", "id": pid})
             return "stopped-infra"
+        except Exception as exc:                            # unexpected runner/verifier fault
+            _record("runner-error", exc)
+            _append(camp, {"event": "STOP", "reason": "runner error", "id": pid})
+            return "stopped-error"
         m = _metrics(rep, config, spec, name, time.time() - t0)
         _append(camp, {"event": "attempt_result", "id": pid, "attempt": k, "commit": manifest["commit"],
                        "digest": digest, **spec, **m})
@@ -358,9 +465,9 @@ def _execute(camp_dir: Path, config: dict, manifest: dict, digest: str | None, c
               f"calls={m['llm_calls']} tok={m['tokens']} {m['wall_s']}s", flush=True)
         if m["outcome_class"] == "valid":
             _copy_player_artifacts(name, camp_dir / "_valid_playtest" / pid)
-        if m["outcome_class"] == "infra":
-            _append(camp, {"event": "STOP", "reason": "infra category", "id": pid})
-            return "stopped-infra"
+        if m["outcome_class"] in ("infra", "runner-error"):   # generator caught + reported it
+            _append(camp, {"event": "STOP", "reason": f"{m['outcome_class']} category", "id": pid})
+            return "stopped-infra" if m["outcome_class"] == "infra" else "stopped-error"
     _append(camp, {"event": "campaign_done"})
     return "done"
 
@@ -368,14 +475,19 @@ def _execute(camp_dir: Path, config: dict, manifest: dict, digest: str | None, c
 # --------------------------------------------------------------------------- #
 # commands
 # --------------------------------------------------------------------------- #
-def cmd_run(config_path: str, caller_factory=None, digest_fn=_live_digest) -> Path:
+def cmd_run(config_path: str, caller_factory=None, digest_fn=None):
+    """Returns (campaign_dir, status). status in {done, stopped-infra, stopped-error}."""
+    digest_fn = digest_fn or _live_digest
     cfg = load_config(config_path)
     camp_dir = GENERATED / cfg["dest"]
     if (camp_dir / "manifest.json").exists():
         raise BatchError(f"{camp_dir}/manifest.json exists — use `resume` instead of overwriting")
     camp_dir.mkdir(parents=True, exist_ok=True)
     commit = git_commit()
-    digest = digest_fn(cfg["ollama_url"], cfg["model"])
+    try:
+        digest = digest_fn(cfg["ollama_url"], cfg["model"])
+    except OSError as exc:
+        raise BatchError(f"cannot reach Ollama at {cfg['ollama_url']} to verify the model digest: {exc}")
     if digest is None:
         raise BatchError(f"model {cfg['model']!r} not found at the endpoint (cannot fingerprint)")
     fp = fingerprint(cfg, commit, digest)
@@ -388,14 +500,19 @@ def cmd_run(config_path: str, caller_factory=None, digest_fn=_live_digest) -> Pa
     status = _execute(camp_dir, cfg, manifest, digest, caller_factory)
     write_report(camp_dir)
     print(f"[batch] run {status}; report in {camp_dir}", flush=True)
-    return camp_dir
+    return camp_dir, status
 
 
-def cmd_resume(camp_dir: str | Path, ollama_url: str | None = None, caller_factory=None, digest_fn=_live_digest) -> Path:
+def cmd_resume(camp_dir: str | Path, ollama_url: str | None = None, caller_factory=None, digest_fn=None):
+    """Returns (campaign_dir, status). status in {done, stopped-infra, stopped-error}."""
+    digest_fn = digest_fn or _live_digest
     camp_dir = Path(camp_dir)
     mpath = camp_dir / "manifest.json"
     if not mpath.exists():
         raise BatchError(f"no manifest.json in {camp_dir}")
+    # make the append-only dataset safe BEFORE any further append (truncated-tail recovery
+    # or refusal on intermediate corruption), so resume never concatenates onto damaged bytes
+    _repair_jsonl(camp_dir / "campaign.jsonl")
     manifest = json.loads(mpath.read_text(encoding="utf-8"))
     cfg = manifest["config"]
     # the URL is transport-only: allow updating it, re-verify the digest, never let it break resume
@@ -406,7 +523,10 @@ def cmd_resume(camp_dir: str | Path, ollama_url: str | None = None, caller_facto
         _write_atomic(mpath, json.dumps(manifest, indent=2))
     url = manifest["url_current"]
     commit = git_commit()
-    digest = digest_fn(url, cfg["model"])
+    try:
+        digest = digest_fn(url, cfg["model"])
+    except OSError as exc:
+        raise BatchError(f"cannot reach Ollama at {url} to verify the model digest: {exc}")
     fp_now = fingerprint(cfg, commit, digest)
     if fp_now != manifest["fingerprint"]:
         why = []
@@ -420,7 +540,7 @@ def cmd_resume(camp_dir: str | Path, ollama_url: str | None = None, caller_facto
     status = _execute(camp_dir, cfg, manifest, digest, caller_factory)
     write_report(camp_dir)
     print(f"[batch] resume {status}; report in {camp_dir}", flush=True)
-    return camp_dir
+    return camp_dir, status
 
 
 # --------------------------------------------------------------------------- #
@@ -435,17 +555,22 @@ def _stats(xs):
 
 
 def collect(camp_dir: Path) -> dict:
+    _repair_jsonl(camp_dir / "campaign.jsonl")   # recover a truncated tail before reading
     recs = _read_jsonl(camp_dir / "campaign.jsonl")
     results = [r for r in recs if r.get("event") == "attempt_result"]
     completed = [r for r in results if r["outcome_class"] in ("valid", "model-failure")]
     infra = [r for r in results if r["outcome_class"] == "infra"]
+    runner_err = [r for r in results if r["outcome_class"] == "runner-error"]
+    interrupted = [r for r in results if r["outcome_class"] == "interrupted"]
     incomplete = [r for r in recs if r.get("event") == "attempt_incomplete"]
     endpoint_changes = [r for r in recs if r.get("event") == "endpoint_change"]
-    return {"recs": recs, "completed": completed, "infra": infra, "incomplete": incomplete,
-            "endpoint_changes": endpoint_changes}
+    return {"recs": recs, "completed": completed, "infra": infra, "runner_error": runner_err,
+            "interrupted": interrupted, "incomplete": incomplete, "endpoint_changes": endpoint_changes}
 
 
 def write_report(camp_dir: Path) -> tuple[Path, Path]:
+    if not (camp_dir / "campaign.jsonl").exists() and not (camp_dir / "manifest.json").exists():
+        raise BatchError(f"no campaign found at {camp_dir}")
     c = collect(camp_dir)
     completed, infra, incomplete = c["completed"], c["infra"], c["incomplete"]
 
@@ -465,6 +590,8 @@ def write_report(camp_dir: Path) -> tuple[Path, Path]:
              f"- Model successes (fully valid): **{sum(1 for r in completed if r['success'])}**",
              f"- Model failures: **{sum(1 for r in completed if not r['success'])}**",
              f"- Infra-interrupted attempts (excluded): **{len(infra)}**",
+             f"- Runner/verifier-error attempts (excluded): **{len(c['runner_error'])}**",
+             f"- User-interrupted attempts (excluded): **{len(c['interrupted'])}**",
              f"- Incomplete/killed attempts (excluded): **{len(incomplete)}**",
              f"- Endpoint changes during the campaign: **{len(c['endpoint_changes'])}**", ""]
 
@@ -524,7 +651,7 @@ def write_report(camp_dir: Path) -> tuple[Path, Path]:
     with csv_path.open("w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
-        for r in completed + infra:
+        for r in completed + infra + c["runner_error"] + c["interrupted"]:
             row = dict(r)
             row["mechanic_families"] = "|".join(r.get("mechanic_families") or [])
             w.writerow(row)
@@ -550,20 +677,35 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+# exit codes (documented, consistent across run/resume):
+#   0  campaign completed (even with model-attributable failures)
+#   2  usage / config / fingerprint error (BatchError)
+#   3  stopped by a real infrastructure fault
+#   4  stopped by an unexpected runner/verifier error
+#   130 interrupted by the user (Ctrl-C)
+_EXIT = {"done": 0, "stopped-infra": 3, "stopped-error": 4}
+
+
 def main(argv=None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         if args.cmd == "run":
-            cmd_run(args.config)
-        elif args.cmd == "resume":
-            cmd_resume(args.dir, ollama_url=args.ollama_url)
-        elif args.cmd == "report":
+            _, status = cmd_run(args.config)
+            return _EXIT.get(status, 1)
+        if args.cmd == "resume":
+            _, status = cmd_resume(args.dir, ollama_url=args.ollama_url)
+            return _EXIT.get(status, 1)
+        if args.cmd == "report":
             write_report(Path(args.dir))
             print(f"[batch] report written in {args.dir}")
+            return 0
     except BatchError as exc:
         print(f"[batch] error: {exc}", file=sys.stderr)
         return 2
-    return 0
+    except KeyboardInterrupt:
+        print("[batch] interrupted (data preserved; resume to continue)", file=sys.stderr)
+        return 130
+    return 1
 
 
 if __name__ == "__main__":
