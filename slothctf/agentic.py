@@ -507,35 +507,67 @@ def _gate_challenge(state, base_dir, backend, tgt, solver_backend) -> tuple[bool
     return True, "challenge-ok", ""
 
 
-def _solver_mismatch_detail(state, cbin, got: str) -> str:
-    """Build a DIAGNOSTIC (not a solution) for a solver that produced the wrong flag,
-    classifying the failure from observable, organizer-side evidence only:
-
-      A  the solver produced nothing -> it likely did not LOCATE the data;
-      B  wrong-length output         -> wrong region / extraction length;
-      C  right length, wrong bytes   -> extraction ok, INVERSE transform wrong.
-
-    It reports the binary size, the expected encoded-byte count, whether those bytes
-    are present contiguously, and the length actually produced. It never reveals how to
-    parse the binary or how to invert the transform — the solver stays the model's."""
+def _solver_evidence(state, cbin) -> tuple:
+    """Observable, organizer-side evidence shared by both solver diagnostics: the
+    binary size, the expected encoded-byte count, and whether those bytes appear
+    contiguously. Never reveals how to locate or invert them."""
     want_len = state.encoder.artifacts.get("want_len")
     try:
         bin_sz = cbin.stat().st_size
     except OSError:
         bin_sz = None
     contig = state.challenge.artifacts.get("encoded_bytes_contiguous")
+    return want_len, bin_sz, contig
+
+
+def _solver_mismatch_detail(state, cbin, got: str) -> str:
+    """Build a DIAGNOSTIC (not a solution) for a solver that produced the WRONG flag.
+    It separates OBSERVED facts from HYPOTHESES and from what is NOT DETERMINABLE
+    without instrumenting the solver. In particular a correct output LENGTH does NOT
+    prove the bytes were extracted correctly. It never reveals how to parse the binary
+    or invert the transform, and does not change any acceptance condition."""
+    want_len, bin_sz, contig = _solver_evidence(state, cbin)
+    obs = (f"OBSERVED: the solver printed {len(got)} characters; the flag is {len(state.flag)}; the binary is "
+           f"{bin_sz} bytes and {want_len} encoded bytes are expected"
+           f"{', present contiguously' if contig else ''}.")
     if not got:
-        cat = (f"category A — the solver produced NO output, so it did not locate/extract the data. "
-               f"The {want_len} encoded bytes are present in the {bin_sz}-byte binary"
-               f"{' contiguously' if contig else ''}; re-examine how your solver finds them.")
+        hyp = ("POSSIBLE CAUSE (hypothesis): the solver did not locate/extract the data (it produced nothing); "
+               "re-examine how it finds the bytes in the binary.")
     elif len(got) != len(state.flag):
-        cat = (f"category B — the solver produced {len(got)} characters but the flag is {len(state.flag)}; "
-               f"the extracted sequence length is wrong (wrong region or count — expected {want_len} encoded bytes).")
+        hyp = "POSSIBLE CAUSE (hypothesis): the extracted region or length is wrong."
     else:
-        cat = ("category C — the solver produced the CORRECT LENGTH but wrong bytes: extraction looks right, so "
-               "the INVERSE TRANSFORM is the likely fault (re-check byte width / 8-bit masking and operation order).")
+        hyp = ("POSSIBLE CAUSES (hypotheses, not certainties): a correct output LENGTH does NOT prove correct "
+               "extraction — the region read may still be wrong, OR the inverse transform may be wrong (check "
+               "8-bit masking / operation order). Weigh both.")
+    undet = ("NOT DETERMINABLE from outside the solver: the exact offset you read and the bytes you extracted — "
+             "the harness cannot see inside your solver, so state your assumption explicitly.")
     return (f"the solver recovered {got[:80]!r} but the flag is {state.flag!r}. Its inverse must match the "
-            f"encoder's transform. | diagnostic {cat}")
+            f"encoder's transform. | {obs} {hyp} {undet}")
+
+
+def _solver_error_detail(state, cbin, raw: str) -> str:
+    """Build a DIAGNOSTIC for a solver that RAISED (exited non-zero). Preserves the
+    exception/traceback within a safe limit and adds the same observed evidence, framed
+    as facts vs hypotheses. An out-of-range byte is explicitly NOT attributed to the
+    inverse algorithm alone — it may equally come from reading the wrong region. Never
+    provides an implementation; asks the model to diagnose before fixing."""
+    want_len, bin_sz, contig = _solver_evidence(state, cbin)
+    raw = raw or ""
+    low = raw.lower()
+    obs = (f"OBSERVED: the solver raised an exception (traceback below). The binary is {bin_sz} bytes and "
+           f"{want_len} encoded bytes are expected"
+           f"{', present contiguously' if contig else ''}.")
+    if "range(0, 256)" in raw or "byte must be in range" in low or "out of range" in low:
+        hyp = ("POSSIBLE CAUSES (hypotheses, not certainties): an out-of-range byte can come EITHER from reading "
+               "the WRONG region of the binary (the values are then not your encoded bytes) OR from 8-bit "
+               "arithmetic that is not normalised (a subtract/rotate without mod-256 / &0xFF). Check BOTH the "
+               "extraction region and the 8-bit handling; do not assume the inverse algorithm alone is at fault.")
+    else:
+        hyp = ("POSSIBLE CAUSES (hypotheses): the region you read, the extracted length, the inverse arithmetic, "
+               "or a plain Python mistake — decide which from the traceback.")
+    undet = ("NOT DETERMINABLE from outside the solver: the exact offset you read and the bytes you extracted. "
+             "First state the single concrete cause, then return a corrected solver.")
+    return f"solver exited non-zero. | {obs} {hyp} {undet}\n--- traceback (truncated) ---\n{raw[:800]}"
 
 
 def _gate_solver(state, base_dir, backend, tgt, solver_backend) -> tuple[bool, str, str]:
@@ -544,7 +576,7 @@ def _gate_solver(state, base_dir, backend, tgt, solver_backend) -> tuple[bool, s
         return False, "challenge-compile", "challenge binary missing (re-verify challenge)."
     ok, out, detail = g._run_solver_isolated(state.solver.code, cbin, solver_backend)
     if not ok:
-        return False, "solver-error", detail
+        return False, "solver-error", _solver_error_detail(state, cbin, detail)
     if out.strip() != state.flag:
         return False, "solver-mismatch", _solver_mismatch_detail(state, cbin, out.strip())
     # mini anti-hardcode swap DURING construction (reuses the authoritative helper)

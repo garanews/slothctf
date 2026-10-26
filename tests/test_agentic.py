@@ -43,6 +43,13 @@ ENC_BROKEN = "#include <stdio.h>\nint main(){ this is not valid c }\n"
 CHAL_BROKEN = ("#include <stdio.h>\nstatic const unsigned char d[]={ /*__ENCODED_ARRAY__*/ };\n"
                "int main(){ not valid c at all ; }\n")
 SOL_WRONG = "print('sloth{definitely_not_it}')\n"          # valid python, wrong output -> mismatch
+# raises ValueError: byte must be in range(0,256) (ELF byte 0x7f - 200 < 0) -> solver-error
+SOL_RANGE_ERR = ("import sys\n"
+                 "b=open(sys.argv[1],'rb').read()\n"
+                 "out=bytearray()\n"
+                 "for i in range(8):\n"
+                 "    out.append(b[i]-200)\n"
+                 "print(out.decode())\n")
 
 # XOR 0x5a challenge that hardcodes a wrong flag length (32) -> rejects the real flag,
 # reproducing the first A100 run's defect; marker matches CHAL_FIXED below.
@@ -317,6 +324,32 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(rep.telemetry["final_stage"], "max-repairs")
         self.assertIsNotNone(rep.telemetry["budget"]["tokens"])
 
+    def test_solver_diagnostics_separate_facts_from_hypotheses(self):
+        # solver-error and solver-mismatch diagnostics must report OBSERVED facts, hedge
+        # the causes as hypotheses, and mark what is NOT DETERMINABLE from outside.
+        with TemporaryDirectory() as tmp:
+            cbin = Path(tmp) / "challenge"
+            cbin.write_bytes(b"\x00" * 1000)
+            st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{abcdefghijkl}")
+            st.encoder.artifacts = {"want_len": len(st.flag)}
+            st.challenge.artifacts = {"encoded_bytes_contiguous": True}
+
+            raw = "Traceback (most recent call last):\n  ...\nValueError: byte must be in range(0, 256)\n"
+            d = ag._solver_error_detail(st, cbin, raw)
+            self.assertIn("OBSERVED", d)
+            self.assertIn("1000", d)                 # binary size
+            self.assertIn(str(len(st.flag)), d)      # expected encoded-byte count
+            self.assertIn("ValueError", d)           # traceback preserved
+            self.assertIn("do not assume the inverse algorithm alone is at fault", d)   # both causes offered
+            self.assertIn("NOT DETERMINABLE", d)
+
+            same_len = "y" * len(st.flag)            # correct LENGTH, wrong bytes
+            m = ag._solver_mismatch_detail(st, cbin, same_len)
+            self.assertIn("does NOT prove correct", m)   # length != correct extraction
+            self.assertIn("hypotheses", m.lower())
+            self.assertIn("NOT DETERMINABLE", m)
+            self.assertIn("did not locate", ag._solver_mismatch_detail(st, cbin, ""))  # empty -> locate hypothesis
+
     def test_small_change_is_progress_not_blocked(self):
         # A one-token change must count as progress (not a no-op repair).
         self.assertNotEqual(ag._normalize(ENC_GOOD), ag._normalize(ENC_GOOD.replace("0x5a", "0x5b")))
@@ -443,6 +476,21 @@ class AgenticElfTests(unittest.TestCase):
         with _run("ag_sol_fix", "elf", self._backend(), items) as (rep, caller, _):
             self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
             self.assertTrue(any(a.stage == "solver-mismatch" for a in rep.attempts))
+
+    def test_solver_error_then_repaired_to_valid(self):
+        # Phase 1/2: a crashing solver (ValueError: byte out of range) gets STRUCTURED,
+        # hedged feedback (traceback + observed evidence + both possible causes); the next
+        # LLM repair produces a working solver and Stage E passes.
+        items = [{"design": "d"}, {"encoder_code": ENC_GOOD},
+                 {"challenge_code": CHAL_GOOD, "success_marker": "Correct"},
+                 {"solver_code": SOL_RANGE_ERR},
+                 {"solver_code": SOL_GOOD}]
+        with _run("ag_solver_err", "elf", self._backend(), items) as (rep, caller, _):
+            self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
+            self.assertTrue(any(a.stage == "solver-error" for a in rep.attempts))
+            self.assertTrue(any("OBSERVED" in p and "ValueError" in p for p in caller.calls),
+                            "structured solver-error feedback with traceback was not fed to the model")
+            self.assertTrue(any("do not assume the inverse algorithm alone is at fault" in p for p in caller.calls))
 
     def test_solver_no_progress_then_effective_repair(self):
         # Phase 2/3 on the ambiguous solver-mismatch path: an identical diagnose reply is
