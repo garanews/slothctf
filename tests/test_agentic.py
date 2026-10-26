@@ -444,6 +444,24 @@ class AgenticElfTests(unittest.TestCase):
             self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
             self.assertTrue(any(a.stage == "solver-mismatch" for a in rep.attempts))
 
+    def test_solver_no_progress_then_effective_repair(self):
+        # Phase 2/3 on the ambiguous solver-mismatch path: an identical diagnose reply is
+        # detected as no-progress (NOT recompiled), the feedback escalates, and the next
+        # effective repair lets the solver recover the flag -> Stage E passes.
+        items = [{"design": "d"}, {"encoder_code": ENC_GOOD},
+                 {"challenge_code": CHAL_GOOD, "success_marker": "Correct"},
+                 {"solver_code": SOL_WRONG},
+                 {"component": "solver", "code": SOL_WRONG, "reason": "unchanged"},   # no-progress
+                 {"component": "solver", "code": SOL_GOOD, "reason": "fix inverse"}]  # effective
+        with _run("ag_solver_np", "elf", self._backend(), items) as (rep, caller, _):
+            self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
+            self.assertTrue(any(a.stage == "repair-no-progress" for a in rep.attempts))
+            self.assertEqual(rep.telemetry.get("no_progress", {}).get("solver"), 1)
+            # the identical reply did NOT trigger a third solver gate run (no wasted recompile)
+            gate_runs = [a for a in rep.attempts if a.stage in ("solver-mismatch", "solver-ok")]
+            self.assertEqual(len(gate_runs), 2, [a.stage for a in rep.attempts])
+            self.assertTrue(any("IDENTICAL" in p for p in caller.calls))   # escalated feedback sent
+
     def test_hardcoded_solver_rejected_by_flag_swap(self):
         flag = "sloth{fixed_demo_abc}"
         hc = f"print({flag!r})\n"  # ignores the binary; recovers only this flag

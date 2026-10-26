@@ -428,7 +428,7 @@ def _repair_prompt(which: str, state: ProjectState, err: str) -> str:
 def _diagnose_prompt(state: ProjectState, err: str) -> str:
     return (
         "A verification step failed and the cause is ambiguous. Decide which component is "
-        "responsible and fix it. The harness reported:\n" + err[:600] + "\n\n"
+        "responsible and fix it. The harness reported:\n" + err[:1500] + "\n\n"
         f"design:\n{state.design}\n\nencoder_code:\n{state.encoder.code}\n\n"
         f"challenge_code:\n{state.challenge.code}\n\nsolver_code:\n{state.solver.code}\n\n"
         'Return ONE JSON object: {"component": "encoder|challenge|solver", '
@@ -507,6 +507,37 @@ def _gate_challenge(state, base_dir, backend, tgt, solver_backend) -> tuple[bool
     return True, "challenge-ok", ""
 
 
+def _solver_mismatch_detail(state, cbin, got: str) -> str:
+    """Build a DIAGNOSTIC (not a solution) for a solver that produced the wrong flag,
+    classifying the failure from observable, organizer-side evidence only:
+
+      A  the solver produced nothing -> it likely did not LOCATE the data;
+      B  wrong-length output         -> wrong region / extraction length;
+      C  right length, wrong bytes   -> extraction ok, INVERSE transform wrong.
+
+    It reports the binary size, the expected encoded-byte count, whether those bytes
+    are present contiguously, and the length actually produced. It never reveals how to
+    parse the binary or how to invert the transform — the solver stays the model's."""
+    want_len = state.encoder.artifacts.get("want_len")
+    try:
+        bin_sz = cbin.stat().st_size
+    except OSError:
+        bin_sz = None
+    contig = state.challenge.artifacts.get("encoded_bytes_contiguous")
+    if not got:
+        cat = (f"category A — the solver produced NO output, so it did not locate/extract the data. "
+               f"The {want_len} encoded bytes are present in the {bin_sz}-byte binary"
+               f"{' contiguously' if contig else ''}; re-examine how your solver finds them.")
+    elif len(got) != len(state.flag):
+        cat = (f"category B — the solver produced {len(got)} characters but the flag is {len(state.flag)}; "
+               f"the extracted sequence length is wrong (wrong region or count — expected {want_len} encoded bytes).")
+    else:
+        cat = ("category C — the solver produced the CORRECT LENGTH but wrong bytes: extraction looks right, so "
+               "the INVERSE TRANSFORM is the likely fault (re-check byte width / 8-bit masking and operation order).")
+    return (f"the solver recovered {got[:80]!r} but the flag is {state.flag!r}. Its inverse must match the "
+            f"encoder's transform. | diagnostic {cat}")
+
+
 def _gate_solver(state, base_dir, backend, tgt, solver_backend) -> tuple[bool, str, str]:
     cbin = base_dir / _chal_rel(tgt)
     if not cbin.exists():
@@ -515,8 +546,7 @@ def _gate_solver(state, base_dir, backend, tgt, solver_backend) -> tuple[bool, s
     if not ok:
         return False, "solver-error", detail
     if out.strip() != state.flag:
-        return False, "solver-mismatch", (f"the solver recovered {out.strip()[:80]!r} but the flag is "
-                                          f"{state.flag!r}. Its inverse must match the encoder's transform.")
+        return False, "solver-mismatch", _solver_mismatch_detail(state, cbin, out.strip())
     # mini anti-hardcode swap DURING construction (reuses the authoritative helper)
     swap = g._recover_flag_swap(base_dir, state.challenge.code, state.encoder.code, state.solver.code,
                                 backend, tgt, solver_backend, original_bin=cbin, original_flag=state.flag)
@@ -724,6 +754,48 @@ def generate_recover_agentic(
                                      "change exactly that.")
             state.save()
 
+    def fetch_diagnose_fix(stage_label: str, detail: str, default_resp: str):
+        """No-progress-aware repair for the AMBIGUOUS path (solver-mismatch, flag-swap,
+        ambiguous Stage-E). The model still CHOOSES which component to change. A diagnose
+        call is never issued once no component has repair budget left; an identical reply
+        is recorded as `repair-no-progress`, escalated and retried WITHOUT recompiling,
+        bounded by max_repairs_per_stage no-progress rounds; a changed fix for an already
+        -exhausted component is refused rather than applied. Returns (responsible, newcode,
+        reason) or None when nothing applicable remains."""
+        extra = ""
+        np_rounds = 0
+        while True:
+            if all(state.comp(s).repairs >= budget.max_repairs_per_stage for s in STAGES):
+                report.attempts.append(g.AttemptResult(0, False, "max-repairs", f"diagnose: {detail[:150]}"[:300]))
+                state.log({"type": "max-repairs", "component": "diagnose"})
+                return None
+            payload = _ask(caller, model, budget, state, report, stage_label, "diagnose",
+                           _diagnose_prompt(state, detail + extra))
+            resp = str(payload.get("component", default_resp))
+            resp = resp if resp in STAGES else default_resp
+            newcode = str(payload.get("code", state.comp(resp).code))
+            reason = str(payload.get("reason", detail))[:300]
+            if _normalize(newcode) != _normalize(state.comp(resp).code):       # real change
+                if state.comp(resp).repairs >= budget.max_repairs_per_stage:   # but no budget to apply it
+                    report.attempts.append(g.AttemptResult(0, False, "max-repairs", f"{resp}: diagnose"[:300]))
+                    state.log({"type": "max-repairs", "component": resp})
+                    return None
+                return resp, newcode, reason
+            # no progress: record against the chosen component, escalate, bound, retry
+            np_rounds += 1
+            np = report.telemetry.setdefault("no_progress", {})     # type: ignore[union-attr]
+            np[resp] = np.get(resp, 0) + 1
+            report.attempts.append(g.AttemptResult(0, False, "repair-no-progress",
+                                                   f"{resp}: identical diagnosis; escalating feedback"[:300]))
+            state.log({"type": "repair-no-progress", "component": resp, "detail": detail[:600]})
+            extra = ("\n\nNOTE: your previous diagnosis returned code IDENTICAL to the current version of that "
+                     "component and fixed nothing — do not resend the same code. Identify the REAL culprit "
+                     "component and change exactly the part that is wrong.")
+            state.save()
+            if np_rounds >= budget.max_repairs_per_stage:
+                report.attempts.append(g.AttemptResult(0, False, "max-repairs", f"diagnose no-progress: {resp}"[:300]))
+                return None
+
     try:
         # Stage A — design
         if not state.design:
@@ -758,18 +830,14 @@ def generate_recover_agentic(
             # failed -> repair (LLM-authored), possibly backtracking
             if stage_name in _AMBIGUOUS:
                 # ambiguous (solver-mismatch / swap): the model picks the responsible component.
-                if all(state.comp(s).repairs >= budget.max_repairs_per_stage for s in STAGES):
-                    report.attempts.append(g.AttemptResult(0, False, "max-repairs", f"{which}: {stage_name}"[:300]))
+                got = fetch_diagnose_fix(which, detail, which)
+                if got is None:
+                    state.save()
                     return report
-                payload = _ask(caller, model, budget, state, report, which, "diagnose", _diagnose_prompt(state, detail))
-                responsible = str(payload.get("component", which))
-                if responsible not in STAGES:
-                    responsible = which
-                newcode = str(payload.get("code", state.comp(responsible).code))
-                reason = str(payload.get("reason", detail))[:300]
+                responsible, newcode, reason = got
                 if not apply_fix(responsible, newcode, reason):
                     state.save()
-                    return report  # repair budget exhausted for a component
+                    return report
             else:
                 # unambiguous: known responsible component; fetch a CHANGED fix within budget.
                 responsible = _UNAMBIGUOUS.get(stage_name, which)
@@ -802,11 +870,10 @@ def generate_recover_agentic(
                 break
             e_repairs += 1
             if e.stage in _AMBIGUOUS or e.stage.startswith("swap") or e.stage == "solver-mismatch":
-                payload = _ask(caller, model, budget, state, report, "final", "diagnose", _diagnose_prompt(state, e.detail))
-                responsible = str(payload.get("component", "solver"))
-                responsible = responsible if responsible in STAGES else "solver"
-                newcode = str(payload.get("code", state.comp(responsible).code))
-                reason = str(payload.get("reason", e.detail))[:300]
+                got = fetch_diagnose_fix("final", e.detail, "solver")
+                if got is None:
+                    break
+                responsible, newcode, reason = got
                 if not apply_fix(responsible, newcode, reason):
                     break
             else:
@@ -833,10 +900,11 @@ def generate_recover_agentic(
                 else:
                     # fold back into the same repair machinery via a fresh fix
                     if sn in _AMBIGUOUS:
-                        resp = _UNAMBIGUOUS.get(sn, which)
-                        pl = _ask(caller, model, budget, state, report, which, "diagnose", _diagnose_prompt(state, det))
-                        resp = str(pl.get("component", which)); resp = resp if resp in STAGES else which
-                        nc = str(pl.get("code", state.comp(resp).code)); rs = str(pl.get("reason", det))[:300]
+                        got = fetch_diagnose_fix(which, det, which)
+                        if got is None:
+                            state.save()
+                            return report
+                        resp, nc, rs = got
                         if not apply_fix(resp, nc, rs):
                             state.save()
                             return report
