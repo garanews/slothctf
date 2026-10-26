@@ -288,9 +288,10 @@ def _invoke(caller: Callable, prompt: str, model: str) -> tuple[dict, Optional[i
     return dict(data), toks
 
 
-def ollama_transport(base_url: str, temperature: float = 0.7):
+def ollama_transport(base_url: str, temperature: float = 0.7, num_ctx: int = 4096):
     """Real token-aware transport around Ollama, reusing generator's JSON coercion.
-    Returns a caller(prompt, model) -> (dict, total_tokens)."""
+    Returns a caller(prompt, model) -> (dict, total_tokens). `num_ctx` defaults to the
+    historical 4096 so existing behaviour is unchanged when no override is given."""
     from urllib import request
     from urllib.error import URLError
 
@@ -299,7 +300,7 @@ def ollama_transport(base_url: str, temperature: float = 0.7):
     def caller(prompt: str, model: str):
         payload = json.dumps({"model": model, "prompt": prompt, "stream": True,
                               "format": "json", "keep_alive": "10m",
-                              "options": {"temperature": temperature, "num_ctx": 4096}}).encode()
+                              "options": {"temperature": temperature, "num_ctx": num_ctx}}).encode()
         req = request.Request(endpoint, data=payload,
                               headers={"Content-Type": "application/json"}, method="POST")
         chunks: list[str] = []
