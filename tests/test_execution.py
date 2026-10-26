@@ -220,7 +220,7 @@ class StaticAnalysisElfTests(unittest.TestCase):
         self.assertIn("=== sections", ev)
         self.assertIn("=== strings", ev)
         self.assertIn("=== disassembly", ev)
-        self.assertLessEqual(len(ev), 9200)                    # bounded to the context budget
+        self.assertLessEqual(len(ev), 6000)                    # bounded to the context budget
 
 
 @unittest.skipUnless(_PE_READY, "needs Docker + the Windows-compat sandbox image")
@@ -235,7 +235,7 @@ class StaticAnalysisPeTests(unittest.TestCase):
             ev = b.static_analysis(ws, "bin/challenge.exe", get_target("pe"))
         self.assertIn("=== sections", ev)
         self.assertIn("=== disassembly", ev)
-        self.assertLessEqual(len(ev), 9200)
+        self.assertLessEqual(len(ev), 6000)
 
 
 class _EofPipe:

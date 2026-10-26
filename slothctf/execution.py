@@ -237,13 +237,21 @@ class ExecutionBackend(ABC):
         in_container = self.name.startswith("docker")
         pin = str(PurePosixPath(_WORK) / binary_rel) if in_container else binary_rel
         pre = "x86_64-w64-mingw32-" if self.name == "docker-wincompat" else ""
+        data_secs = [".rodata", ".data"] if target.name == "elf" else [".rdata", ".data"]
+        data_cmd = [f"{pre}objdump", "-s", *[a for s in data_secs for a in ("-j", s)], pin]
+        # Selection: the DATA dump carries the embedded (often non-printable) encoded bytes a
+        # recover solver must locate; the disassembly carries the transform logic. Each gets its
+        # OWN char budget so neither starves the other (a large static-PE .rdata must not crowd
+        # out the code, and vice-versa). Sizing: the total (~5.5k chars ~ <2k dense tokens) leaves
+        # the num_ctx=4096 window ample room for the solver response. Standard binutils only.
         steps = [
-            ("sections", [f"{pre}objdump", "-h", pin], 60),
-            ("strings", [f"{pre}strings", "-n", "5", pin], 80),
-            ("disassembly", [f"{pre}objdump", "-d", "-M", "intel", pin], 240),
+            ("sections", [f"{pre}objdump", "-h", pin], 40, 800),
+            ("data section contents (encoded bytes live here)", data_cmd, 60, 1900),
+            ("strings", [f"{pre}strings", "-n", "5", pin], 40, 900),
+            ("disassembly", [f"{pre}objdump", "-d", "-M", "intel", pin], 140, 1900),
         ]
         parts: list[str] = []
-        for label, inner, max_lines in steps:
+        for label, inner, max_lines, max_chars in steps:
             try:
                 r = self._run_tool(inner, workspace, min(limits.run_timeout, 30.0), limits)
                 text = (r.stdout or "").strip()
@@ -255,12 +263,10 @@ class ExecutionBackend(ABC):
             clipped = "\n".join(lines[:max_lines])
             if len(lines) > max_lines:
                 clipped += f"\n[... {label}: {len(lines) - max_lines} more lines truncated ...]"
+            if len(clipped) > max_chars:
+                clipped = clipped[:max_chars] + f"\n[... {label}: truncated to {max_chars} chars ...]"
             parts.append(f"=== {label} ({inner[0]}) ===\n{clipped}")
-        blob = "\n\n".join(parts)
-        budget = 9000
-        if len(blob) > budget:
-            blob = blob[:budget] + "\n[... evidence truncated to fit the context budget ...]"
-        return blob
+        return "\n\n".join(parts)
 
 
 # --------------------------------------------------------------------------- #
