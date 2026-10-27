@@ -78,7 +78,22 @@ FC_SOLVER_GOOD = (
     "        s = (s + v + i) & 0xFF\n"
     "    if pat.match(bytes(dec)):\n"
     "        print(dec.decode()); break\n")
-FC_ENCODER_BROKEN = "#include <stdio.h>\nint main(){ not valid c ; }\n"
+FC_ENCODER_BROKEN = "#include <stdio.h>\n/*__TRANSFORM_FN__*/\nint main(){ not valid c ; }\n"
+# a fully self-contained, independently COMPILABLE encoder that defines slothctf_transform
+# inline, with NO placeholder at all — must still be REJECTED by the contract check
+# (never compiled to find this out).
+FC_ENCODER_AUTONOMOUS = (
+    "#include <stdio.h>\n#include <string.h>\n#include <stddef.h>\n"
+    + FC_TRANSFORM +
+    "int main(int argc, char **argv) {\n"
+    "    if (argc != 2) return 1;\n"
+    "    const unsigned char *flag = (const unsigned char *)argv[1];\n"
+    "    size_t n = strlen((const char *)flag);\n"
+    "    unsigned char out[1024];\n"
+    "    slothctf_transform(flag, n, out);\n"
+    "    for (size_t i = 0; i < n; i++) { printf(\"0x%02x\", out[i]); if (i+1<n) printf(\",\"); }\n"
+    "    return 0;\n"
+    "}\n")
 
 
 # --- proven-good components (XOR 0x5a; static const; marker 'Correct') ---------
@@ -489,20 +504,89 @@ class StateMachineTests(unittest.TestCase):
         st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}")
         self.assertEqual(st.mode, "inverse")  # unchanged default, old behaviour preserved
         raw = "RAW" + ag.TRANSFORM_PLACEHOLDER + "CODE"
-        self.assertEqual(ag._resolve_fc("challenge", st, raw, {}), raw)  # no-op in inverse mode
+        code, err, tc = ag._resolve_fc("challenge", st, raw, {})
+        self.assertEqual((code, err, tc), (raw, None, None))  # no-op in inverse mode
 
-    def test_resolve_fc_splices_transform_in_forward_check_mode(self):
+    def test_resolve_fc_splices_transform_exactly_once(self):
         st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}",
                              mode="forward_check")
         raw_enc = "A" + ag.TRANSFORM_PLACEHOLDER + "B"
-        resolved = ag._resolve_fc("encoder", st, raw_enc, {"transform_code": "FNBODY"})
-        self.assertEqual(resolved, "AFNBODYB")
-        self.assertEqual(st.transform_code, "FNBODY")   # cached for the challenge stage
+        code, err, tc = ag._resolve_fc("encoder", st, raw_enc, {"transform_code": "FNBODY"})
+        self.assertIsNone(err)
+        self.assertEqual(code, "AFNBODYB")
+        self.assertEqual(tc, "FNBODY")
+        self.assertEqual(st.transform_code, "", "PURE function: must NOT mutate state itself")
+        st.transform_code = "FNBODY"   # simulate the caller committing it (apply_fix's job)
         raw_chal = "X" + ag.TRANSFORM_PLACEHOLDER + "Y"
-        self.assertEqual(ag._resolve_fc("challenge", st, raw_chal, {}), "XFNBODYY")
-        # missing marker/transform -> returned unchanged (compiler will report it naturally)
-        st2 = ag.ProjectState(name="y", target="elf", difficulty="easy", flag="sloth{a}", mode="forward_check")
-        self.assertEqual(ag._resolve_fc("challenge", st2, "no-marker-here", {}), "no-marker-here")
+        code2, err2, tc2 = ag._resolve_fc("challenge", st, raw_chal, {})
+        self.assertIsNone(err2)
+        self.assertEqual(code2, "XFNBODYY")
+        self.assertIsNone(tc2)   # challenge never produces a new transform
+
+    def test_resolve_fc_rejects_missing_or_empty_transform_code(self):
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}", mode="forward_check")
+        raw = "A" + ag.TRANSFORM_PLACEHOLDER + "B"
+        code, err, tc = ag._resolve_fc("encoder", st, raw, {})                      # key absent
+        self.assertIsNotNone(err); self.assertEqual(code, raw); self.assertIsNone(tc)
+        code, err, tc = ag._resolve_fc("encoder", st, raw, {"transform_code": "   "})  # empty/whitespace
+        self.assertIsNotNone(err)
+
+    def test_resolve_fc_rejects_missing_or_duplicated_placeholder(self):
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}", mode="forward_check")
+        # encoder: zero occurrences (model wrote F inline, fully compilable on its own) -> rejected
+        code, err, tc = ag._resolve_fc("encoder", st, "no marker at all", {"transform_code": "FN"})
+        self.assertIsNotNone(err); self.assertIn("exactly once (found 0)", err); self.assertIsNone(tc)
+        # encoder: duplicated marker -> rejected
+        dup = ag.TRANSFORM_PLACEHOLDER + "x" + ag.TRANSFORM_PLACEHOLDER
+        code, err, tc = ag._resolve_fc("encoder", st, dup, {"transform_code": "FN"})
+        self.assertIsNotNone(err); self.assertIn("found 2", err)
+        # challenge: never relies on the compiler — checked the same way, before any compile
+        st.transform_code = "FN"
+        code, err, tc = ag._resolve_fc("challenge", st, "no marker here either", {})
+        self.assertIsNotNone(err); self.assertIn("exactly once (found 0)", err)
+
+    def test_display_code_fc_restores_placeholder_for_repair_prompt(self):
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}", mode="forward_check")
+        st.transform_code = "FNBODY"
+        st.challenge.code = "X" + "FNBODY" + "Y"   # as actually stored (already spliced)
+        shown = ag._display_code_fc("challenge", st)
+        self.assertEqual(shown, "X" + ag.TRANSFORM_PLACEHOLDER + "Y")
+        self.assertNotIn("FNBODY", shown)   # model is shown the marker, not the inlined body
+
+    def test_rejected_encoder_repair_never_desyncs_transform_code(self):
+        # requirement: a repair that is proposed but NOT applied (e.g. repair budget already
+        # exhausted at apply time) must leave state.transform_code untouched.
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}", mode="forward_check")
+        st.transform_code = "OLD_FN"
+        st.encoder.code = "A" + "OLD_FN" + "B"
+        st.encoder.repairs = 999   # simulate budget already exhausted
+        code, err, cand_tc = ag._resolve_fc("encoder", st, "A" + ag.TRANSFORM_PLACEHOLDER + "B",
+                                            {"transform_code": "NEW_FN"})
+        self.assertIsNone(err); self.assertEqual(cand_tc, "NEW_FN")
+        self.assertEqual(st.transform_code, "OLD_FN", "resolving a candidate must not commit it")
+        # only a real apply_fix-style commit (here simulated) should change it:
+        # (apply_fix itself refuses when repairs >= budget — covered by the Docker test below)
+
+    def test_transform_only_change_is_progress_not_no_progress(self):
+        # a repair that changes ONLY transform_code (same encoder_code wrapper text) must
+        # still be recognised as a real change on the RESOLVED (post-splice) text.
+        a = ag._normalize("WRAP" + "FN_A" + "WRAP")
+        b = ag._normalize("WRAP" + "FN_B" + "WRAP")
+        self.assertNotEqual(a, b)
+
+    def test_encoder_repair_changing_f_invalidates_challenge_and_solver(self):
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}", mode="forward_check")
+        st.transform_code = "FN_OLD"
+        st.set_code("encoder", "WRAP" + "FN_OLD" + "WRAP"); st.mark_verified("encoder")
+        st.set_code("challenge", "CHAL" + "FN_OLD" + "CHAL"); st.mark_verified("challenge")
+        st.set_code("solver", "sol"); st.mark_verified("solver")
+        self.assertTrue(st.is_verified("challenge") and st.is_verified("solver"))
+        # the atomic commit pattern apply_fix uses when an encoder repair changes F:
+        st.set_code("encoder", "WRAP" + "FN_NEW" + "WRAP")
+        st.transform_code = "FN_NEW"
+        self.assertFalse(st.is_verified("encoder"))
+        self.assertFalse(st.is_verified("challenge"), "a changed F must invalidate the challenge")
+        self.assertFalse(st.is_verified("solver"))
 
     def test_mode_and_transform_code_persist_across_save_load(self):
         with TemporaryDirectory() as tmp:
@@ -718,9 +802,9 @@ class AgenticForwardCheckElfTests(unittest.TestCase):
             self.assertNotIn(ag.TRANSFORM_PLACEHOLDER, st.encoder.code)
             self.assertNotIn(ag.TRANSFORM_PLACEHOLDER, st.challenge.code)
 
-    def test_missing_placeholder_surfaces_as_ordinary_compile_error(self):
-        # No special "missing marker" stage needed: an encoder without the token just
-        # fails to link (undefined reference) -> ordinary compile-error repair path.
+    def test_broken_encoder_still_fixed_by_ordinary_compile_error_path(self):
+        # Non-contract compile errors (e.g. a syntax error) still go through the ordinary
+        # encoder-compile repair path, unaffected by the new contract pre-check.
         items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_BROKEN},
                  {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
                  {"challenge_code": FC_CHALLENGE_GOOD, "success_marker": "Correct"},
@@ -729,6 +813,26 @@ class AgenticForwardCheckElfTests(unittest.TestCase):
                   flag=FC_FLAG, mode="forward_check") as (rep, caller, _):
             self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
             self.assertTrue(any(a.stage == "encoder-compile" for a in rep.attempts))
+
+    def test_autonomous_f_without_placeholder_rejected_without_compiling(self):
+        # A fully self-contained, independently compilable encoder (slothctf_transform
+        # written inline, no marker at all) must be REJECTED by the contract check — proving
+        # the harness does NOT rely on the compiler to catch a missing placeholder.
+        items = [{"design": "d"},
+                 {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_AUTONOMOUS},  # contract violation
+                 {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},        # correct repair
+                 {"challenge_code": FC_CHALLENGE_GOOD, "success_marker": "Correct"},
+                 {"solver_code": FC_SOLVER_GOOD}]
+        with _run("ag_fc_autonomous", "elf", self._backend(), items,
+                  flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
+            self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
+            stages = [a.stage for a in rep.attempts]
+            self.assertIn("fc-contract-encoder", stages, [(a.stage, a.detail[:80]) for a in rep.attempts])
+            # caught BEFORE any compile attempt — never relied on the compiler to detect it
+            self.assertLess(stages.index("fc-contract-encoder"), stages.index("encoder-ok"))
+            st = ag.ProjectState.load(cdir / "agentic_state.json")
+            self.assertEqual(st.encoder.repairs, 1)   # one accepted repair (the contract
+                                                       # violation itself cost no repair slot)
 
     def test_hardcoded_solver_still_rejected_by_flag_swap(self):
         # Stage D/E are untouched by Forward-Check: the anti-hardcode swap still fires.
