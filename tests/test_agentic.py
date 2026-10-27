@@ -873,8 +873,9 @@ class AgenticForwardCheckElfTests(unittest.TestCase):
 
     def test_wrong_length_input_rejected_safely(self):
         # Direct binary-level check on the harness-synthesized challenge: short, empty,
-        # too-long and no-trailing-newline inputs must all be rejected cleanly (exit 0, no
-        # crash) — exactly the class of bug the 15-run campaign found in model-written I/O.
+        # too-long, no-trailing-newline, and embedded-NUL inputs must all be rejected
+        # cleanly (exit 0, no crash) — the embedded-NUL case is the fix under test: a
+        # strlen()-based read would silently accept "<flag>\0<garbage>" as the bare flag.
         import slothctf.generator as gmod
         items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
                  {"solver_code": FC_SOLVER_GOOD}]
@@ -885,7 +886,9 @@ class AgenticForwardCheckElfTests(unittest.TestCase):
             be = self._backend()
             for label, stdin in [("short", "short\n"), ("empty", "\n"),
                                  ("too-long", "definitely_wrong_" + FC_FLAG + "\n"),
-                                 ("no-newline-exact-len", FC_FLAG)]:
+                                 ("no-newline-exact-len", FC_FLAG),
+                                 ("embedded-nul-then-garbage", FC_FLAG + "\x00GARBAGE_AFTER_NUL\n"),
+                                 ("embedded-nul-at-eof", FC_FLAG + "\x00")]:
                 r = be.run_binary(cdir, "bin/challenge", tgt, stdin_text=stdin)
                 self.assertTrue(r.ok and not r.timed_out, f"{label}: crashed/timed out: {r.stderr}")
                 self.assertEqual(r.exit_code, 0, f"{label}: must exit 0")
@@ -919,6 +922,19 @@ class AgenticPeTests(unittest.TestCase):
             st = ag.ProjectState.load(cdir / "agentic_state.json")
             self.assertIn("s = (unsigned char)(s + in[i]", st.encoder.code)
             self.assertIn("s = (unsigned char)(s + in[i]", st.challenge.code)
+            # same embedded-NUL regression as ELF, on the real .exe (byte-counting read
+            # must behave identically regardless of target — PE and ELF are equal footing)
+            import slothctf.generator as gmod
+            be = DockerWinCompatBackend()
+            tgt = gmod.get_target("pe")
+            for label, stdin in [("embedded-nul-then-garbage", FC_FLAG + "\x00GARBAGE_AFTER_NUL\n"),
+                                 ("embedded-nul-at-eof", FC_FLAG + "\x00")]:
+                r = be.run_binary(cdir, "bin/challenge.exe", tgt, stdin_text=stdin)
+                self.assertTrue(r.ok and not r.timed_out, f"{label}: crashed/timed out: {r.stderr}")
+                self.assertEqual(r.exit_code, 0, f"{label}: must exit 0")
+                self.assertIn("WRONG_INPUT", r.stdout, label)
+            good = be.run_binary(cdir, "bin/challenge.exe", tgt, stdin_text=FC_FLAG + "\n")
+            self.assertIn(ag.FC_SUCCESS_MARKER, good.stdout)
 
 
 @unittest.skipUnless(_READY, _SKIP)
