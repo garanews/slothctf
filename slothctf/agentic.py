@@ -18,6 +18,14 @@ Stages:  A design → B encoder → C challenge → D solver → E final verific
 Repairs are produced by the LLM; the harness only verifies. Failures route to the
 responsible component (the model diagnoses ambiguous ones); changing a component
 invalidates everything downstream (via a content signature) and re-runs its gates.
+
+Two Stage-B/C modes (ProjectState.mode, default "inverse" — unchanged behaviour):
+  "inverse"       — the model writes the challenge's inverse by hand (original).
+  "forward_check" — EXPERIMENTAL. The model writes ONE transform function F (any buffer-
+                     wide, stateful, composed algorithm); the harness splices that SAME
+                     verified C source into both the encoder and the challenge (which
+                     re-applies F to the input and compares), so no hand-written inverse
+                     is needed. Stage D/E are identical in both modes.
 """
 from __future__ import annotations
 
@@ -159,6 +167,8 @@ class ProjectState:
     prompt: str = ""
     success_marker: str = ""
     design: str = ""
+    mode: str = "inverse"       # "inverse" (default, unchanged) | "forward_check" (experimental)
+    transform_code: str = ""   # forward_check: the ONE shared F implementation (encoder+challenge)
     encoder: Component = field(default_factory=Component)
     challenge: Component = field(default_factory=Component)
     solver: Component = field(default_factory=Component)
@@ -210,6 +220,7 @@ class ProjectState:
             "name": self.name, "target": self.target, "difficulty": self.difficulty,
             "flag": self.flag, "model": self.model, "prompt": self.prompt,
             "success_marker": self.success_marker, "design": self.design,
+            "mode": self.mode, "transform_code": self.transform_code,
             "encoder": cd(self.encoder), "challenge": cd(self.challenge),
             "solver": cd(self.solver), "transcript": self.transcript,
             "budget_calls": self.budget_calls, "budget_tokens": self.budget_tokens,
@@ -258,7 +269,8 @@ class ProjectState:
         st = cls(name=d["name"], target=d["target"], difficulty=d["difficulty"],
                  flag=d["flag"], model=d.get("model", DEFAULT_MODEL),
                  prompt=d.get("prompt", ""), success_marker=d.get("success_marker", ""),
-                 design=d.get("design", ""), encoder=mkc(d.get("encoder", {})),
+                 design=d.get("design", ""), mode=d.get("mode", "inverse"),
+                 transform_code=d.get("transform_code", ""), encoder=mkc(d.get("encoder", {})),
                  challenge=mkc(d.get("challenge", {})), solver=mkc(d.get("solver", {})),
                  transcript=d.get("transcript", []),
                  budget_calls=int(d.get("budget_calls", 0)),
@@ -403,6 +415,60 @@ def _challenge_prompt(state: ProjectState) -> str:
         'Return ONE JSON object: {"challenge_code": "<C source>", "success_marker": "<exact text>"}.')
 
 
+# --------------------------------------------------------------------------- #
+# Forward-Check mode (experimental): ONE shared transform F, reused verbatim by
+# encoder AND challenge — no hand-written inverse. Splice point is a plain C
+# comment token, same mechanism as g.ENCODED_PLACEHOLDER (text substitution, no
+# parsing). F may be stateful / buffer-wide (permutations, state machines,
+# inter-byte dependencies all remain allowed) — it just must be a pure, callable
+# function of (in, n).
+# --------------------------------------------------------------------------- #
+TRANSFORM_PLACEHOLDER = "/*__TRANSFORM_FN__*/"
+TRANSFORM_FN_SIG = "void slothctf_transform(const unsigned char *in, size_t n, unsigned char *out)"
+
+
+def _encoder_prompt_fc(state: ProjectState) -> str:
+    return (
+        f"Your design:\n{state.design}\n\n"
+        "FORWARD-CHECK mode: you never write an inverse. Your transform will be compiled "
+        "VERBATIM into both the organizer encoder and the player challenge; the challenge just "
+        "re-applies it and compares bytes. Write TWO fields:\n"
+        f"1. transform_code: a SELF-CONTAINED C function, exactly this signature:\n   {TRANSFORM_FN_SIG};\n"
+        "   It may use permutations, a running state, inter-byte dependencies or any composed "
+        "operation over the WHOLE buffer — not restricted to independent per-byte ops. It must be "
+        "a PURE function of (in, n): no I/O, no mutable state across calls, no randomness.\n"
+        f"2. encoder_code: a COMPLETE C program (organizer tool) containing the literal token "
+        f"{TRANSFORM_PLACEHOLDER} near the TOP of the file (right after your #includes, before any "
+        "other code, so the function is declared before main() calls it) — the harness inserts your "
+        "transform_code there verbatim. main() reads the flag from argv[1], calls "
+        "slothctf_transform(flag, strlen(flag), out), and prints out as comma-separated single-byte "
+        f"0xNN tokens and NOTHING else. Process the whole flag; no fixed length. Must compile on "
+        f"{_platform_line(state)}. "
+        'Return ONE JSON object: {"transform_code": "<C function source>", '
+        f'"encoder_code": "<C source containing {TRANSFORM_PLACEHOLDER}>"}}.')
+
+
+def _challenge_prompt_fc(state: ProjectState) -> str:
+    return (
+        f"Your design:\n{state.design}\n\n"
+        "FORWARD-CHECK mode: do NOT write an inverse. Your VERIFIED transform (used verbatim, "
+        f"unchanged, in both the encoder and this challenge):\n{state.transform_code}\n\n"
+        f"The encoder output bytes will be substituted at the token {g.ENCODED_PLACEHOLDER}. Write "
+        "challenge_code: a COMPLETE C program given to the player, containing BOTH literal tokens "
+        f"near the TOP of the file (before main): {TRANSFORM_PLACEHOLDER} (the harness inserts the "
+        "SAME verified transform there verbatim — call it exactly as slothctf_transform) and a "
+        f"file-scope `static const unsigned char NAME[] = {{ {g.ENCODED_PLACEHOLDER} }};` array, "
+        "actually used. Derive the byte count from sizeof(NAME); never hardcode a length. main(): "
+        "read one line from stdin, strip the newline, FIRST check the input length equals "
+        "sizeof(NAME) (reject safely otherwise — no buffer overrun), ONLY THEN call "
+        "slothctf_transform(input, sizeof(NAME), computed) into a same-size buffer, and compare "
+        "computed to NAME with memcmp. Print EXACTLY the success marker iff they match, otherwise a "
+        "different message; never print the flag, keep no plaintext flag literal. Use only headers "
+        f"available on {_platform_line(state)}. Do NOT reimplement, invert or modify the transform — "
+        "call the given function exactly as provided; fix only your own I/O/length/comparison logic. "
+        'Return ONE JSON object: {"challenge_code": "<C source>", "success_marker": "<exact text>"}.')
+
+
 def _binary_evidence_block(state: ProjectState) -> str:
     ev = getattr(state, "binary_evidence", "") or ""
     if not ev:
@@ -440,23 +506,101 @@ _REPAIR_PROMPTS = {
 }
 
 
+def _display_code_fc(which: str, state: ProjectState) -> str:
+    """Forward-check only: the STORED component code already has F's body spliced in
+    (Stage E needs it that way). For display in a repair prompt, restore the single
+    placeholder marker in its place — so the model edits a version that still shows the
+    marker, and naturally keeps/returns it, instead of seeing (and risking copying or
+    tweaking) F's inlined body. Falls back to the raw stored code if the exact transform
+    text can't be found verbatim (defensive; should not happen once resolved)."""
+    code = state.comp(which).code
+    tc = state.transform_code
+    if tc and tc in code:
+        return code.replace(tc, TRANSFORM_PLACEHOLDER)
+    return code
+
+
 def _repair_prompt(which: str, state: ProjectState, err: str) -> str:
-    base = _REPAIR_PROMPTS[which].format(err=err[:1500], code=state.comp(which).code)
+    if which == "encoder" and state.mode == "forward_check":
+        # Forward-check: always re-ask for BOTH fields (transform_code may need the fix, or
+        # just encoder_code's I/O glue) — a single shared-source repair, not two divergent ones.
+        return (f"Fix the transform/encoder. The harness reported:\n{err[:1500]}\n"
+                f"Current transform_code:\n{state.transform_code}\n"
+                f"Current encoder_code (marker shown where your transform is spliced in):\n"
+                f"{_display_code_fc('encoder', state)}\n"
+                "FORWARD-CHECK mode: this transform_code is compiled VERBATIM into both the "
+                "encoder and the player challenge — fix whichever field caused the error. Keep "
+                f"the literal token {TRANSFORM_PLACEHOLDER} near the top of encoder_code (exactly "
+                f"once), and keep the signature {TRANSFORM_FN_SIG}. "
+                'Return ONE JSON object: {"transform_code": "<C function source>", "encoder_code": "<C source>"}.')
+    code_for_prompt = (_display_code_fc(which, state)
+                      if which == "challenge" and state.mode == "forward_check"
+                      else state.comp(which).code)
+    base = _REPAIR_PROMPTS[which].format(err=err[:1500], code=code_for_prompt)
     if which == "challenge":
-        # Stage C repairs are organizer-side: the verified encoder + design are provided so the
-        # challenge can be made mathematically consistent with the encoder transform.
-        base += ("\n\nThe VERIFIED encoder whose transform you MUST invert exactly (derive the length "
-                 f"from the embedded array, never a fixed constant):\n{state.encoder.code}\n"
-                 f"Your design:\n{state.design}\n"
-                 "First determine the SINGLE concrete cause of the divergence — compare your decode "
-                 "length, indices, casts, order and mod-256 arithmetic against the encoder and the "
-                 "reported error — then return challenge_code that changes exactly that. Add no "
-                 "operation the encoder does not perform.")
+        if state.mode == "forward_check":
+            base += ("\n\nFORWARD-CHECK mode: do NOT write an inverse. The code above already has "
+                     f"the marker {TRANSFORM_PLACEHOLDER} where the verified transform is spliced in "
+                     "(exactly once) — keep that single marker in your reply exactly as shown; do NOT "
+                     "inline, duplicate, remove or rewrite the transform. Fix only your own length "
+                     "check, buffer sizes, marker text or exit-code contract.\n"
+                     f"Your design:\n{state.design}\n")
+        else:
+            # Stage C repairs are organizer-side: the verified encoder + design are provided so the
+            # challenge can be made mathematically consistent with the encoder transform.
+            base += ("\n\nThe VERIFIED encoder whose transform you MUST invert exactly (derive the length "
+                     f"from the embedded array, never a fixed constant):\n{state.encoder.code}\n"
+                     f"Your design:\n{state.design}\n"
+                     "First determine the SINGLE concrete cause of the divergence — compare your decode "
+                     "length, indices, casts, order and mod-256 arithmetic against the encoder and the "
+                     "reported error — then return challenge_code that changes exactly that. Add no "
+                     "operation the encoder does not perform.")
     elif which == "solver":
         # solver repairs stay player-only: the binary RE evidence is public, but NEVER the
         # encoder, challenge source, design or flag.
         base += _binary_evidence_block(state)
     return base
+
+
+def _resolve_fc(which: str, state: ProjectState, raw_code: str, payload: dict) -> tuple[str, Optional[str], Optional[str]]:
+    """Forward-check mode only. PURE function — never mutates `state` — so a rejected,
+    identical or ultimately-unapplied reply can never desync state.transform_code from
+    the actually-stored state.encoder.code; the caller commits the returned candidate
+    transform ONLY when it accepts the code (atomically with state.set_code).
+
+    Returns (code, error, candidate_transform):
+      - on success: (code with F spliced in exactly once, None, candidate_transform_or_None)
+      - on a CONTRACT violation (missing/empty transform_code, or the placeholder absent or
+        duplicated): (raw_code unchanged, <error detail>, None) — the caller must treat this
+        as a repairable failure WITHOUT compiling (never relies on the compiler to catch it).
+    `candidate_transform` is only meaningful for which == "encoder" (the new F the caller
+    should commit to state.transform_code once this exact code is accepted)."""
+    if state.mode != "forward_check":
+        return raw_code, None, None
+    if which == "encoder":
+        tc = str(payload.get("transform_code", "")).strip()
+        if not tc:
+            return raw_code, "transform_code is missing or empty; return a non-empty C function.", None
+        n = raw_code.count(TRANSFORM_PLACEHOLDER)
+        if n != 1:
+            return raw_code, (
+                f"encoder_code must contain the token {TRANSFORM_PLACEHOLDER} exactly once (found {n}). "
+                "Do not write slothctf_transform's body directly in encoder_code — put it ONLY in "
+                f"transform_code, and mark its single splice point in encoder_code with {TRANSFORM_PLACEHOLDER}."
+            ), None
+        return raw_code.replace(TRANSFORM_PLACEHOLDER, tc), None, tc
+    if which == "challenge":
+        n = raw_code.count(TRANSFORM_PLACEHOLDER)
+        if n != 1:
+            return raw_code, (
+                f"challenge_code must contain the token {TRANSFORM_PLACEHOLDER} exactly once (found {n}). "
+                "Do not rewrite or inline slothctf_transform — the harness inserts the verified one at "
+                "that single marker; restore it if your previous reply removed or duplicated it."
+            ), None
+        if not state.transform_code.strip():
+            return raw_code, "no verified transform is available yet (re-verify the encoder first).", None
+        return raw_code.replace(TRANSFORM_PLACEHOLDER, state.transform_code), None, None
+    return raw_code, None, None
 
 
 # --------------------------------------------------------------------------- #
@@ -656,6 +800,8 @@ _RESPONSIBLE = {
     "solver-error": "solver", "solver-mismatch": "solver", "solver-hardcoded": "solver",
     "swap-solver-error": "solver", "swap-encoder": "encoder", "swap-identical": "encoder",
     "swap-compile": "challenge",
+    # forward_check-only contract violations (checked WITHOUT compiling — see _resolve_fc)
+    "fc-contract-encoder": "encoder", "fc-contract-challenge": "challenge",
 }
 
 
@@ -697,6 +843,7 @@ def generate_recover_agentic(
     backend=None, solver_backend=None, caller: Optional[Callable] = None,
     model: str = DEFAULT_MODEL, ollama_url: str = g.DEFAULT_OLLAMA_URL,
     budget: Optional[Budget] = None, flag: Optional[str] = None, resume: bool = True,
+    mode: str = "inverse",
 ) -> g.GenerationReport:
     """Agentic test-driven generation of a `recover` challenge. Returns a
     GenerationReport; a challenge is successful ONLY if the unchanged Stage-E gate
@@ -704,7 +851,10 @@ def generate_recover_agentic(
     recorded under a classified category: 'budget-exhausted', 'infra' (Ollama/HTTP/
     connection/sandbox), 'model-invalid' (unusable model reply), or 'verifier-error'
     (an unexpected fault inside a check). `caller` is the LLM hook (tests inject
-    replay). Everything is logged to a local, never-published transcript."""
+    replay). Everything is logged to a local, never-published transcript.
+
+    `mode`: "inverse" (default; unchanged) or "forward_check" (experimental — see module
+    docstring). Only applies to a FRESH run; resuming an existing run keeps its saved mode."""
     base_dir = Path("generated") / name
     base_dir.mkdir(parents=True, exist_ok=True)
     tgt = g.get_target(target)
@@ -725,13 +875,13 @@ def generate_recover_agentic(
     else:
         state = ProjectState(name=name, target=tgt.name, difficulty=difficulty,
                              flag=flag or g._random_flag(), model=model, prompt=prompt,
-                             path=str(statepath))
+                             mode=mode, path=str(statepath))
     state.save()
 
     report = g.GenerationReport(name=name, model=model, directory=str(base_dir), success=False)
     report.telemetry = {"workflow": "agentic", "stages": [], "repairs": {}}  # type: ignore[attr-defined]
 
-    def apply_fix(which: str, code: str, reason: str) -> bool:
+    def apply_fix(which: str, code: str, reason: str, transform_code: Optional[str] = None) -> bool:
         c = state.comp(which)
         if c.repairs >= budget.max_repairs_per_stage:
             report.attempts.append(g.AttemptResult(0, False, "max-repairs", f"{which}: {reason}"[:300]))
@@ -739,6 +889,11 @@ def generate_recover_agentic(
                        "note": "max-repairs", "reason": str(reason)[:600], "repairs": c.repairs})
             return False
         state.set_code(which, code)
+        # forward_check: commit the new F ATOMICALLY with the code that embeds it, and only
+        # on this accepted path — never on a rejected/no-progress/exhausted candidate, so
+        # transform_code can never drift out of sync with the actually-stored encoder.code.
+        if transform_code is not None:
+            state.transform_code = transform_code
         c.repairs += 1
         c.gate_detail = reason
         report.telemetry["repairs"][which] = c.repairs  # type: ignore[index]
@@ -763,12 +918,15 @@ def generate_recover_agentic(
     escalate: dict[str, str] = {}   # per-component extra feedback after a no-progress repair
 
     def fetch_fix(responsible: str, detail: str):
-        """Obtain a CHANGED fix for a known-responsible component (Phase 2/3). Pre-checks
-        the repair budget so a call that could no longer be applied is never issued; when
-        the model resends identical code it records a `repair-no-progress` event, escalates
-        the feedback and retries WITHOUT recompiling, all within budget. Returns
-        (newcode, marker) once the code actually changes, or None when the component's
-        repair budget is exhausted. Applying the returned code is the caller's job."""
+        """Obtain a CHANGED, CONTRACT-VALID fix for a known-responsible component. Pre-checks
+        the repair budget so a call that could no longer be applied is never issued. An
+        identical reply records `repair-no-progress`; a forward_check contract violation
+        (missing/duplicated placeholder, empty transform_code — checked WITHOUT compiling)
+        records `repair-contract-violation`; both escalate feedback and retry WITHOUT
+        recompiling, bounded by the same repair counter. Returns (newcode, marker,
+        transform_code) once a valid, changed code is produced, or None when the
+        component's repair budget is exhausted. Applying the returned code (and committing
+        transform_code) is the caller's job — fetch_fix never mutates state.transform_code."""
         if responsible == "solver":        # refresh the public binary evidence for the walled prompt
             _ensure_binary_evidence(state, base_dir, backend, tgt)
         while True:
@@ -779,23 +937,32 @@ def generate_recover_agentic(
                 return None
             payload = _ask(caller, model, budget, state, report, responsible, "repair",
                            _repair_prompt(responsible, state, detail + escalate.get(responsible, "")))
-            newcode = str(payload.get(f"{responsible}_code", c.code))
+            raw = str(payload.get(f"{responsible}_code", c.code))
+            newcode, fc_err, cand_tc = _resolve_fc(responsible, state, raw, payload)
             marker = (str(payload["success_marker"]).strip()
                       if responsible == "challenge" and payload.get("success_marker") else None)
-            if _normalize(newcode) != _normalize(c.code):          # real change -> progress
+            if fc_err is None and _normalize(newcode) != _normalize(c.code):   # valid + real change
                 escalate.pop(responsible, None)
-                return newcode, marker
-            # no progress: record, escalate the feedback, bound via the repair counter, retry
+                return newcode, marker, cand_tc
+            # either a contract violation or an identical reply: record, escalate, retry —
+            # bounded by the SAME repair counter, never recompiled.
             c.repairs += 1
-            np = report.telemetry.setdefault("no_progress", {})     # type: ignore[union-attr]
-            np[responsible] = np.get(responsible, 0) + 1
-            report.attempts.append(g.AttemptResult(0, False, "repair-no-progress",
-                                                   f"{responsible}: identical reply; escalating feedback"[:300]))
-            state.log({"type": "repair-no-progress", "component": responsible,
-                       "repairs": c.repairs, "detail": detail[:600]})
-            escalate[responsible] = ("\n\nNOTE: your previous reply was byte-for-byte IDENTICAL and fixed "
-                                     "nothing — do not resend the same code. Name the ONE concrete cause of the "
-                                     "failure and change exactly that part.")
+            if fc_err is not None:
+                report.attempts.append(g.AttemptResult(0, False, "repair-contract-violation",
+                                                       f"{responsible}: {fc_err}"[:300]))
+                state.log({"type": "repair-contract-violation", "component": responsible,
+                           "repairs": c.repairs, "detail": fc_err[:600]})
+                escalate[responsible] = "\n\nNOTE: " + fc_err
+            else:
+                np = report.telemetry.setdefault("no_progress", {})     # type: ignore[union-attr]
+                np[responsible] = np.get(responsible, 0) + 1
+                report.attempts.append(g.AttemptResult(0, False, "repair-no-progress",
+                                                       f"{responsible}: identical reply; escalating feedback"[:300]))
+                state.log({"type": "repair-no-progress", "component": responsible,
+                           "repairs": c.repairs, "detail": detail[:600]})
+                escalate[responsible] = ("\n\nNOTE: your previous reply was byte-for-byte IDENTICAL and fixed "
+                                         "nothing — do not resend the same code. Name the ONE concrete cause of "
+                                         "the failure and change exactly that part.")
             state.save()
 
     try:
@@ -814,17 +981,30 @@ def generate_recover_agentic(
             comp = state.comp(which)
             if which == "solver":   # independent solver sees public binary evidence, not sources
                 _ensure_binary_evidence(state, base_dir, backend, tgt)
+            fc_gen_err: Optional[str] = None   # set below if the FIRST reply violates the contract
             if not comp.code:  # first time we need this component
                 key = f"{which}_code"
-                payload = _ask(caller, model, budget, state, report, which, "generate",
-                               {"encoder": _encoder_prompt, "challenge": _challenge_prompt,
-                                "solver": _solver_prompt}[which](state))
-                comp.code = str(payload.get(key, ""))
-                if which == "challenge" and payload.get("success_marker"):
-                    state.success_marker = str(payload["success_marker"]).strip()
-                comp.status = "pending"
+                fc = state.mode == "forward_check"
+                gen_prompt = ({"encoder": _encoder_prompt_fc if fc else _encoder_prompt,
+                              "challenge": _challenge_prompt_fc if fc else _challenge_prompt,
+                              "solver": _solver_prompt}[which])(state)
+                payload = _ask(caller, model, budget, state, report, which, "generate", gen_prompt)
+                resolved, fc_gen_err, cand_tc = _resolve_fc(which, state, str(payload.get(key, "")), payload)
+                if fc_gen_err is None:
+                    comp.code = resolved
+                    if which == "encoder" and cand_tc is not None:
+                        state.transform_code = cand_tc        # first-ever F: nothing to desync yet
+                    if which == "challenge" and payload.get("success_marker"):
+                        state.success_marker = str(payload["success_marker"]).strip()
+                    comp.status = "pending"
                 state.save()
-            ok, stage_name, detail = run_gate(which)
+            if fc_gen_err is not None:
+                # Contract violation on the FIRST reply: never compiled — go straight to the
+                # SAME repair machinery a gate failure would use (never trust the compiler
+                # to catch a missing/duplicated placeholder).
+                ok, stage_name, detail = False, f"fc-contract-{which}", fc_gen_err
+            else:
+                ok, stage_name, detail = run_gate(which)
             report.attempts.append(g.AttemptResult(0, ok, stage_name, detail[:300]))
             report.telemetry["stages"].append({which: stage_name})  # type: ignore[index]
             if ok:
@@ -838,10 +1018,10 @@ def generate_recover_agentic(
             if got is None:
                 state.save()
                 return report  # repair budget exhausted for this component
-            newcode, marker = got
+            newcode, marker, cand_tc = got
             if marker:
                 state.success_marker = marker
-            if not apply_fix(responsible, newcode, detail[:300]):
+            if not apply_fix(responsible, newcode, detail[:300], transform_code=cand_tc):
                 state.save()
                 return report
 
@@ -869,10 +1049,10 @@ def generate_recover_agentic(
             got = fetch_fix(responsible, fb)
             if got is None:
                 break
-            newcode, marker = got
+            newcode, marker, cand_tc = got
             if marker:
                 state.success_marker = marker
-            if not apply_fix(responsible, newcode, fb[:300]):
+            if not apply_fix(responsible, newcode, fb[:300], transform_code=cand_tc):
                 break
             # re-verify any now-invalidated upstream stages before the next E
             while True:
@@ -892,10 +1072,10 @@ def generate_recover_agentic(
                     if got is None:
                         state.save()
                         return report
-                    nc, marker = got
+                    nc, marker, cand_tc = got
                     if marker:
                         state.success_marker = marker
-                    if not apply_fix(resp, nc, det[:300]):
+                    if not apply_fix(resp, nc, det[:300], transform_code=cand_tc):
                         state.save()
                         return report
     except BudgetExhausted as be:

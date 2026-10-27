@@ -22,6 +22,80 @@ _SKIP = "needs Docker + the slothctf-sandbox image"
 _WIN_READY = docker_available() and win_image_available()
 _WIN_SKIP = "needs Docker + the slothctf-sandbox-win image"
 
+# --- Forward-Check fixtures: ONE stateful, buffer-wide transform shared verbatim by
+# the encoder and the challenge (no hand-written inverse). Flag fixed at 19 bytes. ---
+FC_FLAG = "sloth{abcdefghijkl}"
+FC_TRANSFORM = (
+    "void slothctf_transform(const unsigned char *in, size_t n, unsigned char *out) {\n"
+    "    unsigned char s = 0x5a;\n"
+    "    for (size_t i = 0; i < n; i++) {\n"
+    "        unsigned char v = (unsigned char)(in[i] ^ s);\n"
+    "        out[i] = v;\n"
+    "        s = (unsigned char)(s + in[i] + (unsigned char)i);\n"
+    "    }\n"
+    "}\n")
+FC_ENCODER_GOOD = (
+    "#include <stdio.h>\n#include <string.h>\n#include <stddef.h>\n"
+    "/*__TRANSFORM_FN__*/\n"
+    "int main(int argc, char **argv) {\n"
+    "    if (argc != 2) return 1;\n"
+    "    const unsigned char *flag = (const unsigned char *)argv[1];\n"
+    "    size_t n = strlen((const char *)flag);\n"
+    "    unsigned char out[1024];\n"
+    "    slothctf_transform(flag, n, out);\n"
+    "    for (size_t i = 0; i < n; i++) { printf(\"0x%02x\", out[i]); if (i+1<n) printf(\",\"); }\n"
+    "    return 0;\n"
+    "}\n")
+FC_CHALLENGE_GOOD = (
+    "#include <stdio.h>\n#include <string.h>\n#include <stddef.h>\n"
+    "/*__TRANSFORM_FN__*/\n"
+    "static const unsigned char data[] = { /*__ENCODED_ARRAY__*/ };\n"
+    "int main(void) {\n"
+    "    char b[256];\n"
+    "    if (!fgets(b, sizeof b, stdin)) { printf(\"Denied\\n\"); return 0; }\n"
+    "    size_t n = strlen(b);\n"
+    "    if (n && b[n-1]=='\\n') b[--n] = 0;\n"
+    "    if (n != sizeof(data)) { printf(\"Denied\\n\"); return 0; }\n"
+    "    unsigned char computed[256];\n"
+    "    slothctf_transform((const unsigned char *)b, n, computed);\n"
+    "    if (memcmp(computed, data, n) != 0) { printf(\"Denied\\n\"); return 0; }\n"
+    "    printf(\"Correct\\n\"); return 0;\n"
+    "}\n")
+# independent solver: brute-forces the offset of a 19-byte window and inverts the SAME
+# stateful recurrence purely from the binary's raw bytes (no encoder/challenge access).
+FC_SOLVER_GOOD = (
+    "import sys, re\n"
+    "b = open(sys.argv[1], 'rb').read()\n"
+    "L = 19\n"
+    "pat = re.compile(rb'^sloth\\{[ -~]{1,40}\\}$')\n"
+    "for off in range(len(b) - L + 1):\n"
+    "    enc = b[off:off+L]\n"
+    "    s = 0x5a\n"
+    "    dec = bytearray(L)\n"
+    "    for i in range(L):\n"
+    "        v = enc[i] ^ s\n"
+    "        dec[i] = v\n"
+    "        s = (s + v + i) & 0xFF\n"
+    "    if pat.match(bytes(dec)):\n"
+    "        print(dec.decode()); break\n")
+FC_ENCODER_BROKEN = "#include <stdio.h>\n/*__TRANSFORM_FN__*/\nint main(){ not valid c ; }\n"
+# a fully self-contained, independently COMPILABLE encoder that defines slothctf_transform
+# inline, with NO placeholder at all — must still be REJECTED by the contract check
+# (never compiled to find this out).
+FC_ENCODER_AUTONOMOUS = (
+    "#include <stdio.h>\n#include <string.h>\n#include <stddef.h>\n"
+    + FC_TRANSFORM +
+    "int main(int argc, char **argv) {\n"
+    "    if (argc != 2) return 1;\n"
+    "    const unsigned char *flag = (const unsigned char *)argv[1];\n"
+    "    size_t n = strlen((const char *)flag);\n"
+    "    unsigned char out[1024];\n"
+    "    slothctf_transform(flag, n, out);\n"
+    "    for (size_t i = 0; i < n; i++) { printf(\"0x%02x\", out[i]); if (i+1<n) printf(\",\"); }\n"
+    "    return 0;\n"
+    "}\n")
+
+
 # --- proven-good components (XOR 0x5a; static const; marker 'Correct') ---------
 ENC_GOOD = ("#include <stdio.h>\nint main(int c,char**v){for(char*p=v[1];*p;++p)"
             "printf(\"0x%02x,\",(unsigned char)(*p^0x5a));return 0;}\n")
@@ -425,6 +499,105 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(rep.telemetry.get("error", {}).get("category"), "verifier-error")
         self.assertIn("compiler exploded", rep.attempts[-1].detail)
 
+    # -- Forward-Check: mode isolation, resolution, persistence --------------- #
+    def test_mode_defaults_to_inverse_and_resolve_is_noop(self):
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}")
+        self.assertEqual(st.mode, "inverse")  # unchanged default, old behaviour preserved
+        raw = "RAW" + ag.TRANSFORM_PLACEHOLDER + "CODE"
+        code, err, tc = ag._resolve_fc("challenge", st, raw, {})
+        self.assertEqual((code, err, tc), (raw, None, None))  # no-op in inverse mode
+
+    def test_resolve_fc_splices_transform_exactly_once(self):
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}",
+                             mode="forward_check")
+        raw_enc = "A" + ag.TRANSFORM_PLACEHOLDER + "B"
+        code, err, tc = ag._resolve_fc("encoder", st, raw_enc, {"transform_code": "FNBODY"})
+        self.assertIsNone(err)
+        self.assertEqual(code, "AFNBODYB")
+        self.assertEqual(tc, "FNBODY")
+        self.assertEqual(st.transform_code, "", "PURE function: must NOT mutate state itself")
+        st.transform_code = "FNBODY"   # simulate the caller committing it (apply_fix's job)
+        raw_chal = "X" + ag.TRANSFORM_PLACEHOLDER + "Y"
+        code2, err2, tc2 = ag._resolve_fc("challenge", st, raw_chal, {})
+        self.assertIsNone(err2)
+        self.assertEqual(code2, "XFNBODYY")
+        self.assertIsNone(tc2)   # challenge never produces a new transform
+
+    def test_resolve_fc_rejects_missing_or_empty_transform_code(self):
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}", mode="forward_check")
+        raw = "A" + ag.TRANSFORM_PLACEHOLDER + "B"
+        code, err, tc = ag._resolve_fc("encoder", st, raw, {})                      # key absent
+        self.assertIsNotNone(err); self.assertEqual(code, raw); self.assertIsNone(tc)
+        code, err, tc = ag._resolve_fc("encoder", st, raw, {"transform_code": "   "})  # empty/whitespace
+        self.assertIsNotNone(err)
+
+    def test_resolve_fc_rejects_missing_or_duplicated_placeholder(self):
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}", mode="forward_check")
+        # encoder: zero occurrences (model wrote F inline, fully compilable on its own) -> rejected
+        code, err, tc = ag._resolve_fc("encoder", st, "no marker at all", {"transform_code": "FN"})
+        self.assertIsNotNone(err); self.assertIn("exactly once (found 0)", err); self.assertIsNone(tc)
+        # encoder: duplicated marker -> rejected
+        dup = ag.TRANSFORM_PLACEHOLDER + "x" + ag.TRANSFORM_PLACEHOLDER
+        code, err, tc = ag._resolve_fc("encoder", st, dup, {"transform_code": "FN"})
+        self.assertIsNotNone(err); self.assertIn("found 2", err)
+        # challenge: never relies on the compiler — checked the same way, before any compile
+        st.transform_code = "FN"
+        code, err, tc = ag._resolve_fc("challenge", st, "no marker here either", {})
+        self.assertIsNotNone(err); self.assertIn("exactly once (found 0)", err)
+
+    def test_display_code_fc_restores_placeholder_for_repair_prompt(self):
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}", mode="forward_check")
+        st.transform_code = "FNBODY"
+        st.challenge.code = "X" + "FNBODY" + "Y"   # as actually stored (already spliced)
+        shown = ag._display_code_fc("challenge", st)
+        self.assertEqual(shown, "X" + ag.TRANSFORM_PLACEHOLDER + "Y")
+        self.assertNotIn("FNBODY", shown)   # model is shown the marker, not the inlined body
+
+    def test_rejected_encoder_repair_never_desyncs_transform_code(self):
+        # requirement: a repair that is proposed but NOT applied (e.g. repair budget already
+        # exhausted at apply time) must leave state.transform_code untouched.
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}", mode="forward_check")
+        st.transform_code = "OLD_FN"
+        st.encoder.code = "A" + "OLD_FN" + "B"
+        st.encoder.repairs = 999   # simulate budget already exhausted
+        code, err, cand_tc = ag._resolve_fc("encoder", st, "A" + ag.TRANSFORM_PLACEHOLDER + "B",
+                                            {"transform_code": "NEW_FN"})
+        self.assertIsNone(err); self.assertEqual(cand_tc, "NEW_FN")
+        self.assertEqual(st.transform_code, "OLD_FN", "resolving a candidate must not commit it")
+        # only a real apply_fix-style commit (here simulated) should change it:
+        # (apply_fix itself refuses when repairs >= budget — covered by the Docker test below)
+
+    def test_transform_only_change_is_progress_not_no_progress(self):
+        # a repair that changes ONLY transform_code (same encoder_code wrapper text) must
+        # still be recognised as a real change on the RESOLVED (post-splice) text.
+        a = ag._normalize("WRAP" + "FN_A" + "WRAP")
+        b = ag._normalize("WRAP" + "FN_B" + "WRAP")
+        self.assertNotEqual(a, b)
+
+    def test_encoder_repair_changing_f_invalidates_challenge_and_solver(self):
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}", mode="forward_check")
+        st.transform_code = "FN_OLD"
+        st.set_code("encoder", "WRAP" + "FN_OLD" + "WRAP"); st.mark_verified("encoder")
+        st.set_code("challenge", "CHAL" + "FN_OLD" + "CHAL"); st.mark_verified("challenge")
+        st.set_code("solver", "sol"); st.mark_verified("solver")
+        self.assertTrue(st.is_verified("challenge") and st.is_verified("solver"))
+        # the atomic commit pattern apply_fix uses when an encoder repair changes F:
+        st.set_code("encoder", "WRAP" + "FN_NEW" + "WRAP")
+        st.transform_code = "FN_NEW"
+        self.assertFalse(st.is_verified("encoder"))
+        self.assertFalse(st.is_verified("challenge"), "a changed F must invalidate the challenge")
+        self.assertFalse(st.is_verified("solver"))
+
+    def test_mode_and_transform_code_persist_across_save_load(self):
+        with TemporaryDirectory() as tmp:
+            p = Path(tmp) / "agentic_state.json"
+            st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}",
+                                 mode="forward_check", transform_code="void f(){}", path=str(p))
+            st.save()
+            st2 = ag.ProjectState.load(p)
+            self.assertEqual(st2.mode, "forward_check")
+            self.assertEqual(st2.transform_code, "void f(){}")
+
 
 class CliTests(unittest.TestCase):
     """CLI wiring for --workflow (no Docker, no Ollama)."""
@@ -453,7 +626,7 @@ class CliTests(unittest.TestCase):
 # Docker-gated: full ELF/PE flows and repair paths through the real sandbox
 # =========================================================================== #
 @contextlib.contextmanager
-def _run(name, target, backend, items, budget=None, flag=None):
+def _run(name, target, backend, items, budget=None, flag=None, mode="inverse"):
     """Run an agentic generation in a throwaway cwd and YIELD (rep, caller, cdir)
     while the workspace still exists, so file-existence assertions run before the
     TemporaryDirectory is cleaned up."""
@@ -463,7 +636,7 @@ def _run(name, target, backend, items, budget=None, flag=None):
         try:
             caller = Replay(items)
             rep = ag.generate_recover_agentic(name, prompt="xor recover", target=target,
-                                              backend=backend, caller=caller,
+                                              backend=backend, caller=caller, mode=mode,
                                               budget=budget or ag.Budget(), flag=flag, resume=False)
             yield rep, caller, Path(tmp) / "generated" / name
         finally:
@@ -602,6 +775,93 @@ class AgenticElfTests(unittest.TestCase):
                 os.chdir(prev)
 
 
+@unittest.skipUnless(_READY, _SKIP)
+class AgenticForwardCheckElfTests(unittest.TestCase):
+    """Forward-Check mode: ONE shared transform (stateful, inter-byte dependency) is
+    spliced verbatim into encoder AND challenge — no hand-written inverse. Old 'inverse'
+    mode (AgenticElfTests above) is untouched and used as the reference."""
+
+    def _backend(self):
+        from slothctf.execution import DockerLinuxBackend
+        return DockerLinuxBackend()
+
+    def test_full_valid_elf_shared_transform(self):
+        items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
+                 {"challenge_code": FC_CHALLENGE_GOOD, "success_marker": "Correct"},
+                 {"solver_code": FC_SOLVER_GOOD}]
+        with _run("ag_fc_elf_ok", "elf", self._backend(), items,
+                  flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
+            self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
+            self.assertTrue((cdir / "bin" / "challenge").exists())
+            # the SAME literal transform (incl. the stateful recurrence line) is baked into
+            # BOTH built sources — proof of single shared source, not two divergent ones.
+            st = ag.ProjectState.load(cdir / "agentic_state.json")
+            needle = "s = (unsigned char)(s + in[i]"
+            self.assertIn(needle, st.encoder.code)
+            self.assertIn(needle, st.challenge.code)
+            self.assertNotIn(ag.TRANSFORM_PLACEHOLDER, st.encoder.code)
+            self.assertNotIn(ag.TRANSFORM_PLACEHOLDER, st.challenge.code)
+
+    def test_broken_encoder_still_fixed_by_ordinary_compile_error_path(self):
+        # Non-contract compile errors (e.g. a syntax error) still go through the ordinary
+        # encoder-compile repair path, unaffected by the new contract pre-check.
+        items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_BROKEN},
+                 {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
+                 {"challenge_code": FC_CHALLENGE_GOOD, "success_marker": "Correct"},
+                 {"solver_code": FC_SOLVER_GOOD}]
+        with _run("ag_fc_fix", "elf", self._backend(), items,
+                  flag=FC_FLAG, mode="forward_check") as (rep, caller, _):
+            self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
+            self.assertTrue(any(a.stage == "encoder-compile" for a in rep.attempts))
+
+    def test_autonomous_f_without_placeholder_rejected_without_compiling(self):
+        # A fully self-contained, independently compilable encoder (slothctf_transform
+        # written inline, no marker at all) must be REJECTED by the contract check — proving
+        # the harness does NOT rely on the compiler to catch a missing placeholder.
+        items = [{"design": "d"},
+                 {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_AUTONOMOUS},  # contract violation
+                 {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},        # correct repair
+                 {"challenge_code": FC_CHALLENGE_GOOD, "success_marker": "Correct"},
+                 {"solver_code": FC_SOLVER_GOOD}]
+        with _run("ag_fc_autonomous", "elf", self._backend(), items,
+                  flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
+            self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
+            stages = [a.stage for a in rep.attempts]
+            self.assertIn("fc-contract-encoder", stages, [(a.stage, a.detail[:80]) for a in rep.attempts])
+            # caught BEFORE any compile attempt — never relied on the compiler to detect it
+            self.assertLess(stages.index("fc-contract-encoder"), stages.index("encoder-ok"))
+            st = ag.ProjectState.load(cdir / "agentic_state.json")
+            self.assertEqual(st.encoder.repairs, 1)   # one accepted repair (the contract
+                                                       # violation itself cost no repair slot)
+
+    def test_hardcoded_solver_still_rejected_by_flag_swap(self):
+        # Stage D/E are untouched by Forward-Check: the anti-hardcode swap still fires.
+        hc = f"print({FC_FLAG!r})\n"
+        items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
+                 {"challenge_code": FC_CHALLENGE_GOOD, "success_marker": "Correct"}, {"solver_code": hc},
+                 {"solver_code": hc}, {"solver_code": hc}]
+        with _run("ag_fc_hardcode", "elf", self._backend(), items,
+                  budget=ag.Budget(max_repairs_per_stage=1), flag=FC_FLAG,
+                  mode="forward_check") as (rep, caller, _):
+            self.assertFalse(rep.success)
+            self.assertTrue(any(a.stage == "solver-hardcoded" for a in rep.attempts))
+
+    def test_wrong_length_input_rejected_safely(self):
+        # Direct binary-level check: a truncated line must be rejected cleanly (exit 0,
+        # no crash) — the "check length first" contract, exercised on the real artifact.
+        from slothctf.execution import ResourceLimits
+        items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
+                 {"challenge_code": FC_CHALLENGE_GOOD, "success_marker": "Correct"},
+                 {"solver_code": FC_SOLVER_GOOD}]
+        with _run("ag_fc_shortlen", "elf", self._backend(), items,
+                  flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
+            self.assertTrue(rep.success)
+            r = self._backend().run_binary(cdir, "bin/challenge", __import__("slothctf.generator", fromlist=["get_target"]).get_target("elf"),
+                                           stdin_text="short\n")
+            self.assertTrue(r.ok and not r.timed_out)
+            self.assertIn("Denied", r.stdout)
+
+
 @unittest.skipUnless(_WIN_READY and _READY, _WIN_SKIP)
 class AgenticPeTests(unittest.TestCase):
     def test_full_valid_pe(self):
@@ -611,6 +871,55 @@ class AgenticPeTests(unittest.TestCase):
         with _run("ag_pe_ok", "pe", DockerWinCompatBackend(), items) as (rep, caller, cdir):
             self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
             self.assertTrue((cdir / "bin" / "challenge.exe").exists())
+
+    def test_full_valid_pe_forward_check_shared_transform(self):
+        from slothctf.execution import DockerWinCompatBackend
+        items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
+                 {"challenge_code": FC_CHALLENGE_GOOD, "success_marker": "Correct"},
+                 {"solver_code": FC_SOLVER_GOOD}]
+        with _run("ag_fc_pe_ok", "pe", DockerWinCompatBackend(), items,
+                  flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
+            self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
+            self.assertTrue((cdir / "bin" / "challenge.exe").exists())
+            st = ag.ProjectState.load(cdir / "agentic_state.json")
+            self.assertIn("s = (unsigned char)(s + in[i]", st.encoder.code)
+            self.assertIn("s = (unsigned char)(s + in[i]", st.challenge.code)
+
+
+@unittest.skipUnless(_READY, _SKIP)
+class ForwardCheckCollisionRiskTests(unittest.TestCase):
+    """Standalone (no agentic orchestrator, no LLM): documents a KNOWN, un-fixed risk of
+    Forward-Check — a non-injective transform lets the challenge accept a WRONG input
+    that happens to collide under F. This is not claimed to be solved; it is a recorded
+    limitation to weigh against the mode's benefit (no hand-written-inverse divergence)."""
+
+    def test_noninjective_transform_accepts_a_colliding_wrong_input(self):
+        from slothctf.execution import DockerLinuxBackend
+        import slothctf.generator as g
+        backend = DockerLinuxBackend()
+        tgt = g.get_target("elf")
+        noninjective = (  # case-folding loses information -> distinct ASCII inputs collide
+            "void slothctf_transform(const unsigned char *in, size_t n, unsigned char *out) {\n"
+            "    for (size_t i = 0; i < n; i++) {\n"
+            "        unsigned char c = in[i];\n"
+            "        out[i] = (c >= 'a' && c <= 'z') ? (unsigned char)(c - 32) : c;\n"
+            "    }\n"
+            "}\n")
+        real, colliding = "ABCD", "abcd"   # both fold to "ABCD" -> same encoded bytes; plain ASCII, no encoding pitfalls
+        body = ",".join(f"0x{ord(c):02x}" for c in real)
+        chal_src = FC_CHALLENGE_GOOD.replace("/*__TRANSFORM_FN__*/", noninjective) \
+                                    .replace("/*__ENCODED_ARRAY__*/", body)
+        with TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            (ws / "src").mkdir(); (ws / "bin").mkdir()
+            (ws / "src" / "challenge.c").write_text(chal_src, encoding="utf-8")
+            r = backend.compile_c(ws, "src/challenge.c", "bin/challenge", tgt)
+            self.assertTrue(r.ok, r.stderr)
+            good = backend.run_binary(ws, "bin/challenge", tgt, stdin_text=real + "\n")
+            bad = backend.run_binary(ws, "bin/challenge", tgt, stdin_text=colliding + "\n")
+        self.assertIn("Correct", good.stdout)
+        self.assertIn("Correct", bad.stdout, "documents the known risk: a non-injective F "
+                      "lets a colliding WRONG input pass — Forward-Check does not prove F is injective.")
 
 
 if __name__ == "__main__":
