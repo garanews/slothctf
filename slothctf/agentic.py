@@ -493,12 +493,45 @@ _FC_CHALLENGE_SKELETON = (
     "}\n")
 
 
+# Verified (4/7 Stage-D failures in the 15-run campaign were hand-rolled ELF/PE parsing
+# bugs: struct.error, "Could not determine .rodata boundaries", "Could not find encoded
+# flag start", a ZeroDivisionError from a failed key extraction). Reliable section/offset
+# lookup has no RE content — it is a solved, mechanical problem — so the solver is told it
+# can call the SAME standard binutils already used to produce the evidence above, on its
+# own argv[1], instead of re-deriving ELF/PE section tables from scratch in pure Python.
+# This is guidance only: no new tool, no new container, no change to the solver's contract
+# (still one self-contained script reading only argv[1]) — `objdump`/`strings` are already
+# on PATH in the exact sandbox the solver runs in (confirmed: objdump auto-detects BOTH ELF
+# and PE; `readelf` is ELF-only, so prefer objdump for target-agnostic behaviour).
+_SOLVER_TOOLING_HINT = (
+    "\nYou MAY call standard binutils yourself at runtime via subprocess, against "
+    "sys.argv[1] (the file you are actually given — do this EVERY run; never hardcode an "
+    "offset you saw once, since the binary may be rebuilt with a different flag later): "
+    "`objdump` and `strings` are on PATH and work on BOTH ELF and PE (objdump auto-detects "
+    "the format; `readelf` is ELF-only, so prefer objdump). This only helps you locate "
+    "bytes reliably — it does NOT find the flag or invert anything for you; that stays your "
+    "own analysis. Example: get each section's exact file offset/size from `objdump -h`, "
+    "then read those bytes directly from the file (no need to parse the harder -s/-d "
+    "output):\n"
+    "    out = subprocess.run(['objdump', '-h', path], capture_output=True, text=True).stdout\n"
+    "    for line in out.splitlines():\n"
+    "        m = re.match(r'^\\s*\\d+\\s+(\\S+)\\s+([0-9a-fA-F]+)\\s+[0-9a-fA-F]+\\s+"
+    "[0-9a-fA-F]+\\s+([0-9a-fA-F]+)', line)\n"
+    "        if m:\n"
+    "            name, size, fileoff = m.group(1), int(m.group(2), 16), int(m.group(3), 16)\n"
+    "            # name is e.g. .rodata/.data (ELF) or .rdata/.data (PE); read bytes with\n"
+    "            # open(path,'rb').seek(fileoff) + .read(size) — a plain file read, not a\n"
+    "            # hand-rolled ELF/PE header walk. A missing section just yields no match.\n"
+    "This runs instantly and shares your script's own time limit; no setup needed.\n")
+
+
 def _binary_evidence_block(state: ProjectState) -> str:
     ev = getattr(state, "binary_evidence", "") or ""
     if not ev:
         return ""
     return ("\n\nReverse-engineering EVIDENCE from the DISTRIBUTED binary (standard tools, static "
-            "analysis only — this is exactly what a player with a disassembler sees):\n" + ev + "\n")
+            "analysis only — this is exactly what a player with a disassembler sees):\n" + ev + "\n"
+            + _SOLVER_TOOLING_HINT)
 
 
 def _solver_prompt(state: ProjectState) -> str:

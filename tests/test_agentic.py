@@ -65,6 +65,39 @@ FC_SOLVER_GOOD = (
     "        s = (s + v + i) & 0xFF\n"
     "    if pat.match(bytes(dec)):\n"
     "        print(dec.decode()); break\n")
+# same inverse math as FC_SOLVER_GOOD, but LOCATES the bytes via the NEW Stage-D guidance
+# (objdump -h for section file-offset/size, then a plain file read) instead of brute-
+# forcing the whole binary — proves the guided technique works end-to-end through the
+# real hardened solver container, on ELF and PE, and (via Stage E's flag-swap, which
+# reruns this unmodified script against a REBUILT binary) on a recompiled binary too,
+# since nothing here is hardcoded — every run re-derives offsets from sys.argv[1].
+FC_SOLVER_OBJDUMP = (
+    "import sys, re, subprocess\n"
+    "path = sys.argv[1]\n"
+    "out = subprocess.run(['objdump', '-h', path], capture_output=True, text=True, timeout=10).stdout\n"
+    "sections = []\n"
+    "for line in out.splitlines():\n"
+    "    m = re.match(r'^\\s*\\d+\\s+(\\S+)\\s+([0-9a-fA-F]+)\\s+[0-9a-fA-F]+\\s+[0-9a-fA-F]+\\s+([0-9a-fA-F]+)', line)\n"
+    "    if m:\n"
+    "        name, size, fileoff = m.group(1), int(m.group(2), 16), int(m.group(3), 16)\n"
+    "        if name.lower() in ('.rodata', '.data', '.rdata') and size > 0:\n"
+    "            sections.append((fileoff, size))\n"
+    "with open(path, 'rb') as f:\n"
+    "    raw = f.read()\n"
+    "L = 19\n"
+    "pat = re.compile(rb'^sloth\\{[ -~]{1,40}\\}$')\n"
+    "for fileoff, size in sections:\n"
+    "    chunk = raw[fileoff:fileoff+size]\n"
+    "    for start in range(max(0, len(chunk) - L + 1)):\n"
+    "        enc = chunk[start:start+L]\n"
+    "        s = 0x5a\n"
+    "        dec = bytearray(L)\n"
+    "        for i in range(L):\n"
+    "            v = enc[i] ^ s\n"
+    "            dec[i] = v\n"
+    "            s = (s + v + i) & 0xFF\n"
+    "        if pat.match(bytes(dec)):\n"
+    "            print(dec.decode()); sys.exit(0)\n")
 FC_ENCODER_BROKEN = "#include <stdio.h>\n/*__TRANSFORM_FN__*/\nint main(){ not valid c ; }\n"
 # a fully self-contained, independently COMPILABLE encoder that defines slothctf_transform
 # inline, with NO placeholder at all — must still be REJECTED by the contract check
@@ -423,6 +456,10 @@ class StateMachineTests(unittest.TestCase):
         sol_rep = ag._repair_prompt("solver", st, "your solver did not recover the correct flag")
         self.assertIn("EVIDENCE_PUBLIC_MARKER", sol)
         self.assertIn("EVIDENCE_PUBLIC_MARKER", sol_rep)
+        # the binutils-tooling guidance (objdump/subprocess hint) rides along the same
+        # evidence block and must be secret-free too
+        self.assertIn("objdump", sol)
+        self.assertIn("objdump", sol_rep)
         # ...but the solver generate + repair prompts must contain NONE of the private markers
         for s in secrets:
             self.assertNotIn(s, sol, f"solver generate prompt leaked {s!r}")
@@ -871,6 +908,20 @@ class AgenticForwardCheckElfTests(unittest.TestCase):
             self.assertFalse(rep.success)
             self.assertTrue(any(a.stage == "solver-hardcoded" for a in rep.attempts))
 
+    def test_objdump_guided_solver_passes_including_flag_swap_on_rebuilt_binary(self):
+        # End-to-end proof of the new Stage-D guidance: a solver that locates bytes via
+        # `objdump -h` + a plain file read (not brute-forcing the whole binary) must pass
+        # all the way through Stage E — which reruns this UNCHANGED script against a
+        # REBUILT binary with a different flag (flag-swap). Nothing here is hardcoded, so
+        # passing both runs proves it works on the original AND a recompiled binary.
+        # This demonstrates the MECHANISM only — not a claim that Qwen writes this.
+        items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
+                 {"solver_code": FC_SOLVER_OBJDUMP}]
+        with _run("ag_fc_objdump_solver", "elf", self._backend(), items,
+                  flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
+            self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
+            self.assertEqual(rep.attempts[-1].stage, "passed")
+
     def test_wrong_length_input_rejected_safely(self):
         # Direct binary-level check on the harness-synthesized challenge: short, empty,
         # too-long, no-trailing-newline, and embedded-NUL inputs must all be rejected
@@ -935,6 +986,18 @@ class AgenticPeTests(unittest.TestCase):
                 self.assertIn("WRONG_INPUT", r.stdout, label)
             good = be.run_binary(cdir, "bin/challenge.exe", tgt, stdin_text=FC_FLAG + "\n")
             self.assertIn(ag.FC_SUCCESS_MARKER, good.stdout)
+
+    def test_objdump_guided_solver_passes_pe_including_flag_swap_on_rebuilt_binary(self):
+        # Same end-to-end proof as ELF, on PE. The solver itself always runs in the LINUX
+        # sandbox (per solver_backend resolution) and calls plain `objdump` (no mingw
+        # prefix) — confirming it reads the PE file correctly from there too.
+        from slothctf.execution import DockerWinCompatBackend
+        items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
+                 {"solver_code": FC_SOLVER_OBJDUMP}]
+        with _run("ag_fc_objdump_solver_pe", "pe", DockerWinCompatBackend(), items,
+                  flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
+            self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
+            self.assertEqual(rep.attempts[-1].stage, "passed")
 
 
 @unittest.skipUnless(_READY, _SKIP)
