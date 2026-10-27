@@ -46,21 +46,8 @@ FC_ENCODER_GOOD = (
     "    for (size_t i = 0; i < n; i++) { printf(\"0x%02x\", out[i]); if (i+1<n) printf(\",\"); }\n"
     "    return 0;\n"
     "}\n")
-FC_CHALLENGE_GOOD = (
-    "#include <stdio.h>\n#include <string.h>\n#include <stddef.h>\n"
-    "/*__TRANSFORM_FN__*/\n"
-    "static const unsigned char data[] = { /*__ENCODED_ARRAY__*/ };\n"
-    "int main(void) {\n"
-    "    char b[256];\n"
-    "    if (!fgets(b, sizeof b, stdin)) { printf(\"Denied\\n\"); return 0; }\n"
-    "    size_t n = strlen(b);\n"
-    "    if (n && b[n-1]=='\\n') b[--n] = 0;\n"
-    "    if (n != sizeof(data)) { printf(\"Denied\\n\"); return 0; }\n"
-    "    unsigned char computed[256];\n"
-    "    slothctf_transform((const unsigned char *)b, n, computed);\n"
-    "    if (memcmp(computed, data, n) != 0) { printf(\"Denied\\n\"); return 0; }\n"
-    "    printf(\"Correct\\n\"); return 0;\n"
-    "}\n")
+# Note: the challenge is no longer an LLM-authored fixture — in forward_check mode it is
+# always ag._FC_CHALLENGE_SKELETON (harness-synthesized; see tests below that use it directly).
 # independent solver: brute-forces the offset of a 19-byte window and inverts the SAME
 # stateful recurrence purely from the binary's raw bytes (no encoder/challenge access).
 FC_SOLVER_GOOD = (
@@ -567,6 +554,42 @@ class StateMachineTests(unittest.TestCase):
         # only a real apply_fix-style commit (here simulated) should change it:
         # (apply_fix itself refuses when repairs >= budget — covered by the Docker test below)
 
+    def test_route_responsible_sends_challenge_failures_to_encoder_in_forward_check(self):
+        st_fc = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}", mode="forward_check")
+        st_inv = ag.ProjectState(name="y", target="elf", difficulty="easy", flag="sloth{a}")  # inverse (default)
+        # Stage C is harness-synthesized under forward_check: only F (encoder) can be fixed.
+        self.assertEqual(ag._route_responsible("recover-rejects-correct", "challenge", st_fc), "encoder")
+        self.assertEqual(ag._route_responsible("challenge-crash", "challenge", st_fc), "encoder")
+        self.assertEqual(ag._route_responsible("fc-contract-challenge", "challenge", st_fc), "encoder")
+        # encoder/solver failures are unaffected by the reroute
+        self.assertEqual(ag._route_responsible("encoder-compile", "encoder", st_fc), "encoder")
+        self.assertEqual(ag._route_responsible("solver-mismatch", "solver", st_fc), "solver")
+        # inverse mode (default, unchanged): challenge failures stay on "challenge"
+        self.assertEqual(ag._route_responsible("recover-rejects-correct", "challenge", st_inv), "challenge")
+
+    def test_challenge_skeleton_resync_uses_current_transform_not_stale(self):
+        # The exact property run_gate() relies on: re-resolving the FIXED skeleton always
+        # reflects state.transform_code AS IT IS NOW, so an accepted encoder repair (which
+        # changes F) can never leave the challenge embedding a stale, pre-repair F.
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}", mode="forward_check")
+        st.transform_code = "OLD_FN_BODY"
+        stale, err, _ = ag._resolve_fc("challenge", st, ag._FC_CHALLENGE_SKELETON, {})
+        self.assertIsNone(err)
+        self.assertIn("OLD_FN_BODY", stale)
+        st.transform_code = "NEW_FN_BODY"   # simulates an accepted encoder repair changing F
+        fresh, err2, _ = ag._resolve_fc("challenge", st, ag._FC_CHALLENGE_SKELETON, {})
+        self.assertIsNone(err2)
+        self.assertIn("NEW_FN_BODY", fresh)
+        self.assertNotIn("OLD_FN_BODY", fresh)
+
+    def test_gate_challenge_hint_is_mode_aware(self):
+        # The leftover "invert the encoder transform byte-for-byte" hint must not appear
+        # for forward_check (there is no inverse to write there).
+        import inspect
+        src = inspect.getsource(ag._gate_challenge)
+        self.assertIn("forward_check", src)
+        self.assertIn("there is no inverse to write", src)
+
     def test_transform_only_change_is_progress_not_no_progress(self):
         # a repair that changes ONLY transform_code (same encoder_code wrapper text) must
         # still be recognised as a real change on the RESOLVED (post-splice) text.
@@ -778,36 +801,40 @@ class AgenticElfTests(unittest.TestCase):
 @unittest.skipUnless(_READY, _SKIP)
 class AgenticForwardCheckElfTests(unittest.TestCase):
     """Forward-Check mode: ONE shared transform (stateful, inter-byte dependency) is
-    spliced verbatim into encoder AND challenge — no hand-written inverse. Old 'inverse'
-    mode (AgenticElfTests above) is untouched and used as the reference."""
+    spliced verbatim into encoder AND the harness-synthesized challenge — no hand-written
+    inverse, and (since the 15-run campaign showed the model's own I/O boilerplate was the
+    actual bug) no hand-written length/exit-code glue either. Old 'inverse' mode
+    (AgenticElfTests above) is untouched and used as the reference. Stage C now never asks
+    the LLM anything, so these Replay lists have NO challenge-stage item."""
 
     def _backend(self):
         from slothctf.execution import DockerLinuxBackend
         return DockerLinuxBackend()
 
-    def test_full_valid_elf_shared_transform(self):
+    def test_full_valid_elf_shared_transform_harness_synthesized_challenge(self):
         items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
-                 {"challenge_code": FC_CHALLENGE_GOOD, "success_marker": "Correct"},
                  {"solver_code": FC_SOLVER_GOOD}]
         with _run("ag_fc_elf_ok", "elf", self._backend(), items,
                   flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
             self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
             self.assertTrue((cdir / "bin" / "challenge").exists())
+            st = ag.ProjectState.load(cdir / "agentic_state.json")
+            self.assertEqual(st.success_marker, ag.FC_SUCCESS_MARKER)
             # the SAME literal transform (incl. the stateful recurrence line) is baked into
             # BOTH built sources — proof of single shared source, not two divergent ones.
-            st = ag.ProjectState.load(cdir / "agentic_state.json")
             needle = "s = (unsigned char)(s + in[i]"
             self.assertIn(needle, st.encoder.code)
             self.assertIn(needle, st.challenge.code)
             self.assertNotIn(ag.TRANSFORM_PLACEHOLDER, st.encoder.code)
             self.assertNotIn(ag.TRANSFORM_PLACEHOLDER, st.challenge.code)
+            # Stage C never asked the LLM anything: exactly 3 calls (design, encoder, solver)
+            self.assertEqual(len(caller.calls), 3, caller.calls)
 
     def test_broken_encoder_still_fixed_by_ordinary_compile_error_path(self):
         # Non-contract compile errors (e.g. a syntax error) still go through the ordinary
         # encoder-compile repair path, unaffected by the new contract pre-check.
         items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_BROKEN},
                  {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
-                 {"challenge_code": FC_CHALLENGE_GOOD, "success_marker": "Correct"},
                  {"solver_code": FC_SOLVER_GOOD}]
         with _run("ag_fc_fix", "elf", self._backend(), items,
                   flag=FC_FLAG, mode="forward_check") as (rep, caller, _):
@@ -821,7 +848,6 @@ class AgenticForwardCheckElfTests(unittest.TestCase):
         items = [{"design": "d"},
                  {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_AUTONOMOUS},  # contract violation
                  {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},        # correct repair
-                 {"challenge_code": FC_CHALLENGE_GOOD, "success_marker": "Correct"},
                  {"solver_code": FC_SOLVER_GOOD}]
         with _run("ag_fc_autonomous", "elf", self._backend(), items,
                   flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
@@ -838,8 +864,7 @@ class AgenticForwardCheckElfTests(unittest.TestCase):
         # Stage D/E are untouched by Forward-Check: the anti-hardcode swap still fires.
         hc = f"print({FC_FLAG!r})\n"
         items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
-                 {"challenge_code": FC_CHALLENGE_GOOD, "success_marker": "Correct"}, {"solver_code": hc},
-                 {"solver_code": hc}, {"solver_code": hc}]
+                 {"solver_code": hc}, {"solver_code": hc}, {"solver_code": hc}]
         with _run("ag_fc_hardcode", "elf", self._backend(), items,
                   budget=ag.Budget(max_repairs_per_stage=1), flag=FC_FLAG,
                   mode="forward_check") as (rep, caller, _):
@@ -847,19 +872,30 @@ class AgenticForwardCheckElfTests(unittest.TestCase):
             self.assertTrue(any(a.stage == "solver-hardcoded" for a in rep.attempts))
 
     def test_wrong_length_input_rejected_safely(self):
-        # Direct binary-level check: a truncated line must be rejected cleanly (exit 0,
-        # no crash) — the "check length first" contract, exercised on the real artifact.
-        from slothctf.execution import ResourceLimits
+        # Direct binary-level check on the harness-synthesized challenge: short, empty,
+        # too-long and no-trailing-newline inputs must all be rejected cleanly (exit 0, no
+        # crash) — exactly the class of bug the 15-run campaign found in model-written I/O.
+        import slothctf.generator as gmod
         items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
-                 {"challenge_code": FC_CHALLENGE_GOOD, "success_marker": "Correct"},
                  {"solver_code": FC_SOLVER_GOOD}]
         with _run("ag_fc_shortlen", "elf", self._backend(), items,
                   flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
-            self.assertTrue(rep.success)
-            r = self._backend().run_binary(cdir, "bin/challenge", __import__("slothctf.generator", fromlist=["get_target"]).get_target("elf"),
-                                           stdin_text="short\n")
-            self.assertTrue(r.ok and not r.timed_out)
-            self.assertIn("Denied", r.stdout)
+            self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
+            tgt = gmod.get_target("elf")
+            be = self._backend()
+            for label, stdin in [("short", "short\n"), ("empty", "\n"),
+                                 ("too-long", "definitely_wrong_" + FC_FLAG + "\n"),
+                                 ("no-newline-exact-len", FC_FLAG)]:
+                r = be.run_binary(cdir, "bin/challenge", tgt, stdin_text=stdin)
+                self.assertTrue(r.ok and not r.timed_out, f"{label}: crashed/timed out: {r.stderr}")
+                self.assertEqual(r.exit_code, 0, f"{label}: must exit 0")
+                if label == "no-newline-exact-len":
+                    self.assertIn(ag.FC_SUCCESS_MARKER, r.stdout, label)
+                else:
+                    self.assertIn("WRONG_INPUT", r.stdout, label)
+            # the correct flag (with newline) must still succeed
+            good = be.run_binary(cdir, "bin/challenge", tgt, stdin_text=FC_FLAG + "\n")
+            self.assertIn(ag.FC_SUCCESS_MARKER, good.stdout)
 
 
 @unittest.skipUnless(_WIN_READY and _READY, _WIN_SKIP)
@@ -875,7 +911,6 @@ class AgenticPeTests(unittest.TestCase):
     def test_full_valid_pe_forward_check_shared_transform(self):
         from slothctf.execution import DockerWinCompatBackend
         items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
-                 {"challenge_code": FC_CHALLENGE_GOOD, "success_marker": "Correct"},
                  {"solver_code": FC_SOLVER_GOOD}]
         with _run("ag_fc_pe_ok", "pe", DockerWinCompatBackend(), items,
                   flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
@@ -907,8 +942,9 @@ class ForwardCheckCollisionRiskTests(unittest.TestCase):
             "}\n")
         real, colliding = "ABCD", "abcd"   # both fold to "ABCD" -> same encoded bytes; plain ASCII, no encoding pitfalls
         body = ",".join(f"0x{ord(c):02x}" for c in real)
-        chal_src = FC_CHALLENGE_GOOD.replace("/*__TRANSFORM_FN__*/", noninjective) \
-                                    .replace("/*__ENCODED_ARRAY__*/", body)
+        # use the REAL, shipped skeleton (not a test-only fixture) — the fix under test
+        chal_src = ag._FC_CHALLENGE_SKELETON.replace(ag.TRANSFORM_PLACEHOLDER, noninjective) \
+                                            .replace(g.ENCODED_PLACEHOLDER, body)
         with TemporaryDirectory() as tmp:
             ws = Path(tmp)
             (ws / "src").mkdir(); (ws / "bin").mkdir()
@@ -917,8 +953,8 @@ class ForwardCheckCollisionRiskTests(unittest.TestCase):
             self.assertTrue(r.ok, r.stderr)
             good = backend.run_binary(ws, "bin/challenge", tgt, stdin_text=real + "\n")
             bad = backend.run_binary(ws, "bin/challenge", tgt, stdin_text=colliding + "\n")
-        self.assertIn("Correct", good.stdout)
-        self.assertIn("Correct", bad.stdout, "documents the known risk: a non-injective F "
+        self.assertIn(ag.FC_SUCCESS_MARKER, good.stdout)
+        self.assertIn(ag.FC_SUCCESS_MARKER, bad.stdout, "documents the known risk: a non-injective F "
                       "lets a colliding WRONG input pass — Forward-Check does not prove F is injective.")
 
 

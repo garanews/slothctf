@@ -448,25 +448,45 @@ def _encoder_prompt_fc(state: ProjectState) -> str:
         f'"encoder_code": "<C source containing {TRANSFORM_PLACEHOLDER}>"}}.')
 
 
-def _challenge_prompt_fc(state: ProjectState) -> str:
-    return (
-        f"Your design:\n{state.design}\n\n"
-        "FORWARD-CHECK mode: do NOT write an inverse. Your VERIFIED transform (used verbatim, "
-        f"unchanged, in both the encoder and this challenge):\n{state.transform_code}\n\n"
-        f"The encoder output bytes will be substituted at the token {g.ENCODED_PLACEHOLDER}. Write "
-        "challenge_code: a COMPLETE C program given to the player, containing BOTH literal tokens "
-        f"near the TOP of the file (before main): {TRANSFORM_PLACEHOLDER} (the harness inserts the "
-        "SAME verified transform there verbatim — call it exactly as slothctf_transform) and a "
-        f"file-scope `static const unsigned char NAME[] = {{ {g.ENCODED_PLACEHOLDER} }};` array, "
-        "actually used. Derive the byte count from sizeof(NAME); never hardcode a length. main(): "
-        "read one line from stdin, strip the newline, FIRST check the input length equals "
-        "sizeof(NAME) (reject safely otherwise — no buffer overrun), ONLY THEN call "
-        "slothctf_transform(input, sizeof(NAME), computed) into a same-size buffer, and compare "
-        "computed to NAME with memcmp. Print EXACTLY the success marker iff they match, otherwise a "
-        "different message; never print the flag, keep no plaintext flag literal. Use only headers "
-        f"available on {_platform_line(state)}. Do NOT reimplement, invert or modify the transform — "
-        "call the given function exactly as provided; fix only your own I/O/length/comparison logic. "
-        'Return ONE JSON object: {"challenge_code": "<C source>", "success_marker": "<exact text>"}.')
+# Forward-check Stage C is NOT LLM-authored: the 15-run campaign showed 7/7 challenge
+# failures were the SAME structural bug class — the model's own hand-written fgets/
+# strlen/sizeof(NAME) buffer arithmetic around calling the shared F (off-by-one buffer
+# sizes, a bogus "exclude the null terminator" subtraction, even a genuine 1-byte stack
+# overflow from `fgets(buf, sizeof(buf)+1, ...)`), NOT a transform/inverse problem (zero
+# fc-contract or F-divergence failures occurred). This boilerplate has NO algorithmic
+# content — reading a line, checking its length against a known array size, calling F,
+# comparing, printing a fixed marker — so it is generated deterministically, exactly
+# once, correctness-reviewed here instead of re-derived (and re-broken) by the model on
+# every run. F itself remains 100% LLM-invented; only this I/O glue is fixed.
+FC_SUCCESS_MARKER = "FLAG_RECOVERED"
+_FC_CHALLENGE_SKELETON = (
+    "#include <stdio.h>\n#include <string.h>\n#include <stddef.h>\n\n"
+    f"{TRANSFORM_PLACEHOLDER}\n\n"
+    f"static const unsigned char SLOTHCTF_ENCODED[] = {{ {g.ENCODED_PLACEHOLDER} }};\n"
+    "#define SLOTHCTF_FLAG_LEN (sizeof(SLOTHCTF_ENCODED))\n\n"
+    "int main(void) {\n"
+    "    char buf[SLOTHCTF_FLAG_LEN + 2];   /* +1 slack, +1 for fgets' NUL terminator */\n"
+    "    if (fgets(buf, sizeof(buf), stdin) == NULL) {\n"
+    "        printf(\"WRONG_INPUT\\n\");\n"
+    "        return 0;\n"
+    "    }\n"
+    "    size_t n = strlen(buf);\n"
+    "    if (n > 0 && buf[n - 1] == '\\n') {\n"
+    "        buf[--n] = '\\0';\n"
+    "    }\n"
+    "    if (n != SLOTHCTF_FLAG_LEN) {\n"
+    "        printf(\"WRONG_INPUT\\n\");\n"
+    "        return 0;\n"
+    "    }\n"
+    "    unsigned char computed[SLOTHCTF_FLAG_LEN];\n"
+    "    slothctf_transform((const unsigned char *)buf, SLOTHCTF_FLAG_LEN, computed);\n"
+    "    if (memcmp(computed, SLOTHCTF_ENCODED, SLOTHCTF_FLAG_LEN) == 0) {\n"
+    f"        printf(\"{FC_SUCCESS_MARKER}\\n\");\n"
+    "    } else {\n"
+    "        printf(\"WRONG_INPUT\\n\");\n"
+    "    }\n"
+    "    return 0;\n"
+    "}\n")
 
 
 def _binary_evidence_block(state: ProjectState) -> str:
@@ -533,28 +553,20 @@ def _repair_prompt(which: str, state: ProjectState, err: str) -> str:
                 f"the literal token {TRANSFORM_PLACEHOLDER} near the top of encoder_code (exactly "
                 f"once), and keep the signature {TRANSFORM_FN_SIG}. "
                 'Return ONE JSON object: {"transform_code": "<C function source>", "encoder_code": "<C source>"}.')
-    code_for_prompt = (_display_code_fc(which, state)
-                      if which == "challenge" and state.mode == "forward_check"
-                      else state.comp(which).code)
-    base = _REPAIR_PROMPTS[which].format(err=err[:1500], code=code_for_prompt)
+    # NOTE: "challenge" repairs under forward_check never happen — Stage C is harness-
+    # synthesized there (see _FC_CHALLENGE_SKELETON) and failures route to "encoder"
+    # instead (only F can be at fault); see _route_responsible.
+    base = _REPAIR_PROMPTS[which].format(err=err[:1500], code=state.comp(which).code)
     if which == "challenge":
-        if state.mode == "forward_check":
-            base += ("\n\nFORWARD-CHECK mode: do NOT write an inverse. The code above already has "
-                     f"the marker {TRANSFORM_PLACEHOLDER} where the verified transform is spliced in "
-                     "(exactly once) — keep that single marker in your reply exactly as shown; do NOT "
-                     "inline, duplicate, remove or rewrite the transform. Fix only your own length "
-                     "check, buffer sizes, marker text or exit-code contract.\n"
-                     f"Your design:\n{state.design}\n")
-        else:
-            # Stage C repairs are organizer-side: the verified encoder + design are provided so the
-            # challenge can be made mathematically consistent with the encoder transform.
-            base += ("\n\nThe VERIFIED encoder whose transform you MUST invert exactly (derive the length "
-                     f"from the embedded array, never a fixed constant):\n{state.encoder.code}\n"
-                     f"Your design:\n{state.design}\n"
-                     "First determine the SINGLE concrete cause of the divergence — compare your decode "
-                     "length, indices, casts, order and mod-256 arithmetic against the encoder and the "
-                     "reported error — then return challenge_code that changes exactly that. Add no "
-                     "operation the encoder does not perform.")
+        # Stage C repairs are organizer-side: the verified encoder + design are provided so the
+        # challenge can be made mathematically consistent with the encoder transform.
+        base += ("\n\nThe VERIFIED encoder whose transform you MUST invert exactly (derive the length "
+                 f"from the embedded array, never a fixed constant):\n{state.encoder.code}\n"
+                 f"Your design:\n{state.design}\n"
+                 "First determine the SINGLE concrete cause of the divergence — compare your decode "
+                 "length, indices, casts, order and mod-256 arithmetic against the encoder and the "
+                 "reported error — then return challenge_code that changes exactly that. Add no "
+                 "operation the encoder does not perform.")
     elif which == "solver":
         # solver repairs stay player-only: the binary RE evidence is public, but NEVER the
         # encoder, challenge source, design or flag.
@@ -663,11 +675,17 @@ def _gate_challenge(state, base_dir, backend, tgt, solver_backend) -> tuple[bool
         # the repair has something to act on besides "the correct flag was rejected".
         want_len = state.encoder.artifacts.get("want_len")
         first = ((good.stdout or "").strip().splitlines() or [""])[0][:48]
+        # mode-aware: forward_check never asks for an inverse (there is none); a mismatch there
+        # means F itself behaved differently than when the encoder ran it, not a derivation bug.
+        hint = ("Your transform_code must be a PURE function of (in, n) with no state carried "
+                "between calls — if it produced different output here than when the encoder ran "
+                "it, that is the bug (fix transform_code; there is no inverse to write)."
+               ) if state.mode == "forward_check" else (
+                "Derive the number of bytes from the embedded array itself (e.g. sizeof), never a "
+                "fixed constant, and invert the encoder transform byte-for-byte.")
         diag = (f" | diagnostic from feeding the correct flag: the flag is {len(state.flag)} bytes and the "
                 f"embedded array has {want_len} bytes (one encoded byte per flag byte); the program printed "
-                f"{first!r} instead of the marker {marker!r}. Derive the number of bytes from the embedded "
-                f"array itself (e.g. sizeof), never a fixed constant, and invert the encoder transform "
-                f"byte-for-byte.")
+                f"{first!r} instead of the marker {marker!r}. {hint}")
         return False, prob[0], prob[1] + diag
     # contiguity stays a non-fatal diagnostic (P1)
     want = g._tokens_to_bytes(body)
@@ -805,6 +823,18 @@ _RESPONSIBLE = {
 }
 
 
+def _route_responsible(stage_name: str, which: str, state) -> str:
+    """Resolve the component responsible for a failure. In forward_check mode, Stage C
+    is harness-synthesized (see _FC_CHALLENGE_SKELETON) — the model never authors
+    challenge_code there, so it can never be the fix target. Any challenge-stage
+    failure routes to "encoder" instead: F is the only LLM-controlled input baked into
+    the deterministic challenge, so a repair there is the only one that can be acted on."""
+    resp = _RESPONSIBLE.get(stage_name, which)
+    if state.mode == "forward_check" and resp == "challenge":
+        return "encoder"
+    return resp
+
+
 def _record_call(state, budget, report, stage, kind, prompt, payload, toks, wall_s, outcome):
     resp = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else str(payload)
     state.log({"type": "llm", "stage": stage, "kind": kind,
@@ -905,6 +935,18 @@ def generate_recover_agentic(
         return True
 
     def run_gate(which: str):
+        if which == "challenge" and state.mode == "forward_check":
+            # Harness-synthesized every time this stage is (re)visited, so it always
+            # embeds the CURRENT state.transform_code — never stale after an F repair.
+            resolved, fc_err, _ = _resolve_fc("challenge", state, _FC_CHALLENGE_SKELETON, {})
+            if fc_err is not None:   # defensive: the fixed skeleton should never violate the contract
+                state.log({"type": "gate", "component": "challenge", "stage": "fc-contract-challenge",
+                           "ok": False, "detail": fc_err[:600]})
+                return False, "fc-contract-challenge", fc_err
+            if _normalize(resolved) != _normalize(state.challenge.code):
+                state.set_code("challenge", resolved)
+            state.success_marker = FC_SUCCESS_MARKER
+            state.save()
         ok, sn, det = _guard_verifier(_GATES[which], state, base_dir, backend, tgt, solver_backend)
         state.log({"type": "gate", "component": which, "stage": sn, "ok": ok, "detail": det[:600]})
         return ok, sn, det
@@ -982,11 +1024,13 @@ def generate_recover_agentic(
             if which == "solver":   # independent solver sees public binary evidence, not sources
                 _ensure_binary_evidence(state, base_dir, backend, tgt)
             fc_gen_err: Optional[str] = None   # set below if the FIRST reply violates the contract
-            if not comp.code:  # first time we need this component
+            fc = state.mode == "forward_check"
+            if which == "challenge" and fc:
+                pass   # no LLM call: run_gate() deterministically (re)synthesizes it from F
+            elif not comp.code:  # first time we need this component
                 key = f"{which}_code"
-                fc = state.mode == "forward_check"
                 gen_prompt = ({"encoder": _encoder_prompt_fc if fc else _encoder_prompt,
-                              "challenge": _challenge_prompt_fc if fc else _challenge_prompt,
+                              "challenge": _challenge_prompt,   # only reached in 'inverse' mode
                               "solver": _solver_prompt}[which])(state)
                 payload = _ask(caller, model, budget, state, report, which, "generate", gen_prompt)
                 resolved, fc_gen_err, cand_tc = _resolve_fc(which, state, str(payload.get(key, "")), payload)
@@ -1013,7 +1057,7 @@ def generate_recover_agentic(
                 continue
             # failed -> repair. Every stage maps to a responsible component; the solver's
             # repair prompt + feedback are walled (player-only), so no private info leaks to it.
-            responsible = _RESPONSIBLE.get(stage_name, which)
+            responsible = _route_responsible(stage_name, which, state)
             got = fetch_fix(responsible, detail)
             if got is None:
                 state.save()
@@ -1042,7 +1086,7 @@ def generate_recover_agentic(
                 report.attempts.append(g.AttemptResult(0, False, "max-repairs", f"final: {e.stage}"))
                 break
             e_repairs += 1
-            responsible = _RESPONSIBLE.get(e.stage, "challenge")
+            responsible = _route_responsible(e.stage, "challenge", state)
             # Stage E's authoritative detail may reveal the flag on a solver failure; when the
             # solver is the culprit, hand it only WALLED public feedback (never e.detail directly).
             fb = _solver_feedback(e.stage, "", e.detail or "", state.flag) if responsible == "solver" else e.detail
@@ -1067,7 +1111,7 @@ def generate_recover_agentic(
                     state.save()
                 else:
                     # fold back into the same repair machinery via a fresh fix
-                    resp = _RESPONSIBLE.get(sn, which)
+                    resp = _route_responsible(sn, which, state)
                     got = fetch_fix(resp, det)
                     if got is None:
                         state.save()
