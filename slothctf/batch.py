@@ -121,6 +121,7 @@ def fingerprint(config: dict, commit: str, digest: str | None) -> str:
         "prompt": config.get("prompt", ""), "inference": config.get("inference", {}),
         "budget": config.get("budget", {}), "matrix": config["matrix"],
         "repeats": config["repeats"], "isolation": config.get("isolation", "isolated"),
+        "agentic_mode": config.get("agentic_mode", "inverse"),
     }
     return hashlib.sha256(_canonical(exp).encode("utf-8")).hexdigest()
 
@@ -299,7 +300,8 @@ def _generate(spec: dict, name: str, config: dict, caller, url: str):
                         max_wall_seconds=b.get("max_wall_seconds", 1800))
         return generate_recover_agentic(name, prompt=config.get("prompt", ""), difficulty=spec["difficulty"],
                                         target=spec["target"], backend=backend, model=config["model"],
-                                        ollama_url=url, caller=caller, budget=budget, resume=False)
+                                        ollama_url=url, caller=caller, budget=budget, resume=False,
+                                        mode=config.get("agentic_mode", "inverse"))
     # monolithic: its own transport, but at the CONFIGURED endpoint (was defaulting before)
     return g.generate_challenge(name, prompt=config.get("prompt", g.DEFAULT_PROMPT), difficulty=spec["difficulty"],
                                 model=config["model"], ollama_url=url, genre=spec["genre"], target=spec["target"],

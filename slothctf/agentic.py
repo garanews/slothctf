@@ -18,6 +18,14 @@ Stages:  A design → B encoder → C challenge → D solver → E final verific
 Repairs are produced by the LLM; the harness only verifies. Failures route to the
 responsible component (the model diagnoses ambiguous ones); changing a component
 invalidates everything downstream (via a content signature) and re-runs its gates.
+
+Two Stage-B/C modes (ProjectState.mode, default "inverse" — unchanged behaviour):
+  "inverse"       — the model writes the challenge's inverse by hand (original).
+  "forward_check" — EXPERIMENTAL. The model writes ONE transform function F (any buffer-
+                     wide, stateful, composed algorithm); the harness splices that SAME
+                     verified C source into both the encoder and the challenge (which
+                     re-applies F to the input and compares), so no hand-written inverse
+                     is needed. Stage D/E are identical in both modes.
 """
 from __future__ import annotations
 
@@ -159,6 +167,8 @@ class ProjectState:
     prompt: str = ""
     success_marker: str = ""
     design: str = ""
+    mode: str = "inverse"       # "inverse" (default, unchanged) | "forward_check" (experimental)
+    transform_code: str = ""   # forward_check: the ONE shared F implementation (encoder+challenge)
     encoder: Component = field(default_factory=Component)
     challenge: Component = field(default_factory=Component)
     solver: Component = field(default_factory=Component)
@@ -210,6 +220,7 @@ class ProjectState:
             "name": self.name, "target": self.target, "difficulty": self.difficulty,
             "flag": self.flag, "model": self.model, "prompt": self.prompt,
             "success_marker": self.success_marker, "design": self.design,
+            "mode": self.mode, "transform_code": self.transform_code,
             "encoder": cd(self.encoder), "challenge": cd(self.challenge),
             "solver": cd(self.solver), "transcript": self.transcript,
             "budget_calls": self.budget_calls, "budget_tokens": self.budget_tokens,
@@ -258,7 +269,8 @@ class ProjectState:
         st = cls(name=d["name"], target=d["target"], difficulty=d["difficulty"],
                  flag=d["flag"], model=d.get("model", DEFAULT_MODEL),
                  prompt=d.get("prompt", ""), success_marker=d.get("success_marker", ""),
-                 design=d.get("design", ""), encoder=mkc(d.get("encoder", {})),
+                 design=d.get("design", ""), mode=d.get("mode", "inverse"),
+                 transform_code=d.get("transform_code", ""), encoder=mkc(d.get("encoder", {})),
                  challenge=mkc(d.get("challenge", {})), solver=mkc(d.get("solver", {})),
                  transcript=d.get("transcript", []),
                  budget_calls=int(d.get("budget_calls", 0)),
@@ -403,6 +415,60 @@ def _challenge_prompt(state: ProjectState) -> str:
         'Return ONE JSON object: {"challenge_code": "<C source>", "success_marker": "<exact text>"}.')
 
 
+# --------------------------------------------------------------------------- #
+# Forward-Check mode (experimental): ONE shared transform F, reused verbatim by
+# encoder AND challenge — no hand-written inverse. Splice point is a plain C
+# comment token, same mechanism as g.ENCODED_PLACEHOLDER (text substitution, no
+# parsing). F may be stateful / buffer-wide (permutations, state machines,
+# inter-byte dependencies all remain allowed) — it just must be a pure, callable
+# function of (in, n).
+# --------------------------------------------------------------------------- #
+TRANSFORM_PLACEHOLDER = "/*__TRANSFORM_FN__*/"
+TRANSFORM_FN_SIG = "void slothctf_transform(const unsigned char *in, size_t n, unsigned char *out)"
+
+
+def _encoder_prompt_fc(state: ProjectState) -> str:
+    return (
+        f"Your design:\n{state.design}\n\n"
+        "FORWARD-CHECK mode: you never write an inverse. Your transform will be compiled "
+        "VERBATIM into both the organizer encoder and the player challenge; the challenge just "
+        "re-applies it and compares bytes. Write TWO fields:\n"
+        f"1. transform_code: a SELF-CONTAINED C function, exactly this signature:\n   {TRANSFORM_FN_SIG};\n"
+        "   It may use permutations, a running state, inter-byte dependencies or any composed "
+        "operation over the WHOLE buffer — not restricted to independent per-byte ops. It must be "
+        "a PURE function of (in, n): no I/O, no mutable state across calls, no randomness.\n"
+        f"2. encoder_code: a COMPLETE C program (organizer tool) containing the literal token "
+        f"{TRANSFORM_PLACEHOLDER} near the TOP of the file (right after your #includes, before any "
+        "other code, so the function is declared before main() calls it) — the harness inserts your "
+        "transform_code there verbatim. main() reads the flag from argv[1], calls "
+        "slothctf_transform(flag, strlen(flag), out), and prints out as comma-separated single-byte "
+        f"0xNN tokens and NOTHING else. Process the whole flag; no fixed length. Must compile on "
+        f"{_platform_line(state)}. "
+        'Return ONE JSON object: {"transform_code": "<C function source>", '
+        f'"encoder_code": "<C source containing {TRANSFORM_PLACEHOLDER}>"}}.')
+
+
+def _challenge_prompt_fc(state: ProjectState) -> str:
+    return (
+        f"Your design:\n{state.design}\n\n"
+        "FORWARD-CHECK mode: do NOT write an inverse. Your VERIFIED transform (used verbatim, "
+        f"unchanged, in both the encoder and this challenge):\n{state.transform_code}\n\n"
+        f"The encoder output bytes will be substituted at the token {g.ENCODED_PLACEHOLDER}. Write "
+        "challenge_code: a COMPLETE C program given to the player, containing BOTH literal tokens "
+        f"near the TOP of the file (before main): {TRANSFORM_PLACEHOLDER} (the harness inserts the "
+        "SAME verified transform there verbatim — call it exactly as slothctf_transform) and a "
+        f"file-scope `static const unsigned char NAME[] = {{ {g.ENCODED_PLACEHOLDER} }};` array, "
+        "actually used. Derive the byte count from sizeof(NAME); never hardcode a length. main(): "
+        "read one line from stdin, strip the newline, FIRST check the input length equals "
+        "sizeof(NAME) (reject safely otherwise — no buffer overrun), ONLY THEN call "
+        "slothctf_transform(input, sizeof(NAME), computed) into a same-size buffer, and compare "
+        "computed to NAME with memcmp. Print EXACTLY the success marker iff they match, otherwise a "
+        "different message; never print the flag, keep no plaintext flag literal. Use only headers "
+        f"available on {_platform_line(state)}. Do NOT reimplement, invert or modify the transform — "
+        "call the given function exactly as provided; fix only your own I/O/length/comparison logic. "
+        'Return ONE JSON object: {"challenge_code": "<C source>", "success_marker": "<exact text>"}.')
+
+
 def _binary_evidence_block(state: ProjectState) -> str:
     ev = getattr(state, "binary_evidence", "") or ""
     if not ev:
@@ -441,22 +507,59 @@ _REPAIR_PROMPTS = {
 
 
 def _repair_prompt(which: str, state: ProjectState, err: str) -> str:
+    if which == "encoder" and state.mode == "forward_check":
+        # Forward-check: always re-ask for BOTH fields (transform_code may need the fix, or
+        # just encoder_code's I/O glue) — a single shared-source repair, not two divergent ones.
+        return (f"Fix the transform/encoder. The harness reported:\n{err[:1500]}\n"
+                f"Current transform_code:\n{state.transform_code}\n"
+                f"Current encoder_code:\n{state.encoder.code}\n"
+                "FORWARD-CHECK mode: this transform_code is compiled VERBATIM into both the "
+                "encoder and the player challenge — fix whichever field caused the error. Keep "
+                f"the literal token {TRANSFORM_PLACEHOLDER} near the top of encoder_code, and keep "
+                f"the signature {TRANSFORM_FN_SIG}. "
+                'Return ONE JSON object: {"transform_code": "<C function source>", "encoder_code": "<C source>"}.')
     base = _REPAIR_PROMPTS[which].format(err=err[:1500], code=state.comp(which).code)
     if which == "challenge":
-        # Stage C repairs are organizer-side: the verified encoder + design are provided so the
-        # challenge can be made mathematically consistent with the encoder transform.
-        base += ("\n\nThe VERIFIED encoder whose transform you MUST invert exactly (derive the length "
-                 f"from the embedded array, never a fixed constant):\n{state.encoder.code}\n"
-                 f"Your design:\n{state.design}\n"
-                 "First determine the SINGLE concrete cause of the divergence — compare your decode "
-                 "length, indices, casts, order and mod-256 arithmetic against the encoder and the "
-                 "reported error — then return challenge_code that changes exactly that. Add no "
-                 "operation the encoder does not perform.")
+        if state.mode == "forward_check":
+            base += ("\n\nFORWARD-CHECK mode: do NOT write an inverse, and do NOT edit the "
+                     f"{TRANSFORM_PLACEHOLDER} marker or the slothctf_transform call — fix only your "
+                     "length check, buffer sizes, marker text or exit-code contract.\n"
+                     f"Your design:\n{state.design}\n")
+        else:
+            # Stage C repairs are organizer-side: the verified encoder + design are provided so the
+            # challenge can be made mathematically consistent with the encoder transform.
+            base += ("\n\nThe VERIFIED encoder whose transform you MUST invert exactly (derive the length "
+                     f"from the embedded array, never a fixed constant):\n{state.encoder.code}\n"
+                     f"Your design:\n{state.design}\n"
+                     "First determine the SINGLE concrete cause of the divergence — compare your decode "
+                     "length, indices, casts, order and mod-256 arithmetic against the encoder and the "
+                     "reported error — then return challenge_code that changes exactly that. Add no "
+                     "operation the encoder does not perform.")
     elif which == "solver":
         # solver repairs stay player-only: the binary RE evidence is public, but NEVER the
         # encoder, challenge source, design or flag.
         base += _binary_evidence_block(state)
     return base
+
+
+def _resolve_fc(which: str, state: ProjectState, raw_code: str, payload: dict) -> str:
+    """Forward-check mode only: splice the verified transform function into the model's
+    raw output IMMEDIATELY on receipt, so state.*.code always holds FINAL, Stage-E-compatible
+    C source — Stage E (unchanged) only ever knows about g.ENCODED_PLACEHOLDER, never about
+    the transform marker. No-op in 'inverse' mode. If the marker/transform is missing this
+    returns the code unchanged; the compiler then reports an ordinary undefined-reference /
+    missing-token error, handled by the existing compile-failure repair path — no special
+    'missing marker' stage is needed."""
+    if state.mode != "forward_check":
+        return raw_code
+    if which == "encoder":
+        tc = str(payload.get("transform_code", state.transform_code))
+        state.transform_code = tc
+        return raw_code.replace(TRANSFORM_PLACEHOLDER, tc) if tc else raw_code
+    if which == "challenge":
+        tc = state.transform_code
+        return raw_code.replace(TRANSFORM_PLACEHOLDER, tc) if tc else raw_code
+    return raw_code
 
 
 # --------------------------------------------------------------------------- #
@@ -697,6 +800,7 @@ def generate_recover_agentic(
     backend=None, solver_backend=None, caller: Optional[Callable] = None,
     model: str = DEFAULT_MODEL, ollama_url: str = g.DEFAULT_OLLAMA_URL,
     budget: Optional[Budget] = None, flag: Optional[str] = None, resume: bool = True,
+    mode: str = "inverse",
 ) -> g.GenerationReport:
     """Agentic test-driven generation of a `recover` challenge. Returns a
     GenerationReport; a challenge is successful ONLY if the unchanged Stage-E gate
@@ -704,7 +808,10 @@ def generate_recover_agentic(
     recorded under a classified category: 'budget-exhausted', 'infra' (Ollama/HTTP/
     connection/sandbox), 'model-invalid' (unusable model reply), or 'verifier-error'
     (an unexpected fault inside a check). `caller` is the LLM hook (tests inject
-    replay). Everything is logged to a local, never-published transcript."""
+    replay). Everything is logged to a local, never-published transcript.
+
+    `mode`: "inverse" (default; unchanged) or "forward_check" (experimental — see module
+    docstring). Only applies to a FRESH run; resuming an existing run keeps its saved mode."""
     base_dir = Path("generated") / name
     base_dir.mkdir(parents=True, exist_ok=True)
     tgt = g.get_target(target)
@@ -725,7 +832,7 @@ def generate_recover_agentic(
     else:
         state = ProjectState(name=name, target=tgt.name, difficulty=difficulty,
                              flag=flag or g._random_flag(), model=model, prompt=prompt,
-                             path=str(statepath))
+                             mode=mode, path=str(statepath))
     state.save()
 
     report = g.GenerationReport(name=name, model=model, directory=str(base_dir), success=False)
@@ -779,7 +886,7 @@ def generate_recover_agentic(
                 return None
             payload = _ask(caller, model, budget, state, report, responsible, "repair",
                            _repair_prompt(responsible, state, detail + escalate.get(responsible, "")))
-            newcode = str(payload.get(f"{responsible}_code", c.code))
+            newcode = _resolve_fc(responsible, state, str(payload.get(f"{responsible}_code", c.code)), payload)
             marker = (str(payload["success_marker"]).strip()
                       if responsible == "challenge" and payload.get("success_marker") else None)
             if _normalize(newcode) != _normalize(c.code):          # real change -> progress
@@ -816,10 +923,12 @@ def generate_recover_agentic(
                 _ensure_binary_evidence(state, base_dir, backend, tgt)
             if not comp.code:  # first time we need this component
                 key = f"{which}_code"
-                payload = _ask(caller, model, budget, state, report, which, "generate",
-                               {"encoder": _encoder_prompt, "challenge": _challenge_prompt,
-                                "solver": _solver_prompt}[which](state))
-                comp.code = str(payload.get(key, ""))
+                fc = state.mode == "forward_check"
+                gen_prompt = ({"encoder": _encoder_prompt_fc if fc else _encoder_prompt,
+                              "challenge": _challenge_prompt_fc if fc else _challenge_prompt,
+                              "solver": _solver_prompt}[which])(state)
+                payload = _ask(caller, model, budget, state, report, which, "generate", gen_prompt)
+                comp.code = _resolve_fc(which, state, str(payload.get(key, "")), payload)
                 if which == "challenge" and payload.get("success_marker"):
                     state.success_marker = str(payload["success_marker"]).strip()
                 comp.status = "pending"
