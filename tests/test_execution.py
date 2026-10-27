@@ -238,6 +238,103 @@ class StaticAnalysisPeTests(unittest.TestCase):
         self.assertLessEqual(len(ev), 6000)
 
 
+# --------------------------------------------------------------------------- #
+# Validates the exact technique Stage D's prompt now points the solver at:
+# `objdump -h` for section (file-offset, size), then a PLAIN file read/slice —
+# no new tool, no new container; objdump/strings are already on PATH in the
+# same sandbox run_solver() uses. These tests exercise ONLY the mechanism (the
+# harness's own use of the tool), not whether an LLM-written solver gets it
+# right — see tests/test_agentic.py for an end-to-end fixture doing that.
+# --------------------------------------------------------------------------- #
+import re as _re  # noqa: E402  (test-local, kept near its single use below)
+
+_DATA_C = (
+    '#include <stdio.h>\n#include <string.h>\n'
+    'static const unsigned char DATA[] = {0xde,0xad,0xbe,0xef,0x11,0x22,0x33,0x44,0x55,0x66};\n'
+    'int main(void){\n'
+    '  char b[256];\n'
+    '  if(!fgets(b,sizeof b,stdin)) return 0;\n'
+    '  if(strlen(b)==sizeof(DATA) && memcmp(b,DATA,sizeof DATA)==0) printf("Correct\\n");\n'
+    '  else printf("No\\n");\n'
+    '  return 0;\n'
+    '}\n'
+)
+_NEEDLE = bytes([0xde, 0xad, 0xbe, 0xef])
+
+
+def _parse_objdump_sections(objdump_h_text):
+    """Exactly the parsing shown in the Stage-D prompt guidance (agentic._SOLVER_TOOLING_HINT)."""
+    out = {}
+    for line in objdump_h_text.splitlines():
+        m = _re.match(r"^\s*\d+\s+(\S+)\s+([0-9a-fA-F]+)\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+([0-9a-fA-F]+)", line)
+        if m:
+            out[m.group(1)] = (int(m.group(3), 16), int(m.group(2), 16))  # name -> (fileoff, size)
+    return out
+
+
+@unittest.skipUnless(_ELF_READY, "needs Docker + the ELF sandbox image")
+class SolverSectionLookupElfTests(unittest.TestCase):
+    def _build(self, ws, binrel="bin/t"):
+        b = DockerLinuxBackend()
+        (ws / "src").mkdir(); (ws / "bin").mkdir()
+        (ws / "src" / "c.c").write_text(_DATA_C, encoding="utf-8")
+        self.assertTrue(b.compile_c(ws, "src/c.c", binrel, get_target("elf")).ok)
+        return b, binrel
+
+    def test_section_offset_and_raw_slice_locate_real_bytes(self):
+        with TemporaryDirectory() as tmp:
+            ws = Path(tmp); b, binrel = self._build(ws)
+            h = b._run_tool(["objdump", "-h", f"/work/{binrel}"], ws, 30.0, ResourceLimits())
+            sections = _parse_objdump_sections(h.stdout)
+            raw = (ws / binrel).read_bytes()
+            real_off = raw.find(_NEEDLE)
+            self.assertNotEqual(real_off, -1)
+            hit = next((n for n, (off, size) in sections.items() if off <= real_off < off + size), None)
+            self.assertIsNotNone(hit, sections)
+            self.assertIn(hit, (".rodata", ".data"))
+
+    def test_missing_section_yields_no_match_not_a_crash(self):
+        with TemporaryDirectory() as tmp:
+            ws = Path(tmp); b, binrel = self._build(ws)
+            h = b._run_tool(["objdump", "-h", "-j", ".this_section_does_not_exist", f"/work/{binrel}"],
+                            ws, 30.0, ResourceLimits())
+            sections = _parse_objdump_sections(h.stdout)
+            self.assertEqual(sections, {})   # empty, not an exception
+
+    def test_malformed_binary_handled_gracefully(self):
+        b = DockerLinuxBackend()
+        with TemporaryDirectory() as tmp:
+            ws = Path(tmp); (ws / "bin").mkdir()
+            (ws / "bin" / "junk").write_bytes(b"not an ELF or PE file at all, just garbage bytes")
+            h = b._run_tool(["objdump", "-h", "/work/bin/junk"], ws, 30.0, ResourceLimits())
+            # objdump reports an error (non-zero / stderr), never hangs or crashes the caller
+            sections = _parse_objdump_sections(h.stdout)
+            self.assertEqual(sections, {})
+            self.assertFalse(h.timed_out)
+
+
+@unittest.skipUnless(_PE_READY, "needs Docker + the Windows-compat sandbox image")
+class SolverSectionLookupPeTests(unittest.TestCase):
+    def test_section_offset_and_raw_slice_locate_real_bytes_pe(self):
+        from slothctf.execution import DockerWinCompatBackend
+        b = DockerWinCompatBackend()
+        with TemporaryDirectory() as tmp:
+            ws = Path(tmp); (ws / "src").mkdir(); (ws / "bin").mkdir()
+            (ws / "src" / "c.c").write_text(_DATA_C, encoding="utf-8")
+            self.assertTrue(b.compile_c(ws, "src/c.c", "bin/t.exe", get_target("pe")).ok)
+            # the solver always runs objdump from the LINUX sandbox (run_solver's image),
+            # not the win-compat one — confirm PLAIN objdump (no mingw prefix) still reads PE.
+            linux = DockerLinuxBackend()
+            h = linux._run_tool(["objdump", "-h", "/work/bin/t.exe"], ws, 30.0, ResourceLimits())
+            sections = _parse_objdump_sections(h.stdout)
+            raw = (ws / "bin" / "t.exe").read_bytes()
+            real_off = raw.find(_NEEDLE)
+            self.assertNotEqual(real_off, -1)
+            hit = next((n for n, (off, size) in sections.items() if off <= real_off < off + size), None)
+            self.assertIsNotNone(hit, sections)
+            self.assertIn(hit, (".rdata", ".data"))
+
+
 class _EofPipe:
     """A pipe that is already at EOF — read() always yields no bytes."""
     def read(self, _n):
