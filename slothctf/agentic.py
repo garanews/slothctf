@@ -567,18 +567,42 @@ def _normalize_ws(text: str) -> str:
     """Collapse whitespace runs to a single space — objdump pads operand columns with
     a variable number of spaces/tabs depending on the instruction's encoded byte count;
     that is a FORMATTING difference, never a content one, so it must not cause a real
-    citation to be rejected as fabricated."""
+    citation to be rejected as fabricated. Used for human-readable error messages."""
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _insn_key(text: str) -> str:
+    """Comparison key for instruction-text EQUALITY: strips ALL whitespace (not just
+    collapsing runs), so the mnemonic/operand gap width and comma-spacing conventions
+    ("eax, 0x3b" vs "eax,0x3b") never cause a real, complete citation to be rejected —
+    only the actual sequence of non-whitespace characters (mnemonic + every operand,
+    in order) has to match. Content, never formatting."""
+    return re.sub(r"\s+", "", text)
+
+
+def _insn_only(line: str) -> str:
+    """Extract just the mnemonic+operands field of one parsed disassembly line (drop
+    the address/raw-bytes columns and any trailing objdump '# ...' relocation/symbol
+    comment — annotation, not part of the instruction), normalized for comparison.
+    A PLT-style target suffix like '<memcmp@plt>' is part of the operand text itself
+    (no '#'), so it is preserved — PLT references stay supported."""
+    field = line.split("\t")[-1] if "\t" in line else line
+    field = field.split("#", 1)[0]
+    return _normalize_ws(field).lower()
 
 
 def _check_solver_evidence(payload: dict, state: ProjectState) -> Optional[str]:
     """Reverse-Engineering-First provenance check: every (addr, insn) pair the model cites
-    in payload["analysis"]["evidence"] must appear verbatim at that address in the
-    disassembly the model was ACTUALLY given (state.binary_evidence) — a fabricated
-    address or instruction text is rejected. This checks ONLY that the citation is real;
-    it never judges whether the model's interpretation (the "claim") of that instruction
-    is mathematically correct — that stays the model's own analysis, same as before.
-    An honest "insufficient_evidence" with no citations is accepted, not punished."""
+    in payload["analysis"]["evidence"] must match the WHOLE instruction (mnemonic AND
+    operands, not an arbitrary substring of it) at that address in the disassembly the
+    model was ACTUALLY given (state.binary_evidence) — modulo whitespace/formatting only.
+    A fabricated address, a fabricated instruction, or a bare/partial fragment (e.g. just
+    the mnemonic) that does not name the full instruction is rejected. This checks ONLY
+    that the citation is real and complete; it never judges whether the model's
+    interpretation (the "claim") of that instruction is mathematically correct — that
+    stays the model's own analysis, same as before. An honest "insufficient_evidence"
+    with no citations is accepted, not punished — but is never treated as a verified,
+    grounded reconstruction (see _evidence_grounded)."""
     analysis = payload.get("analysis")
     if not isinstance(analysis, dict):
         return 'your reply is missing an "analysis" object with your reverse-engineering evidence.'
@@ -595,16 +619,49 @@ def _check_solver_evidence(payload: dict, state: ProjectState) -> Optional[str]:
     for i, item in enumerate(items):
         if not isinstance(item, dict) or "addr" not in item or "insn" not in item:
             return f'analysis.evidence[{i}] must have both "addr" and "insn".'
-        addr, insn = str(item["addr"]), _normalize_ws(str(item["insn"]).lower())
+        addr = str(item["addr"])
+        insn = _normalize_ws(str(item["insn"]).split("#", 1)[0]).lower()
+        if not insn:
+            return (f'analysis.evidence[{i}] has an empty "insn" — cite the FULL instruction '
+                    "(mnemonic and operands) at that address, not just the address.")
         real = lines.get(_normalize_addr(addr))
         if real is None:
             return (f"analysis.evidence[{i}] cites address {addr!r}, which does not appear in the "
                     "disassembly you were given — do not invent addresses.")
-        if insn and insn not in _normalize_ws(real.lower()):
+        if _insn_key(insn) != _insn_key(_insn_only(real)):
             return (f"analysis.evidence[{i}] cites instruction {item['insn']!r} at {addr!r}, but the "
-                    f"disassembly you were given actually shows {real!r} there — cite what is really "
-                    "there, do not paraphrase or invent it.")
+                    f"disassembly you were given actually shows {_insn_only(real)!r} there — cite the "
+                    "FULL instruction exactly as shown (mnemonic and operands), not a fragment, "
+                    "paraphrase or invention.")
     return None
+
+
+def _evidence_grounded(payload: dict) -> bool:
+    """True only if the solver reply cited at least one evidence item that PASSED
+    _check_solver_evidence (i.e. this is only meaningful to call once that check has
+    already returned None). An honest "insufficient_evidence" reply is accepted but is
+    NOT grounded — diagnostics must be able to tell the two apart, never conflating a
+    verified reconstruction with an admitted absence of one."""
+    analysis = payload.get("analysis")
+    if not isinstance(analysis, dict):
+        return False
+    items = analysis.get("evidence") or []
+    return isinstance(items, list) and len(items) > 0
+
+
+def _log_solver_evidence(state: ProjectState, report, payload: dict, *, where: str) -> None:
+    """Record, for DIAGNOSTICS ONLY, whether an ACCEPTED solver reply's analysis was a
+    verified, grounded reconstruction (real cited evidence — _evidence_grounded) or an
+    honest admission of insufficient evidence — these must never be conflated in
+    reporting. Purely additive: never affects which stage passes or fails. Stage E
+    remains the only end-to-end validity gate, completely unchanged by this."""
+    grounded = _evidence_grounded(payload)
+    analysis = payload.get("analysis") if isinstance(payload.get("analysis"), dict) else {}
+    state.log({"type": "solver-analysis", "where": where, "grounded": grounded,
+               "insufficient_evidence": bool(analysis.get("insufficient_evidence")),
+               "evidence_count": len(analysis.get("evidence") or [])})
+    hist = report.telemetry.setdefault("solver_evidence", [])  # type: ignore[union-attr]
+    hist.append({"where": where, "grounded": grounded})
 
 
 def _solver_prompt(state: ProjectState) -> str:
@@ -1125,6 +1182,8 @@ def generate_recover_agentic(
                       if responsible == "challenge" and payload.get("success_marker") else None)
             if fc_err is None and _normalize(newcode) != _normalize(c.code):   # valid + real change
                 escalate.pop(responsible, None)
+                if responsible == "solver":
+                    _log_solver_evidence(state, report, payload, where="repair")
                 return newcode, marker, cand_tc
             # either a contract/evidence violation or an identical reply: record, escalate,
             # retry — bounded by the SAME repair counter, never recompiled.
@@ -1187,6 +1246,8 @@ def generate_recover_agentic(
                     if which == "challenge" and payload.get("success_marker"):
                         state.success_marker = str(payload["success_marker"]).strip()
                     comp.status = "pending"
+                    if which == "solver":
+                        _log_solver_evidence(state, report, payload, where="generate")
                 state.save()
             if fc_gen_err is not None:
                 # Contract violation on the FIRST reply: never compiled — go straight to the

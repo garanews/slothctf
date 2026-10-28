@@ -728,6 +728,71 @@ class ReverseEngineeringFirstTests(unittest.TestCase):
         self.assertIsNotNone(err)
         self.assertIn("actually shows", err)
 
+    def test_empty_insn_string_is_rejected_even_with_a_real_address(self):
+        # a real address with NO instruction text proves nothing was actually observed
+        payload = {"analysis": {"evidence": [
+            {"addr": "0x401196", "insn": "", "claim": "something is here"}],
+            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        err = ag._check_solver_evidence(payload, self._state_with_evidence())
+        self.assertIsNotNone(err)
+        self.assertIn("empty", err.lower())
+
+    def test_whitespace_only_insn_is_rejected(self):
+        payload = {"analysis": {"evidence": [
+            {"addr": "0x401196", "insn": "   ", "claim": "x"}],
+            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        self.assertIsNotNone(ag._check_solver_evidence(payload, self._state_with_evidence()))
+
+    def test_partial_mnemonic_only_citation_is_rejected(self):
+        # a genuine address, but only the bare mnemonic — not the full instruction —
+        # is too generic to prove the operands were actually observed.
+        payload = {"analysis": {"evidence": [
+            {"addr": "0x401196", "insn": "xor", "claim": "a xor happens here"}],
+            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        err = ag._check_solver_evidence(payload, self._state_with_evidence())
+        self.assertIsNotNone(err)
+        self.assertIn("FULL instruction", err)
+
+    def test_citation_matching_operands_but_different_case_and_spacing_is_accepted(self):
+        # formatting-only differences (case, internal spacing) must not cause a real,
+        # complete citation to be rejected
+        payload = {"analysis": {"evidence": [
+            {"addr": "0x401196", "insn": "XOR  EAX, 0x3b", "claim": "byte xored"}],
+            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        self.assertIsNone(ag._check_solver_evidence(payload, self._state_with_evidence()))
+
+    def test_citation_with_trailing_objdump_comment_is_normalized_both_ways(self):
+        # objdump appends '# <target> <symbol>' relocation comments to some instructions;
+        # that annotation is not part of "the instruction" and must not block a match in
+        # either direction (model includes it, or omits it).
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}")
+        st.binary_evidence = (
+            "=== disassembly (objdump) ===\n"
+            "  401004:\t48 8b 05 c5 2f 00 00 \tmov    rax,QWORD PTR [rip+0x2fc5]        "
+            "# 3fd0 <__cxa_finalize@plt+0x2f70>\n")
+        omitted = {"analysis": {"evidence": [
+            {"addr": "401004", "insn": "mov    rax,QWORD PTR [rip+0x2fc5]", "claim": "c"}],
+            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        included = {"analysis": {"evidence": [
+            {"addr": "401004",
+             "insn": "mov    rax,QWORD PTR [rip+0x2fc5]        # 3fd0 <__cxa_finalize@plt+0x2f70>",
+             "claim": "c"}], "insufficient_evidence": False}, "solver_code": "print(1)"}
+        self.assertIsNone(ag._check_solver_evidence(omitted, st))
+        self.assertIsNone(ag._check_solver_evidence(included, st))
+
+    def test_grounded_vs_insufficient_are_distinguishable(self):
+        grounded_payload = {"analysis": {"evidence": [
+            {"addr": "0x401196", "insn": "xor eax,0x3b", "claim": "c"}],
+            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        insufficient_payload = {"analysis": {"evidence": [], "insufficient_evidence": True},
+                                "solver_code": "print(1)"}
+        # both are ACCEPTED (neither is rejected as fabrication)...
+        self.assertIsNone(ag._check_solver_evidence(grounded_payload, self._state_with_evidence()))
+        self.assertIsNone(ag._check_solver_evidence(insufficient_payload, self._state_with_evidence()))
+        # ...but only one is a verified, grounded reconstruction — never conflated
+        self.assertTrue(ag._evidence_grounded(grounded_payload))
+        self.assertFalse(ag._evidence_grounded(insufficient_payload))
+
     def test_missing_analysis_object_is_rejected(self):
         err = ag._check_solver_evidence({"solver_code": "print(1)"}, self._state_with_evidence())
         self.assertIsNotNone(err)
