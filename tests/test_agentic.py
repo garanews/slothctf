@@ -132,6 +132,13 @@ SOL_GOOD = ("import sys, re\n"
             "m=re.search(rb'sloth\\{[^}]{1,64}\\}',dec)\n"
             "print(m.group(0).decode() if m else '')\n")
 
+# Reverse-Engineering-First (ag._check_solver_evidence) requires an "analysis" object in every
+# solver reply now. These existing fixtures test OTHER mechanics (mismatch/no-progress/hardcode/
+# flag-swap/FC round-trip) and are not about evidence grounding, so they honestly declare
+# insufficient evidence rather than fabricate citations — the check accepts that, same as a real
+# model admitting it couldn't ground a claim. The dedicated grounding tests build real citations.
+_ANALYSIS_STUB = {"evidence": [], "insufficient_evidence": True, "notes": "test fixture"}
+
 # deliberately broken variants
 ENC_BROKEN = "#include <stdio.h>\nint main(){ this is not valid c }\n"
 CHAL_BROKEN = ("#include <stdio.h>\nstatic const unsigned char d[]={ /*__ENCODED_ARRAY__*/ };\n"
@@ -659,6 +666,164 @@ class StateMachineTests(unittest.TestCase):
             self.assertEqual(st2.transform_code, "void f(){}")
 
 
+# A tiny slice of REAL `objdump -d -M intel` output (ELF), including a PLT-style symbol
+# suffix (<memcmp@plt>, from the dynamic symbol table — present even in a stripped
+# binary) and a plain, symbol-less instruction line — both forms the provenance check
+# must handle, since a fully-stripped static function has no name at all.
+_REAL_DISASM_SAMPLE = (
+    "=== disassembly (objdump) ===\n"
+    "0000000000401196 <main>:\n"
+    "  401196:\t83 f0 3b             \txor    eax,0x3b\n"
+    "  401199:\t83 c0 07             \tadd    eax,0x7\n"
+    "  40119c:\te8 9f fe ff ff       \tcall   401040 <memcmp@plt>\n"
+)
+
+
+class ReverseEngineeringFirstTests(unittest.TestCase):
+    """Offline (no Docker, no LLM) tests for the RE-First evidence-provenance check:
+    _parse_disasm_lines / _check_solver_evidence. These never judge whether the
+    model's INTERPRETATION of an instruction is correct — only whether the citation
+    (address + instruction text) is real."""
+
+    def test_parse_disasm_lines_handles_plt_symbol_and_plain_lines(self):
+        lines = ag._parse_disasm_lines(_REAL_DISASM_SAMPLE)
+        self.assertIn("401196", lines)          # plain, symbol-less instruction
+        self.assertIn("memcmp@plt", lines["40119c"])  # PLT-style symbol suffix preserved
+
+    def test_normalize_addr_tolerates_0x_prefix_and_leading_zeros(self):
+        self.assertEqual(ag._normalize_addr("0x401196"), ag._normalize_addr("00401196"))
+        self.assertEqual(ag._normalize_addr("401196"), "401196")
+
+    def _state_with_evidence(self):
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}")
+        st.binary_evidence = _REAL_DISASM_SAMPLE
+        return st
+
+    def test_real_citation_is_accepted(self):
+        payload = {"analysis": {"evidence": [
+            {"addr": "0x401196", "insn": "xor eax,0x3b", "claim": "byte xored with 0x3b"}],
+            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        self.assertIsNone(ag._check_solver_evidence(payload, self._state_with_evidence()))
+
+    def test_real_citation_with_plt_symbol_is_accepted(self):
+        payload = {"analysis": {"evidence": [
+            {"addr": "40119c", "insn": "call   401040 <memcmp@plt>", "claim": "flag compared via memcmp"}],
+            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        self.assertIsNone(ag._check_solver_evidence(payload, self._state_with_evidence()))
+
+    def test_fabricated_address_is_rejected(self):
+        payload = {"analysis": {"evidence": [
+            {"addr": "0xdeadbeef", "insn": "xor eax,0x3b", "claim": "made up"}],
+            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        err = ag._check_solver_evidence(payload, self._state_with_evidence())
+        self.assertIsNotNone(err)
+        self.assertIn("does not appear", err)
+
+    def test_fabricated_instruction_at_a_real_address_is_rejected(self):
+        # the ADDRESS is real, but the cited instruction text is not what is really there
+        payload = {"analysis": {"evidence": [
+            {"addr": "0x401196", "insn": "mov eax, 0x9999", "claim": "fabricated"}],
+            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        err = ag._check_solver_evidence(payload, self._state_with_evidence())
+        self.assertIsNotNone(err)
+        self.assertIn("actually shows", err)
+
+    def test_empty_insn_string_is_rejected_even_with_a_real_address(self):
+        # a real address with NO instruction text proves nothing was actually observed
+        payload = {"analysis": {"evidence": [
+            {"addr": "0x401196", "insn": "", "claim": "something is here"}],
+            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        err = ag._check_solver_evidence(payload, self._state_with_evidence())
+        self.assertIsNotNone(err)
+        self.assertIn("empty", err.lower())
+
+    def test_whitespace_only_insn_is_rejected(self):
+        payload = {"analysis": {"evidence": [
+            {"addr": "0x401196", "insn": "   ", "claim": "x"}],
+            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        self.assertIsNotNone(ag._check_solver_evidence(payload, self._state_with_evidence()))
+
+    def test_partial_mnemonic_only_citation_is_rejected(self):
+        # a genuine address, but only the bare mnemonic — not the full instruction —
+        # is too generic to prove the operands were actually observed.
+        payload = {"analysis": {"evidence": [
+            {"addr": "0x401196", "insn": "xor", "claim": "a xor happens here"}],
+            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        err = ag._check_solver_evidence(payload, self._state_with_evidence())
+        self.assertIsNotNone(err)
+        self.assertIn("FULL instruction", err)
+
+    def test_citation_matching_operands_but_different_case_and_spacing_is_accepted(self):
+        # formatting-only differences (case, internal spacing) must not cause a real,
+        # complete citation to be rejected
+        payload = {"analysis": {"evidence": [
+            {"addr": "0x401196", "insn": "XOR  EAX, 0x3b", "claim": "byte xored"}],
+            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        self.assertIsNone(ag._check_solver_evidence(payload, self._state_with_evidence()))
+
+    def test_citation_with_trailing_objdump_comment_is_normalized_both_ways(self):
+        # objdump appends '# <target> <symbol>' relocation comments to some instructions;
+        # that annotation is not part of "the instruction" and must not block a match in
+        # either direction (model includes it, or omits it).
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}")
+        st.binary_evidence = (
+            "=== disassembly (objdump) ===\n"
+            "  401004:\t48 8b 05 c5 2f 00 00 \tmov    rax,QWORD PTR [rip+0x2fc5]        "
+            "# 3fd0 <__cxa_finalize@plt+0x2f70>\n")
+        omitted = {"analysis": {"evidence": [
+            {"addr": "401004", "insn": "mov    rax,QWORD PTR [rip+0x2fc5]", "claim": "c"}],
+            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        included = {"analysis": {"evidence": [
+            {"addr": "401004",
+             "insn": "mov    rax,QWORD PTR [rip+0x2fc5]        # 3fd0 <__cxa_finalize@plt+0x2f70>",
+             "claim": "c"}], "insufficient_evidence": False}, "solver_code": "print(1)"}
+        self.assertIsNone(ag._check_solver_evidence(omitted, st))
+        self.assertIsNone(ag._check_solver_evidence(included, st))
+
+    def test_grounded_vs_insufficient_are_distinguishable(self):
+        grounded_payload = {"analysis": {"evidence": [
+            {"addr": "0x401196", "insn": "xor eax,0x3b", "claim": "c"}],
+            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        insufficient_payload = {"analysis": {"evidence": [], "insufficient_evidence": True},
+                                "solver_code": "print(1)"}
+        # both are ACCEPTED (neither is rejected as fabrication)...
+        self.assertIsNone(ag._check_solver_evidence(grounded_payload, self._state_with_evidence()))
+        self.assertIsNone(ag._check_solver_evidence(insufficient_payload, self._state_with_evidence()))
+        # ...but only one is a verified, grounded reconstruction — never conflated
+        self.assertTrue(ag._evidence_grounded(grounded_payload))
+        self.assertFalse(ag._evidence_grounded(insufficient_payload))
+
+    def test_missing_analysis_object_is_rejected(self):
+        err = ag._check_solver_evidence({"solver_code": "print(1)"}, self._state_with_evidence())
+        self.assertIsNotNone(err)
+        self.assertIn("analysis", err)
+
+    def test_empty_evidence_without_insufficient_flag_is_rejected(self):
+        payload = {"analysis": {"evidence": [], "insufficient_evidence": False}, "solver_code": "print(1)"}
+        err = ag._check_solver_evidence(payload, self._state_with_evidence())
+        self.assertIsNotNone(err)
+
+    def test_honest_insufficient_evidence_is_accepted_not_punished(self):
+        payload = {"analysis": {"evidence": [], "insufficient_evidence": True,
+                                "notes": "disassembly given was not enough to find the comparison"},
+                  "solver_code": "print(1)"}
+        self.assertIsNone(ag._check_solver_evidence(payload, self._state_with_evidence()))
+
+    def test_malformed_evidence_item_is_rejected(self):
+        payload = {"analysis": {"evidence": [{"addr": "0x401196"}],  # missing "insn"
+                                "insufficient_evidence": False}, "solver_code": "print(1)"}
+        err = ag._check_solver_evidence(payload, self._state_with_evidence())
+        self.assertIsNotNone(err)
+        self.assertIn("insn", err)
+
+    def test_no_disassembly_evidence_available_rejects_any_citation(self):
+        # defensive: if state.binary_evidence is empty/unavailable, nothing can be "real"
+        st = ag.ProjectState(name="x", target="elf", difficulty="easy", flag="sloth{a}")
+        payload = {"analysis": {"evidence": [{"addr": "0x401196", "insn": "xor eax,0x3b", "claim": "c"}],
+                                "insufficient_evidence": False}, "solver_code": "print(1)"}
+        self.assertIsNotNone(ag._check_solver_evidence(payload, st))
+
+
 class CliTests(unittest.TestCase):
     """CLI wiring for --workflow (no Docker, no Ollama)."""
 
@@ -711,7 +876,7 @@ class AgenticElfTests(unittest.TestCase):
 
     def test_full_valid_elf(self):
         items = [{"design": "d"}, {"encoder_code": ENC_GOOD},
-                 {"challenge_code": CHAL_GOOD, "success_marker": "Correct"}, {"solver_code": SOL_GOOD}]
+                 {"challenge_code": CHAL_GOOD, "success_marker": "Correct"}, {"solver_code": SOL_GOOD, "analysis": _ANALYSIS_STUB}]
         with _run("ag_elf_ok", "elf", self._backend(), items) as (rep, caller, cdir):
             self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
             self.assertEqual(rep.attempts[-1].stage, "passed")
@@ -720,7 +885,7 @@ class AgenticElfTests(unittest.TestCase):
 
     def test_encoder_repaired_then_valid(self):
         items = [{"design": "d"}, {"encoder_code": ENC_BROKEN}, {"encoder_code": ENC_GOOD},
-                 {"challenge_code": CHAL_GOOD, "success_marker": "Correct"}, {"solver_code": SOL_GOOD}]
+                 {"challenge_code": CHAL_GOOD, "success_marker": "Correct"}, {"solver_code": SOL_GOOD, "analysis": _ANALYSIS_STUB}]
         with _run("ag_enc_fix", "elf", self._backend(), items) as (rep, caller, _):
             self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
             self.assertTrue(any(a.stage == "encoder-compile" for a in rep.attempts))
@@ -728,15 +893,15 @@ class AgenticElfTests(unittest.TestCase):
     def test_challenge_compile_repaired(self):
         items = [{"design": "d"}, {"encoder_code": ENC_GOOD},
                  {"challenge_code": CHAL_BROKEN, "success_marker": "Correct"},
-                 {"challenge_code": CHAL_GOOD, "success_marker": "Correct"}, {"solver_code": SOL_GOOD}]
+                 {"challenge_code": CHAL_GOOD, "success_marker": "Correct"}, {"solver_code": SOL_GOOD, "analysis": _ANALYSIS_STUB}]
         with _run("ag_chal_fix", "elf", self._backend(), items) as (rep, caller, _):
             self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
             self.assertTrue(any(a.stage == "challenge-compile" for a in rep.attempts))
 
     def test_solver_mismatch_then_corrected(self):
         items = [{"design": "d"}, {"encoder_code": ENC_GOOD},
-                 {"challenge_code": CHAL_GOOD, "success_marker": "Correct"}, {"solver_code": SOL_WRONG},
-                 {"solver_code": SOL_GOOD}]
+                 {"challenge_code": CHAL_GOOD, "success_marker": "Correct"}, {"solver_code": SOL_WRONG, "analysis": _ANALYSIS_STUB},
+                 {"solver_code": SOL_GOOD, "analysis": _ANALYSIS_STUB}]
         with _run("ag_sol_fix", "elf", self._backend(), items) as (rep, caller, _):
             self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
             self.assertTrue(any(a.stage == "solver-mismatch" for a in rep.attempts))
@@ -747,8 +912,8 @@ class AgenticElfTests(unittest.TestCase):
         # and the next LLM repair produces a working solver so Stage E passes.
         items = [{"design": "d"}, {"encoder_code": ENC_GOOD},
                  {"challenge_code": CHAL_GOOD, "success_marker": "Correct"},
-                 {"solver_code": SOL_RANGE_ERR},
-                 {"solver_code": SOL_GOOD}]
+                 {"solver_code": SOL_RANGE_ERR, "analysis": _ANALYSIS_STUB},
+                 {"solver_code": SOL_GOOD, "analysis": _ANALYSIS_STUB}]
         with _run("ag_solver_err", "elf", self._backend(), items) as (rep, caller, _):
             self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
             self.assertTrue(any(a.stage == "solver-error" for a in rep.attempts))
@@ -765,9 +930,9 @@ class AgenticElfTests(unittest.TestCase):
         # effective repair lets the solver recover the flag -> Stage E passes.
         items = [{"design": "d"}, {"encoder_code": ENC_GOOD},
                  {"challenge_code": CHAL_GOOD, "success_marker": "Correct"},
-                 {"solver_code": SOL_WRONG},
-                 {"solver_code": SOL_WRONG},   # no-progress (identical)
-                 {"solver_code": SOL_GOOD}]  # effective
+                 {"solver_code": SOL_WRONG, "analysis": _ANALYSIS_STUB},
+                 {"solver_code": SOL_WRONG, "analysis": _ANALYSIS_STUB},   # no-progress (identical)
+                 {"solver_code": SOL_GOOD, "analysis": _ANALYSIS_STUB}]  # effective
         with _run("ag_solver_np", "elf", self._backend(), items) as (rep, caller, _):
             self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
             self.assertTrue(any(a.stage == "repair-no-progress" for a in rep.attempts))
@@ -781,9 +946,9 @@ class AgenticElfTests(unittest.TestCase):
         flag = "sloth{fixed_demo_abc}"
         hc = f"print({flag!r})\n"  # ignores the binary; recovers only this flag
         items = [{"design": "d"}, {"encoder_code": ENC_GOOD},
-                 {"challenge_code": CHAL_GOOD, "success_marker": "Correct"}, {"solver_code": hc},
-                 {"solver_code": hc},
-                 {"solver_code": hc}]
+                 {"challenge_code": CHAL_GOOD, "success_marker": "Correct"}, {"solver_code": hc, "analysis": _ANALYSIS_STUB},
+                 {"solver_code": hc, "analysis": _ANALYSIS_STUB},
+                 {"solver_code": hc, "analysis": _ANALYSIS_STUB}]
         with _run("ag_hardcode", "elf", self._backend(), items,
                   budget=ag.Budget(max_repairs_per_stage=1), flag=flag) as (rep, caller, _):
             self.assertFalse(rep.success)
@@ -797,7 +962,7 @@ class AgenticElfTests(unittest.TestCase):
         items = [{"design": "d"}, {"encoder_code": ENC_GOOD},
                  {"challenge_code": CHAL_BADLEN, "success_marker": "FLAG_RECOVERED"},
                  {"challenge_code": CHAL_FIXED, "success_marker": "FLAG_RECOVERED"},
-                 {"solver_code": SOL_GOOD}]
+                 {"solver_code": SOL_GOOD, "analysis": _ANALYSIS_STUB}]
         with _run("ag_badlen_fix", "elf", self._backend(), items) as (rep, caller, _):
             self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
             self.assertTrue(any(a.stage == "recover-rejects-correct" for a in rep.attempts))
@@ -825,7 +990,7 @@ class AgenticElfTests(unittest.TestCase):
                 self.assertTrue(st.is_verified("encoder"))  # encoder survived the crash
                 # run 2: resume; must NOT re-ask the encoder, only challenge + solver
                 c2 = Replay([{"challenge_code": CHAL_GOOD, "success_marker": "Correct"},
-                             {"solver_code": SOL_GOOD}])
+                             {"solver_code": SOL_GOOD, "analysis": _ANALYSIS_STUB}])
                 rep = ag.generate_recover_agentic("ag_resume", prompt="p", target="elf",
                                                   backend=DockerLinuxBackend(), caller=c2,
                                                   resume=True)
@@ -850,7 +1015,7 @@ class AgenticForwardCheckElfTests(unittest.TestCase):
 
     def test_full_valid_elf_shared_transform_harness_synthesized_challenge(self):
         items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
-                 {"solver_code": FC_SOLVER_GOOD}]
+                 {"solver_code": FC_SOLVER_GOOD, "analysis": _ANALYSIS_STUB}]
         with _run("ag_fc_elf_ok", "elf", self._backend(), items,
                   flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
             self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
@@ -872,7 +1037,7 @@ class AgenticForwardCheckElfTests(unittest.TestCase):
         # encoder-compile repair path, unaffected by the new contract pre-check.
         items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_BROKEN},
                  {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
-                 {"solver_code": FC_SOLVER_GOOD}]
+                 {"solver_code": FC_SOLVER_GOOD, "analysis": _ANALYSIS_STUB}]
         with _run("ag_fc_fix", "elf", self._backend(), items,
                   flag=FC_FLAG, mode="forward_check") as (rep, caller, _):
             self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
@@ -885,7 +1050,7 @@ class AgenticForwardCheckElfTests(unittest.TestCase):
         items = [{"design": "d"},
                  {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_AUTONOMOUS},  # contract violation
                  {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},        # correct repair
-                 {"solver_code": FC_SOLVER_GOOD}]
+                 {"solver_code": FC_SOLVER_GOOD, "analysis": _ANALYSIS_STUB}]
         with _run("ag_fc_autonomous", "elf", self._backend(), items,
                   flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
             self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
@@ -901,7 +1066,7 @@ class AgenticForwardCheckElfTests(unittest.TestCase):
         # Stage D/E are untouched by Forward-Check: the anti-hardcode swap still fires.
         hc = f"print({FC_FLAG!r})\n"
         items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
-                 {"solver_code": hc}, {"solver_code": hc}, {"solver_code": hc}]
+                 {"solver_code": hc, "analysis": _ANALYSIS_STUB}, {"solver_code": hc, "analysis": _ANALYSIS_STUB}, {"solver_code": hc, "analysis": _ANALYSIS_STUB}]
         with _run("ag_fc_hardcode", "elf", self._backend(), items,
                   budget=ag.Budget(max_repairs_per_stage=1), flag=FC_FLAG,
                   mode="forward_check") as (rep, caller, _):
@@ -916,7 +1081,7 @@ class AgenticForwardCheckElfTests(unittest.TestCase):
         # passing both runs proves it works on the original AND a recompiled binary.
         # This demonstrates the MECHANISM only — not a claim that Qwen writes this.
         items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
-                 {"solver_code": FC_SOLVER_OBJDUMP}]
+                 {"solver_code": FC_SOLVER_OBJDUMP, "analysis": _ANALYSIS_STUB}]
         with _run("ag_fc_objdump_solver", "elf", self._backend(), items,
                   flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
             self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
@@ -929,7 +1094,7 @@ class AgenticForwardCheckElfTests(unittest.TestCase):
         # strlen()-based read would silently accept "<flag>\0<garbage>" as the bare flag.
         import slothctf.generator as gmod
         items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
-                 {"solver_code": FC_SOLVER_GOOD}]
+                 {"solver_code": FC_SOLVER_GOOD, "analysis": _ANALYSIS_STUB}]
         with _run("ag_fc_shortlen", "elf", self._backend(), items,
                   flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
             self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
@@ -952,12 +1117,110 @@ class AgenticForwardCheckElfTests(unittest.TestCase):
             self.assertIn(ag.FC_SUCCESS_MARKER, good.stdout)
 
 
+def _real_xor_citation(backend, tgt, chal_rel):
+    """Build the SAME FC_TRANSFORM challenge standalone and return a REAL (addr, insn)
+    pair for one of its xor instructions, from the ACTUAL compiled disassembly — not
+    invented. Used to construct a genuinely grounded `analysis` fixture: the full
+    end-to-end run below builds byte-identical binaries (same source, same backend),
+    so the citation is valid there too."""
+    import slothctf.generator as g
+    chal_src = ag._FC_CHALLENGE_SKELETON.replace(ag.TRANSFORM_PLACEHOLDER, FC_TRANSFORM) \
+                                        .replace(g.ENCODED_PLACEHOLDER, ",".join(["0x00"] * 19))
+    with TemporaryDirectory() as tmp:
+        ws = Path(tmp)
+        (ws / "src").mkdir(); (ws / "bin").mkdir()
+        (ws / "src" / "challenge.c").write_text(chal_src, encoding="utf-8")
+        r = backend.compile_c(ws, "src/challenge.c", chal_rel, tgt)
+        assert r.ok, r.stderr
+        evidence = backend.static_analysis(ws, chal_rel, tgt)
+    lines = ag._parse_disasm_lines(evidence)
+    # ANY complete instruction will do — the production check is content-agnostic, it
+    # only verifies the citation is real. Skip a line whose operands were cut off by
+    # static_analysis's char-budget truncation (bare mnemonic, no operand tokens),
+    # which would make a flaky fixture.
+    for addr, text in lines.items():
+        insn = text.split("\t")[-1].strip()
+        if len(insn.split()) >= 2:
+            return {"addr": addr, "insn": insn}
+    raise AssertionError("no complete (non-truncated) instruction found in the real disassembly")
+
+
+@unittest.skipUnless(_READY, _SKIP)
+class ReverseEngineeringFirstGateDockerTests(unittest.TestCase):
+    """End-to-end Docker proof for the RE-First evidence-provenance check: (a) a
+    genuinely grounded analysis+solver still reaches Stage E valid, and (b) a FIRST
+    solver reply that fabricates its evidence is rejected (stage
+    "solver-evidence-fabricated"), then a re-grounded repair is accepted — reusing the
+    EXISTING repair/feedback loop and counter, no budget increase."""
+
+    def test_grounded_evidence_passes_end_to_end(self):
+        from slothctf.execution import DockerLinuxBackend
+        import slothctf.generator as g
+        backend = DockerLinuxBackend()
+        xor_item = _real_xor_citation(backend, g.get_target("elf"), "bin/probe")
+        good_analysis = {"evidence": [{"addr": xor_item["addr"], "insn": xor_item["insn"],
+                                       "claim": "transform xors the byte with a running state"}],
+                         "insufficient_evidence": False, "notes": "grounded in the real disassembly"}
+        items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
+                 {"solver_code": FC_SOLVER_GOOD, "analysis": good_analysis}]
+        with _run("ag_refirst_ok", "elf", DockerLinuxBackend(), items,
+                  flag=FC_FLAG, mode="forward_check") as (rep, caller, _):
+            self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
+            self.assertEqual(rep.attempts[-1].stage, "passed")
+
+    def test_fabricated_evidence_rejected_then_repaired_without_extra_budget(self):
+        from slothctf.execution import DockerLinuxBackend
+        import slothctf.generator as g
+        backend = DockerLinuxBackend()
+        xor_item = _real_xor_citation(backend, g.get_target("elf"), "bin/probe")
+        good_analysis = {"evidence": [{"addr": xor_item["addr"], "insn": xor_item["insn"],
+                                       "claim": "transform xors the byte with a running state"}],
+                         "insufficient_evidence": False}
+        fake_analysis = {"evidence": [{"addr": "0xdeadbeef", "insn": "xor eax, 0xff",
+                                       "claim": "fabricated — not really in the dump"}],
+                         "insufficient_evidence": False}
+        items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
+                 {"solver_code": FC_SOLVER_GOOD, "analysis": fake_analysis},    # rejected: fabricated
+                 {"solver_code": FC_SOLVER_GOOD, "analysis": good_analysis}]   # repaired: grounded
+        with _run("ag_refirst_fab", "elf", DockerLinuxBackend(), items,
+                  flag=FC_FLAG, mode="forward_check",
+                  budget=ag.Budget(max_repairs_per_stage=2)) as (rep, caller, _):
+            self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
+            self.assertTrue(any(a.stage == "solver-evidence-fabricated" for a in rep.attempts),
+                            [(a.stage, a.detail[:80]) for a in rep.attempts])
+            # the SAME repair counter was charged — no extra budget was granted for this
+            comp_repairs = [a for a in rep.attempts if a.stage == "solver-evidence-fabricated"]
+            self.assertEqual(len(comp_repairs), 1)
+
+
+@unittest.skipUnless(_WIN_READY and _READY, _WIN_SKIP)
+class ReverseEngineeringFirstGateDockerPeTests(unittest.TestCase):
+    """Same positive end-to-end proof as ReverseEngineeringFirstGateDockerTests, on PE —
+    the provenance check is target-agnostic, but the challenge must actually be built
+    and disassembled per-target to prove it, not assumed from the ELF result."""
+
+    def test_grounded_evidence_passes_end_to_end_pe(self):
+        from slothctf.execution import DockerWinCompatBackend
+        import slothctf.generator as g
+        backend = DockerWinCompatBackend()
+        xor_item = _real_xor_citation(backend, g.get_target("pe"), "bin/probe.exe")
+        good_analysis = {"evidence": [{"addr": xor_item["addr"], "insn": xor_item["insn"],
+                                       "claim": "transform xors the byte with a running state"}],
+                         "insufficient_evidence": False, "notes": "grounded in the real disassembly"}
+        items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
+                 {"solver_code": FC_SOLVER_OBJDUMP, "analysis": good_analysis}]
+        with _run("ag_refirst_ok_pe", "pe", DockerWinCompatBackend(), items,
+                  flag=FC_FLAG, mode="forward_check") as (rep, caller, _):
+            self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
+            self.assertEqual(rep.attempts[-1].stage, "passed")
+
+
 @unittest.skipUnless(_WIN_READY and _READY, _WIN_SKIP)
 class AgenticPeTests(unittest.TestCase):
     def test_full_valid_pe(self):
         from slothctf.execution import DockerWinCompatBackend
         items = [{"design": "d"}, {"encoder_code": ENC_GOOD},
-                 {"challenge_code": CHAL_GOOD, "success_marker": "Correct"}, {"solver_code": SOL_GOOD}]
+                 {"challenge_code": CHAL_GOOD, "success_marker": "Correct"}, {"solver_code": SOL_GOOD, "analysis": _ANALYSIS_STUB}]
         with _run("ag_pe_ok", "pe", DockerWinCompatBackend(), items) as (rep, caller, cdir):
             self.assertTrue(rep.success, [(a.stage, a.detail[:80]) for a in rep.attempts])
             self.assertTrue((cdir / "bin" / "challenge.exe").exists())
@@ -965,7 +1228,7 @@ class AgenticPeTests(unittest.TestCase):
     def test_full_valid_pe_forward_check_shared_transform(self):
         from slothctf.execution import DockerWinCompatBackend
         items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
-                 {"solver_code": FC_SOLVER_GOOD}]
+                 {"solver_code": FC_SOLVER_GOOD, "analysis": _ANALYSIS_STUB}]
         with _run("ag_fc_pe_ok", "pe", DockerWinCompatBackend(), items,
                   flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
             self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])
@@ -993,7 +1256,7 @@ class AgenticPeTests(unittest.TestCase):
         # prefix) — confirming it reads the PE file correctly from there too.
         from slothctf.execution import DockerWinCompatBackend
         items = [{"design": "d"}, {"transform_code": FC_TRANSFORM, "encoder_code": FC_ENCODER_GOOD},
-                 {"solver_code": FC_SOLVER_OBJDUMP}]
+                 {"solver_code": FC_SOLVER_OBJDUMP, "analysis": _ANALYSIS_STUB}]
         with _run("ag_fc_objdump_solver_pe", "pe", DockerWinCompatBackend(), items,
                   flag=FC_FLAG, mode="forward_check") as (rep, caller, cdir):
             self.assertTrue(rep.success, [(a.stage, a.detail[:120]) for a in rep.attempts])

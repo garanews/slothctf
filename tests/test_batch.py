@@ -384,7 +384,7 @@ class BatchMechanicsTests(unittest.TestCase):
 # =========================================================================== #
 from slothctf.execution import docker_available, image_available
 try:
-    from tests.test_agentic import Replay, ENC_GOOD, CHAL_GOOD, SOL_GOOD
+    from tests.test_agentic import Replay, ENC_GOOD, CHAL_GOOD, SOL_GOOD, _ANALYSIS_STUB
 except Exception:  # pragma: no cover
     Replay = None
 _READY = docker_available() and image_available() and Replay is not None
@@ -394,7 +394,7 @@ _READY = docker_available() and image_available() and Replay is not None
 class BatchDockerElfTests(unittest.TestCase):
     def test_real_agentic_elf_campaign_one_valid(self):
         items = [{"design": "d"}, {"encoder_code": ENC_GOOD},
-                 {"challenge_code": CHAL_GOOD, "success_marker": "Correct"}, {"solver_code": SOL_GOOD}]
+                 {"challenge_code": CHAL_GOOD, "success_marker": "Correct"}, {"solver_code": SOL_GOOD, "analysis": _ANALYSIS_STUB}]
         with TemporaryDirectory() as tmp, _cwd(tmp):
             cfg = dict(BASE_CFG); cfg["repeats"] = 1; cfg["dest"] = "camp_docker"
             cf = lambda wf, url, temp: Replay(list(items))   # fresh replay for the single run

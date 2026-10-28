@@ -33,6 +33,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -534,6 +535,135 @@ def _binary_evidence_block(state: ProjectState) -> str:
             + _SOLVER_TOOLING_HINT)
 
 
+_DISASM_LINE_RE = re.compile(r"^\s*([0-9a-fA-F]+):\t(.*)$")
+
+
+def _parse_disasm_lines(binary_evidence: str) -> dict[str, str]:
+    """Extract {normalized hex address: full disassembly line} from the '=== disassembly'
+    section of the SAME static-analysis text already shown to the solver model — never
+    re-runs objdump, so the provenance check is against exactly what the model actually
+    saw (including whatever truncation applied to it, which is only fair)."""
+    out: dict[str, str] = {}
+    if not binary_evidence:
+        return out
+    idx = binary_evidence.find("=== disassembly")
+    if idx == -1:
+        return out
+    for line in binary_evidence[idx:].splitlines():
+        m = _DISASM_LINE_RE.match(line)
+        if m:
+            out[_normalize_addr(m.group(1))] = line.strip()
+    return out
+
+
+def _normalize_addr(addr: str) -> str:
+    a = addr.strip().lower()
+    if a.startswith("0x"):
+        a = a[2:]
+    return a.lstrip("0") or "0"
+
+
+def _normalize_ws(text: str) -> str:
+    """Collapse whitespace runs to a single space — objdump pads operand columns with
+    a variable number of spaces/tabs depending on the instruction's encoded byte count;
+    that is a FORMATTING difference, never a content one, so it must not cause a real
+    citation to be rejected as fabricated. Used for human-readable error messages."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _insn_key(text: str) -> str:
+    """Comparison key for instruction-text EQUALITY: strips ALL whitespace (not just
+    collapsing runs), so the mnemonic/operand gap width and comma-spacing conventions
+    ("eax, 0x3b" vs "eax,0x3b") never cause a real, complete citation to be rejected —
+    only the actual sequence of non-whitespace characters (mnemonic + every operand,
+    in order) has to match. Content, never formatting."""
+    return re.sub(r"\s+", "", text)
+
+
+def _insn_only(line: str) -> str:
+    """Extract just the mnemonic+operands field of one parsed disassembly line (drop
+    the address/raw-bytes columns and any trailing objdump '# ...' relocation/symbol
+    comment — annotation, not part of the instruction), normalized for comparison.
+    A PLT-style target suffix like '<memcmp@plt>' is part of the operand text itself
+    (no '#'), so it is preserved — PLT references stay supported."""
+    field = line.split("\t")[-1] if "\t" in line else line
+    field = field.split("#", 1)[0]
+    return _normalize_ws(field).lower()
+
+
+def _check_solver_evidence(payload: dict, state: ProjectState) -> Optional[str]:
+    """Reverse-Engineering-First provenance check: every (addr, insn) pair the model cites
+    in payload["analysis"]["evidence"] must match the WHOLE instruction (mnemonic AND
+    operands, not an arbitrary substring of it) at that address in the disassembly the
+    model was ACTUALLY given (state.binary_evidence) — modulo whitespace/formatting only.
+    A fabricated address, a fabricated instruction, or a bare/partial fragment (e.g. just
+    the mnemonic) that does not name the full instruction is rejected. This checks ONLY
+    that the citation is real and complete; it never judges whether the model's
+    interpretation (the "claim") of that instruction is mathematically correct — that
+    stays the model's own analysis, same as before. An honest "insufficient_evidence"
+    with no citations is accepted, not punished — but is never treated as a verified,
+    grounded reconstruction (see _evidence_grounded)."""
+    analysis = payload.get("analysis")
+    if not isinstance(analysis, dict):
+        return 'your reply is missing an "analysis" object with your reverse-engineering evidence.'
+    items = analysis.get("evidence") or []
+    if not isinstance(items, list):
+        return '"analysis.evidence" must be a list of {"addr": ..., "insn": ...} objects.'
+    if not items:
+        if analysis.get("insufficient_evidence"):
+            return None
+        return ('"analysis.evidence" is empty — cite at least one real (addr, insn) pair copied from '
+                'the disassembly you were given, or set "insufficient_evidence": true and explain why '
+                'in "notes".')
+    lines = _parse_disasm_lines(getattr(state, "binary_evidence", "") or "")
+    for i, item in enumerate(items):
+        if not isinstance(item, dict) or "addr" not in item or "insn" not in item:
+            return f'analysis.evidence[{i}] must have both "addr" and "insn".'
+        addr = str(item["addr"])
+        insn = _normalize_ws(str(item["insn"]).split("#", 1)[0]).lower()
+        if not insn:
+            return (f'analysis.evidence[{i}] has an empty "insn" — cite the FULL instruction '
+                    "(mnemonic and operands) at that address, not just the address.")
+        real = lines.get(_normalize_addr(addr))
+        if real is None:
+            return (f"analysis.evidence[{i}] cites address {addr!r}, which does not appear in the "
+                    "disassembly you were given — do not invent addresses.")
+        if _insn_key(insn) != _insn_key(_insn_only(real)):
+            return (f"analysis.evidence[{i}] cites instruction {item['insn']!r} at {addr!r}, but the "
+                    f"disassembly you were given actually shows {_insn_only(real)!r} there — cite the "
+                    "FULL instruction exactly as shown (mnemonic and operands), not a fragment, "
+                    "paraphrase or invention.")
+    return None
+
+
+def _evidence_grounded(payload: dict) -> bool:
+    """True only if the solver reply cited at least one evidence item that PASSED
+    _check_solver_evidence (i.e. this is only meaningful to call once that check has
+    already returned None). An honest "insufficient_evidence" reply is accepted but is
+    NOT grounded — diagnostics must be able to tell the two apart, never conflating a
+    verified reconstruction with an admitted absence of one."""
+    analysis = payload.get("analysis")
+    if not isinstance(analysis, dict):
+        return False
+    items = analysis.get("evidence") or []
+    return isinstance(items, list) and len(items) > 0
+
+
+def _log_solver_evidence(state: ProjectState, report, payload: dict, *, where: str) -> None:
+    """Record, for DIAGNOSTICS ONLY, whether an ACCEPTED solver reply's analysis was a
+    verified, grounded reconstruction (real cited evidence — _evidence_grounded) or an
+    honest admission of insufficient evidence — these must never be conflated in
+    reporting. Purely additive: never affects which stage passes or fails. Stage E
+    remains the only end-to-end validity gate, completely unchanged by this."""
+    grounded = _evidence_grounded(payload)
+    analysis = payload.get("analysis") if isinstance(payload.get("analysis"), dict) else {}
+    state.log({"type": "solver-analysis", "where": where, "grounded": grounded,
+               "insufficient_evidence": bool(analysis.get("insufficient_evidence")),
+               "evidence_count": len(analysis.get("evidence") or [])})
+    hist = report.telemetry.setdefault("solver_evidence", [])  # type: ignore[union-attr]
+    hist.append({"where": where, "grounded": grounded})
+
+
 def _solver_prompt(state: ProjectState) -> str:
     # INDEPENDENT solver: the generating model gets ONLY what a player has — the public
     # description and reverse-engineering evidence derived from the distributed binary. It must
@@ -546,11 +676,26 @@ def _solver_prompt(state: ProjectState) -> str:
         "alone. You are NOT given the flag, the encoder, the challenge source, or any description of the "
         "transform — infer it from the binary evidence below and the raw bytes."
         + _binary_evidence_block(state) +
-        "\nWrite solver_code: a COMPLETE Python 3 program run as `python3 -I solver.py <binary>`. It reads "
-        "ONLY the binary's raw bytes from argv[1], recovers the flag, and prints EXACTLY the flag and "
-        "nothing else. It must NOT hardcode the flag, read any other file, or execute the binary. Do all "
-        "byte arithmetic mod 256. Valid Python 3 only (use # comments). "
-        'Return ONE JSON object: {"solver_code": "<python source>"}.')
+        "\n\nBEFORE writing any code, reverse-engineer the binary from the disassembly above. Identify, "
+        "each with REAL evidence: where the flag comparison happens; how the data length is determined, "
+        "if it can be; what operations the transform actually performs and in what order. Do NOT assume "
+        "the transform kept its source name or is even a separate function — the binary may be stripped "
+        "and/or the function inlined into main; find it by behaviour, not by name or symbol. Every "
+        "evidence item must be an address and instruction text COPIED from the disassembly you were "
+        "given, never paraphrased or invented — a fabricated citation is rejected outright. If the "
+        "disassembly given to you is not enough to determine something, say so (insufficient_evidence) "
+        "instead of inventing it.\n"
+        "Then write solver_code: a COMPLETE Python 3 program run as `python3 -I solver.py <binary>`, "
+        "implementing ONLY the operations you found evidence for, inverted in order. It reads ONLY the "
+        "binary's raw bytes from argv[1] (the file it is ACTUALLY given — recompute everything at "
+        "runtime, never hardcode a value you only saw once, since the binary may be rebuilt with a "
+        "different flag later), recovers the flag, and prints EXACTLY the flag and nothing else. It must "
+        "NOT hardcode the flag, read any other file, or execute the binary. Do all byte arithmetic mod "
+        "256. Valid Python 3 only (use # comments).\n"
+        'Return ONE JSON object: {"analysis": {"evidence": [{"addr": "<hex address, copied>", '
+        '"insn": "<instruction text at that address, copied>", "claim": "<what this shows>"}, ...], '
+        '"insufficient_evidence": <true|false>, "notes": "<free text>"}, '
+        '"solver_code": "<python source>"}.')
 
 
 _REPAIR_PROMPTS = {
@@ -558,8 +703,13 @@ _REPAIR_PROMPTS = {
                'Return ONE JSON object: {{"encoder_code": "<fixed C source>"}}.',
     "challenge": "Fix challenge_code. The harness reported:\n{err}\nCurrent challenge_code:\n{code}\n"
                  'Return ONE JSON object: {{"challenge_code": "<fixed C source>", "success_marker": "<exact text>"}}.',
-    "solver": "Fix solver_code. The harness reported:\n{err}\nCurrent solver_code:\n{code}\n"
-              'Return ONE JSON object: {{"solver_code": "<fixed python source>"}}.',
+    "solver": "Fix your analysis and/or solver_code. The harness reported:\n{err}\n"
+              "Current solver_code:\n{code}\n"
+              "Evidence items must be addresses/instructions COPIED from the disassembly below, never "
+              "invented. Return ONE JSON object: "
+              '{{"analysis": {{"evidence": [{{"addr": "...", "insn": "...", "claim": "..."}}], '
+              '"insufficient_evidence": <true|false>, "notes": "..."}}, '
+              '"solver_code": "<fixed python source>"}}.',
 }
 
 
@@ -858,6 +1008,7 @@ _RESPONSIBLE = {
     "challenge-crash": "challenge",
     "challenge-bad-exit": "challenge", "too-trivial": "challenge", "output-truncated": "challenge",
     "solver-error": "solver", "solver-mismatch": "solver", "solver-hardcoded": "solver",
+    "solver-evidence-fabricated": "solver",
     "swap-solver-error": "solver", "swap-encoder": "encoder", "swap-identical": "encoder",
     "swap-compile": "challenge",
     # forward_check-only contract violations (checked WITHOUT compiling — see _resolve_fc)
@@ -1023,18 +1174,25 @@ def generate_recover_agentic(
                            _repair_prompt(responsible, state, detail + escalate.get(responsible, "")))
             raw = str(payload.get(f"{responsible}_code", c.code))
             newcode, fc_err, cand_tc = _resolve_fc(responsible, state, raw, payload)
+            # Reverse-Engineering-First: a solver repair must ALSO re-ground its evidence —
+            # independent of _resolve_fc (a no-op for "solver"), never gated by forward_check.
+            if fc_err is None and responsible == "solver":
+                fc_err = _check_solver_evidence(payload, state)
             marker = (str(payload["success_marker"]).strip()
                       if responsible == "challenge" and payload.get("success_marker") else None)
             if fc_err is None and _normalize(newcode) != _normalize(c.code):   # valid + real change
                 escalate.pop(responsible, None)
+                if responsible == "solver":
+                    _log_solver_evidence(state, report, payload, where="repair")
                 return newcode, marker, cand_tc
-            # either a contract violation or an identical reply: record, escalate, retry —
-            # bounded by the SAME repair counter, never recompiled.
+            # either a contract/evidence violation or an identical reply: record, escalate,
+            # retry — bounded by the SAME repair counter, never recompiled.
             c.repairs += 1
             if fc_err is not None:
-                report.attempts.append(g.AttemptResult(0, False, "repair-contract-violation",
+                stage = "repair-evidence-fabricated" if responsible == "solver" else "repair-contract-violation"
+                report.attempts.append(g.AttemptResult(0, False, stage,
                                                        f"{responsible}: {fc_err}"[:300]))
-                state.log({"type": "repair-contract-violation", "component": responsible,
+                state.log({"type": stage, "component": responsible,
                            "repairs": c.repairs, "detail": fc_err[:600]})
                 escalate[responsible] = "\n\nNOTE: " + fc_err
             else:
@@ -1066,6 +1224,7 @@ def generate_recover_agentic(
             if which == "solver":   # independent solver sees public binary evidence, not sources
                 _ensure_binary_evidence(state, base_dir, backend, tgt)
             fc_gen_err: Optional[str] = None   # set below if the FIRST reply violates the contract
+            evidence_err: Optional[str] = None  # set below if a FIRST solver reply fabricates evidence
             fc = state.mode == "forward_check"
             if which == "challenge" and fc:
                 pass   # no LLM call: run_gate() deterministically (re)synthesizes it from F
@@ -1076,19 +1235,27 @@ def generate_recover_agentic(
                               "solver": _solver_prompt}[which])(state)
                 payload = _ask(caller, model, budget, state, report, which, "generate", gen_prompt)
                 resolved, fc_gen_err, cand_tc = _resolve_fc(which, state, str(payload.get(key, "")), payload)
-                if fc_gen_err is None:
+                if fc_gen_err is None and which == "solver":
+                    # Reverse-Engineering-First: reject the FIRST solver reply too if its cited
+                    # evidence is fabricated — independent of forward_check, never gated by it.
+                    evidence_err = _check_solver_evidence(payload, state)
+                if fc_gen_err is None and evidence_err is None:
                     comp.code = resolved
                     if which == "encoder" and cand_tc is not None:
                         state.transform_code = cand_tc        # first-ever F: nothing to desync yet
                     if which == "challenge" and payload.get("success_marker"):
                         state.success_marker = str(payload["success_marker"]).strip()
                     comp.status = "pending"
+                    if which == "solver":
+                        _log_solver_evidence(state, report, payload, where="generate")
                 state.save()
             if fc_gen_err is not None:
                 # Contract violation on the FIRST reply: never compiled — go straight to the
                 # SAME repair machinery a gate failure would use (never trust the compiler
                 # to catch a missing/duplicated placeholder).
                 ok, stage_name, detail = False, f"fc-contract-{which}", fc_gen_err
+            elif evidence_err is not None:
+                ok, stage_name, detail = False, "solver-evidence-fabricated", evidence_err
             else:
                 ok, stage_name, detail = run_gate(which)
             report.attempts.append(g.AttemptResult(0, ok, stage_name, detail[:300]))
