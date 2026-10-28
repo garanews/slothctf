@@ -70,6 +70,76 @@ class RecoverExecutionContractTests(unittest.TestCase):
         self.assertFalse(g._marker_matches("", "Unlocked"))
 
 
+class RecoverSameLengthMutationTests(unittest.TestCase):
+    """_recover_same_length_mutations: format-preserving, same-length, single-byte
+    WRONG candidates used to actually exercise a recover binary's comparison logic
+    on same-length input (not just reject it on length alone)."""
+
+    def test_three_distinct_same_length_candidates(self):
+        out = g._recover_same_length_mutations("sloth{abcdefgh}")
+        self.assertEqual([label for label, _ in out], ["start", "middle", "end"])
+        for label, cand in out:
+            self.assertEqual(len(cand), len("sloth{abcdefgh}"))
+            self.assertNotEqual(cand, "sloth{abcdefgh}")
+            self.assertTrue(cand.startswith("sloth{") and cand.endswith("}"))
+
+    def test_single_char_flag_yields_one_candidate(self):
+        out = g._recover_same_length_mutations("sloth{x}")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(len(out[0][1]), len("sloth{x}"))
+
+    def test_malformed_or_empty_flag_yields_nothing(self):
+        self.assertEqual(g._recover_same_length_mutations("not-a-flag"), [])
+        self.assertEqual(g._recover_same_length_mutations("sloth{}"), [])
+
+
+class RecoverDegenerateTransformTests(unittest.TestCase):
+    """_recover_execution_problem with same_length_bad: a wrong-but-same-length
+    input must be rejected too, not just a wrong-length one — this is what catches
+    a constant/degenerate transform (see docs: Forward-Check v2 run_14)."""
+
+    FLAG = "sloth{abcdefgh}"
+
+    def problem(self, same_length_bad, marker="FLAG_RECOVERED"):
+        good = _er(stdout=marker + "\n")
+        bad = _er(stdout="WRONG_INPUT\n")
+        return g._recover_execution_problem(good, bad, marker, self.FLAG,
+                                            same_length_bad=same_length_bad)
+
+    def test_well_behaved_with_same_length_probes_still_passes(self):
+        same_length_bad = [(label, _er(stdout="WRONG_INPUT\n"))
+                           for label, _ in g._recover_same_length_mutations(self.FLAG)]
+        self.assertIsNone(self.problem(same_length_bad))
+
+    def test_degenerate_transform_accepting_same_length_wrong_input_is_rejected(self):
+        # a constant F: EVERY same-length input, including wrong ones, is "accepted"
+        same_length_bad = [("start", _er(stdout="FLAG_RECOVERED\n")),
+                           ("middle", _er(stdout="WRONG_INPUT\n")),
+                           ("end", _er(stdout="WRONG_INPUT\n"))]
+        stage, msg = self.problem(same_length_bad)
+        self.assertEqual(stage, "recover-degenerate-transform")
+        self.assertIn("start", msg)
+
+    def test_same_length_probe_nonzero_exit_rejected(self):
+        same_length_bad = [("start", _er(ok=False, exit_code=1, stdout="WRONG_INPUT\n"))]
+        self.assertEqual(self.problem(same_length_bad)[0], "challenge-bad-exit")
+
+    def test_same_length_probe_timeout_rejected(self):
+        same_length_bad = [("start", _er(timed_out=True))]
+        self.assertEqual(self.problem(same_length_bad)[0], "challenge-timeout")
+
+    def test_same_length_probe_truncated_rejected(self):
+        same_length_bad = [("start", _er(stdout="WRONG_INPUT\n", truncated=True))]
+        self.assertEqual(self.problem(same_length_bad)[0], "output-truncated")
+
+    def test_no_same_length_probes_is_backward_compatible(self):
+        # old call sites (none left, but the default must stay safe) behave exactly
+        # as before when same_length_bad is omitted.
+        good = _er(stdout="FLAG_RECOVERED\n")
+        bad = _er(stdout="WRONG_INPUT\n")
+        self.assertIsNone(g._recover_execution_problem(good, bad, "FLAG_RECOVERED", self.FLAG))
+
+
 class SchemaAndNormalizeTests(unittest.TestCase):
     def test_schema_describes_recover_solver_and_marker(self):
         s = g._SCHEMA_RULES_RECOVER

@@ -1148,8 +1148,37 @@ def _marker_matches(output: str, marker: str) -> bool:
     return any(line.strip() == marker for line in output.splitlines())
 
 
+_FLAG_WRAPPER_RE = re.compile(r"^(sloth\{)(.*)(\})$", re.DOTALL)
+
+
+def _recover_same_length_mutations(flag: str) -> list[tuple[str, str]]:
+    """Build up to 3 WRONG candidates with the SAME byte length as `flag`, each
+    differing from it by exactly one mutated byte inside the flag's own content
+    (start, middle, end) — the 'sloth{'/'}' wrapper is never touched, so format
+    is preserved. Used to prove the challenge's accept/reject logic is actually
+    exercised on same-length input, not just rejected on length alone: a
+    constant/degenerate transform would wrongly ACCEPT one of these."""
+    m = _FLAG_WRAPPER_RE.match(flag)
+    if not m or not m.group(2):
+        return []
+    prefix, inner, suffix = m.group(1), m.group(2), m.group(3)
+    positions = [("start", 0), ("middle", len(inner) // 2), ("end", len(inner) - 1)]
+    out = []
+    seen_inner = set()
+    for label, pos in positions:
+        ch = inner[pos]
+        alt = "0" if ch != "0" else "1"
+        mutated_inner = inner[:pos] + alt + inner[pos + 1:]
+        if mutated_inner != inner and mutated_inner not in seen_inner:
+            seen_inner.add(mutated_inner)
+            out.append((label, prefix + mutated_inner + suffix))
+    return out
+
+
 def _recover_execution_problem(good: "ExecResult", bad: "ExecResult", marker: str,
-                               expected: str) -> tuple[str, str] | None:
+                               expected: str,
+                               same_length_bad: list[tuple[str, "ExecResult"]] | None = None,
+                               ) -> tuple[str, str] | None:
     """Shared functional contract for a recover binary, used at generation AND
     validation. Returns (stage, message) on a problem, or None if the program is a
     well-behaved validator that hides the flag.
@@ -1157,7 +1186,16 @@ def _recover_execution_problem(good: "ExecResult", bad: "ExecResult", marker: st
     recover v1 requires BOTH runs to exit 0 (exit code 0 on the correct flag and on
     a wrong input); the ONLY difference must be the success marker. A crash, an
     unexpected exit code, a timeout, or TRUNCATED output is a failure — truncated
-    output cannot be trusted to prove the flag is absent."""
+    output cannot be trusted to prove the flag is absent.
+
+    `same_length_bad`: (label, ExecResult) pairs for WRONG inputs of the SAME byte
+    length as the flag (see `_recover_same_length_mutations`). `bad` alone is a
+    DIFFERENT-length probe, which a correct-but-degenerate (e.g. constant) transform
+    would still reject on length alone without ever exercising its own comparison —
+    these same-length probes are what actually exercises it. Any one of them being
+    ACCEPTED proves the transform maps distinct inputs to the same output and is
+    rejected as degenerate; this is evidence of an observed collision, never a claim
+    that the transform is injective when none is found — sampling cannot prove that."""
     if good.timed_out or bad.timed_out:
         return ("challenge-timeout", "the challenge did not finish within the time limit.")
     if good.truncated or bad.truncated:
@@ -1187,6 +1225,25 @@ def _recover_execution_problem(good: "ExecResult", bad: "ExecResult", marker: st
             return ("too-trivial",
                     f"running the binary on {label} input reveals the flag — recover challenges must "
                     "hide it; the flag is obtained by analysis, not by running the program.")
+    for label, r in (same_length_bad or []):
+        if r.timed_out:
+            return ("challenge-timeout",
+                    f"the challenge did not finish within the time limit on a same-length wrong "
+                    f"input ({label}).")
+        if r.truncated:
+            return ("output-truncated",
+                    f"the challenge produced too much output on a same-length wrong input ({label}); "
+                    "flag-absence cannot be verified reliably.")
+        if not r.ok:
+            return ("challenge-bad-exit",
+                    f"on a same-length wrong input ({label}) the challenge exited {r.exit_code}, not 0. "
+                    "Both the correct flag and any wrong input of the same length must exit 0.")
+        if _marker_matches(r.stdout, marker):
+            return ("recover-degenerate-transform",
+                    f"a wrong input of the SAME length as the flag (one byte mutated at the {label} of "
+                    f"its content) also printed the success marker {marker!r} — your transform maps "
+                    "different inputs to the same output. Make it reject inputs that differ from the "
+                    "flag by even a single byte, for inputs of the same length.")
     return None
 
 
@@ -1346,7 +1403,11 @@ def _verify_recover_challenge(base_dir: Path, data: dict[str, Any], backend: "Ex
     good = backend.run_binary(base_dir, challenge_rel, target, stdin_text=expected + "\n")
     bad = backend.run_binary(base_dir, challenge_rel, target,
                              stdin_text="definitely_wrong_" + expected + "\n")
-    prob = _recover_execution_problem(good, bad, marker, expected)
+    same_length_bad = [
+        (label, backend.run_binary(base_dir, challenge_rel, target, stdin_text=cand + "\n"))
+        for label, cand in _recover_same_length_mutations(expected)
+    ]
+    prob = _recover_execution_problem(good, bad, marker, expected, same_length_bad=same_length_bad)
     if prob is not None:
         return AttemptResult(0, False, prob[0], prob[1])
 
