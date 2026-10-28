@@ -25,6 +25,7 @@ docs/sandbox.md.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -68,6 +69,122 @@ def _truncate(s: str, limit: int) -> tuple[str, bool]:
     if len(s) <= limit:
         return s, False
     return s[:limit] + f"\n...[output truncated at {limit} bytes]", True
+
+
+# --------------------------------------------------------------------------- #
+# static_analysis() disassembly selection — deterministic, symbol-independent
+# --------------------------------------------------------------------------- #
+# Import-trampoline section names, in the ELF/binutils convention (not specific to any
+# binary we build): every entry in these sections is a `jmp`/`push`+`jmp` through the
+# GOT, by construction of the dynamic linker — never application logic. A call SITE
+# that targets one (e.g. `call 1050 <memcmp@plt>`) still shows the resolved name at the
+# call site itself, from the dynamic symbol table — dropping the trampoline BODIES here
+# loses no information a solver needs. PE built `-static` has none of these sections.
+_PLT_SECTION_NAMES = frozenset({".plt", ".plt.sec", ".plt.got", ".iplt"})
+_DISASM_HEADER_RE = re.compile(r"^Disassembly of section (\S+):$")
+_DISASM_LABEL_RE = re.compile(r"^[0-9a-fA-F]+ <([^>]+)>:$")
+_DISASM_INSN_RE = re.compile(r"^\s*([0-9a-fA-F]+):\t(.*)$")
+
+
+def _entry_point_from_objdump_f(text: str) -> int | None:
+    """Parse `objdump -f`'s own declared entry point (ELF e_entry / PE
+    AddressOfEntryPoint) — a documented field of the binary's OWN header, read
+    generically for whichever binary is passed; never a hardcoded address, and the
+    same call works for both ELF and PE."""
+    m = re.search(r"start address\s+0x([0-9a-fA-F]+)", text)
+    return int(m.group(1), 16) if m else None
+
+
+def _compact_disassembly(raw: str, entry_point: int | None) -> tuple[str, list[str]]:
+    """Deterministic, symbol-independent compaction of `objdump -d --no-show-raw-insn`
+    output. Two things are compacted to a short marker, everything else passes through
+    UNCHANGED (same address/mnemonic/operand/relocation-comment text _check_solver_
+    evidence() verifies citations against — no format change there):
+
+    1. The full body of any import-trampoline section (_PLT_SECTION_NAMES) -> one line
+       listing its labelled entries. Always boilerplate, never application code, by
+       ELF/ABI convention — not specific to any binary we build.
+    2. The CRT entry-point block: located via the binary's OWN declared entry point
+       (never assumed or hardcoded), compacted from there up to and including the
+       first `ret` or `hlt` it reaches — the canonical end of `_start`'s own code on
+       x86-64. If the function at the entry point never reaches one of those (unusual),
+       nothing is compacted there and the real instructions are shown as-is — safer
+       to show too much than to guess and hide application code.
+
+    No decompiler, no instruction-semantics interpretation: only two structural,
+    binary-intrinsic signals (section identity, the binary's own entry point)."""
+    lines = raw.splitlines()
+    out: list[str] = []
+    notes: list[str] = []
+    i, n = 0, len(lines)
+    section: str | None = None
+    while i < n:
+        line = lines[i]
+        hm = _DISASM_HEADER_RE.match(line)
+        if hm:
+            section = hm.group(1)
+            out.append(line)
+            i += 1
+            continue
+        if section in _PLT_SECTION_NAMES:
+            entries = []
+            while i < n and not _DISASM_HEADER_RE.match(lines[i]):
+                lm = _DISASM_LABEL_RE.match(lines[i].strip())
+                if lm:
+                    entries.append(lm.group(1))
+                i += 1
+            if entries:
+                out.append(f"  [{len(entries)} import-trampoline entries in {section} omitted "
+                           "(boilerplate, not application code): " + ", ".join(entries) + "]")
+                notes.append(f"{section}: {len(entries)} trampoline entries")
+            continue
+        m = _DISASM_INSN_RE.match(line)
+        if m and entry_point is not None and int(m.group(1), 16) == entry_point:
+            start_addr = m.group(1)
+            j, last_addr = i, start_addr
+            while j < n:
+                im = _DISASM_INSN_RE.match(lines[j])
+                if im is None:
+                    break
+                last_addr = im.group(1)
+                mnem_tokens = im.group(2).split("\t")[-1].strip().split()
+                j += 1
+                if mnem_tokens and mnem_tokens[0].lower() in ("hlt", "ret"):
+                    break
+            out.append(f"  [CRT entry-point block {start_addr}-{last_addr} ({j - i} instructions) "
+                       "omitted — program startup trampoline, not application code, located via "
+                       "the binary's own declared entry point]")
+            notes.append(f"entry point {start_addr}-{last_addr}: {j - i} instructions")
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out), notes
+
+
+def _clip_lines_then_chars(text: str, label: str, max_lines: int, max_chars: int) -> str:
+    """Line-budget then char-budget truncation that NEVER cuts a line in half: when the
+    char budget would land inside a line, that whole line (and everything after it) is
+    dropped instead of sliced, and the omission is reported explicitly."""
+    lines = text.splitlines()
+    kept = lines[:max_lines]
+    notes = []
+    if len(lines) > max_lines:
+        notes.append(f"{len(lines) - max_lines} more lines truncated")
+    clipped = "\n".join(kept)
+    if len(clipped) > max_chars:
+        acc, kept2 = 0, []
+        for ln in kept:
+            if acc + len(ln) + 1 > max_chars:
+                break
+            kept2.append(ln)
+            acc += len(ln) + 1
+        notes.append(f"truncated to fit {max_chars} chars; {len(kept) - len(kept2)} further "
+                     "whole line(s) omitted")
+        clipped = "\n".join(kept2)
+    if notes:
+        clipped += f"\n[... {label}: {'; '.join(notes)} ...]"
+    return clipped
 
 
 _READ_CHUNK = 65536  # bytes pulled from a pipe per read
@@ -239,16 +356,23 @@ class ExecutionBackend(ABC):
         pre = "x86_64-w64-mingw32-" if self.name == "docker-wincompat" else ""
         data_secs = [".rodata", ".data"] if target.name == "elf" else [".rdata", ".data"]
         data_cmd = [f"{pre}objdump", "-s", *[a for s in data_secs for a in ("-j", s)], pin]
-        # Selection: the DATA dump carries the embedded (often non-printable) encoded bytes a
-        # recover solver must locate; the disassembly carries the transform logic. Each gets its
-        # OWN char budget so neither starves the other (a large static-PE .rdata must not crowd
-        # out the code, and vice-versa). Sizing: the total (~5.5k chars ~ <2k dense tokens) leaves
-        # the num_ctx=4096 window ample room for the solver response. Standard binutils only.
+        # Budget (chars), rebalanced from a flat per-step split: sections/data/strings are
+        # convenience previews the solver can re-derive itself (it already calls these SAME
+        # tools at runtime, per _SOLVER_TOOLING_HINT); the disassembly is the ONLY evidence
+        # _check_solver_evidence() verifies citations against, and used to be truncated
+        # (140 lines/1900 chars) almost entirely inside ELF/PLT startup boilerplate, before
+        # ever reaching the challenge's own comparison or transform code (verified against
+        # 11 real Forward-Check binaries: 0/11 exposed one real instruction of either). Most
+        # of the increase below comes from _compact_disassembly() dropping that boilerplate
+        # structurally (never from raw-char inflation) — measured at ~4.9k-5.5k compacted
+        # chars for those same 11 binaries, so 6000 covers them with headroom. Total ~7.8k
+        # chars (~<2k dense tokens by a chars/4 estimate) still leaves ample room in a
+        # 4096-token context for the RE-First instructions and the response. Standard
+        # binutils only; see docs on this rebalancing for the full token-budget analysis.
         steps = [
-            ("sections", [f"{pre}objdump", "-h", pin], 40, 800),
-            ("data section contents (encoded bytes live here)", data_cmd, 60, 1900),
-            ("strings", [f"{pre}strings", "-n", "5", pin], 40, 900),
-            ("disassembly", [f"{pre}objdump", "-d", "-M", "intel", pin], 140, 1900),
+            ("sections", [f"{pre}objdump", "-h", pin], 45, 600),
+            ("data section contents (encoded bytes live here)", data_cmd, 50, 700),
+            ("strings", [f"{pre}strings", "-n", "5", pin], 30, 500),
         ]
         parts: list[str] = []
         for label, inner, max_lines, max_chars in steps:
@@ -259,14 +383,36 @@ class ExecutionBackend(ABC):
                     text = f"(no output; {inner[0]} stderr: {r.stderr[:160]})"
             except Exception as exc:
                 text = f"(tool {inner[0]} unavailable: {type(exc).__name__})"
-            lines = text.splitlines()
-            clipped = "\n".join(lines[:max_lines])
-            if len(lines) > max_lines:
-                clipped += f"\n[... {label}: {len(lines) - max_lines} more lines truncated ...]"
-            if len(clipped) > max_chars:
-                clipped = clipped[:max_chars] + f"\n[... {label}: truncated to {max_chars} chars ...]"
+            clipped = _clip_lines_then_chars(text, label, max_lines, max_chars)
             parts.append(f"=== {label} ({inner[0]}) ===\n{clipped}")
+        parts.append(self._disassembly_evidence(pin, pre, workspace, limits))
         return "\n\n".join(parts)
+
+    def _disassembly_evidence(self, pin: str, pre: str, workspace: Path,
+                              limits: "ResourceLimits") -> str:
+        """The disassembly step of static_analysis(): drops raw instruction bytes
+        (--no-show-raw-insn, pure formatting — address/mnemonic/operand/relocation-
+        comment text is unchanged), compacts PLT/entry-point boilerplate
+        (_compact_disassembly), then applies the final line/char budget."""
+        label, max_lines, max_chars = "disassembly", 400, 6000
+        tool_name = f"{pre}objdump"
+        try:
+            r = self._run_tool([tool_name, "-d", "-M", "intel", "--no-show-raw-insn", pin],
+                               workspace, min(limits.run_timeout, 30.0), limits)
+            raw = (r.stdout or "").strip()
+            if not raw and r.stderr:
+                return f"=== {label} ({tool_name}) ===\n(no output; {tool_name} stderr: {r.stderr[:160]})"
+        except Exception as exc:
+            return f"=== {label} ({tool_name}) ===\n(tool {tool_name} unavailable: {type(exc).__name__})"
+        entry_point = None
+        try:
+            fr = self._run_tool([tool_name, "-f", pin], workspace, min(limits.run_timeout, 10.0), limits)
+            entry_point = _entry_point_from_objdump_f(fr.stdout or "")
+        except Exception:
+            pass   # entry-point detection is best-effort; without it nothing is compacted there
+        compacted, notes = _compact_disassembly(raw, entry_point)
+        clipped = _clip_lines_then_chars(compacted, label, max_lines, max_chars)
+        return f"=== {label} ({tool_name}) ===\n{clipped}"
 
 
 # --------------------------------------------------------------------------- #
