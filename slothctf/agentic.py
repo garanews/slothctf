@@ -705,7 +705,11 @@ def _gate_challenge(state, base_dir, backend, tgt, solver_backend) -> tuple[bool
         return False, "bad-marker", "success_marker must not contain the flag."
     good = backend.run_binary(base_dir, _chal_rel(tgt), tgt, stdin_text=state.flag + "\n")
     bad = backend.run_binary(base_dir, _chal_rel(tgt), tgt, stdin_text="definitely_wrong_" + state.flag + "\n")
-    prob = g._recover_execution_problem(good, bad, marker, state.flag)
+    same_length_bad = [
+        (label, backend.run_binary(base_dir, _chal_rel(tgt), tgt, stdin_text=cand + "\n"))
+        for label, cand in g._recover_same_length_mutations(state.flag)
+    ]
+    prob = g._recover_execution_problem(good, bad, marker, state.flag, same_length_bad=same_length_bad)
     if prob is not None:
         # Phase 2: attach a concrete, transform-agnostic diagnostic from the probe — the
         # real lengths (data we already hold) and what the program actually printed — so
@@ -850,7 +854,8 @@ _RESPONSIBLE = {
     "encoder-compile": "encoder", "encoder-crash": "encoder", "encoder-output": "encoder",
     "challenge-compile": "challenge", "missing-placeholder": "challenge", "flag-leak": "challenge",
     "no-marker": "challenge", "bad-marker": "challenge", "recover-rejects-correct": "challenge",
-    "recover-accepts-wrong": "challenge", "challenge-crash": "challenge",
+    "recover-accepts-wrong": "challenge", "recover-degenerate-transform": "challenge",
+    "challenge-crash": "challenge",
     "challenge-bad-exit": "challenge", "too-trivial": "challenge", "output-truncated": "challenge",
     "solver-error": "solver", "solver-mismatch": "solver", "solver-hardcoded": "solver",
     "swap-solver-error": "solver", "swap-encoder": "encoder", "swap-identical": "encoder",

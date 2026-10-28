@@ -1037,5 +1037,89 @@ class ForwardCheckCollisionRiskTests(unittest.TestCase):
                       "lets a colliding WRONG input pass — Forward-Check does not prove F is injective.")
 
 
+@unittest.skipUnless(_READY, _SKIP)
+class ForwardCheckDegenerateTransformGateTests(unittest.TestCase):
+    """Regression for the Forward-Check v2 run_14 finding: a CONSTANT transform (same
+    output for every input — e.g. an s-box array literal left empty/commented-out,
+    which C zero-fills) must not be declared a valid challenge, even though it still
+    correctly rejects a wrong-LENGTH input on its own. Reproduced through the real,
+    shipped skeleton — not a test-only fixture — and through the real gate helper."""
+
+    def test_constant_transform_is_rejected_not_passed(self):
+        from slothctf.execution import DockerLinuxBackend
+        import slothctf.generator as g
+        backend = DockerLinuxBackend()
+        tgt = g.get_target("elf")
+        constant_transform = (
+            "void slothctf_transform(const unsigned char *in, size_t n, unsigned char *out) {\n"
+            "    unsigned char sbox[256] = { /* left empty by mistake: C zero-fills it */ };\n"
+            "    for (size_t i = 0; i < n; i++) out[i] = sbox[in[i]];\n"
+            "}\n")
+        flag = "sloth{abcdefghijkl}"
+        body = ",".join("0x00" for _ in flag)  # sbox[anything] == 0, always
+        chal_src = ag._FC_CHALLENGE_SKELETON.replace(ag.TRANSFORM_PLACEHOLDER, constant_transform) \
+                                            .replace(g.ENCODED_PLACEHOLDER, body)
+        with TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            (ws / "src").mkdir(); (ws / "bin").mkdir()
+            (ws / "src" / "challenge.c").write_text(chal_src, encoding="utf-8")
+            r = backend.compile_c(ws, "src/challenge.c", "bin/challenge", tgt)
+            self.assertTrue(r.ok, r.stderr)
+            good = backend.run_binary(ws, "bin/challenge", tgt, stdin_text=flag + "\n")
+            bad = backend.run_binary(ws, "bin/challenge", tgt,
+                                     stdin_text="definitely_wrong_" + flag + "\n")
+            same_length_bad = [
+                (label, backend.run_binary(ws, "bin/challenge", tgt, stdin_text=cand + "\n"))
+                for label, cand in g._recover_same_length_mutations(flag)
+            ]
+        # sanity: the OLD wrong-length probe alone still looks fine — this is exactly
+        # the blind spot the fix closes, not a contradiction of it.
+        self.assertNotIn(ag.FC_SUCCESS_MARKER, bad.stdout)
+        prob = g._recover_execution_problem(good, bad, ag.FC_SUCCESS_MARKER, flag,
+                                            same_length_bad=same_length_bad)
+        self.assertIsNotNone(prob, "a constant transform must not be declared valid")
+        self.assertEqual(prob[0], "recover-degenerate-transform")
+
+
+@unittest.skipUnless(_WIN_READY and _READY, _WIN_SKIP)
+class ForwardCheckDegenerateTransformGatePeTests(unittest.TestCase):
+    """Same regression as ForwardCheckDegenerateTransformGateTests, on PE — the
+    shared gate helper is target-agnostic, but the challenge must actually be
+    compiled and run per-target to prove it, not assumed from the ELF result."""
+
+    def test_constant_transform_is_rejected_not_passed(self):
+        from slothctf.execution import DockerWinCompatBackend
+        import slothctf.generator as g
+        backend = DockerWinCompatBackend()
+        tgt = g.get_target("pe")
+        constant_transform = (
+            "void slothctf_transform(const unsigned char *in, size_t n, unsigned char *out) {\n"
+            "    unsigned char sbox[256] = { /* left empty by mistake: C zero-fills it */ };\n"
+            "    for (size_t i = 0; i < n; i++) out[i] = sbox[in[i]];\n"
+            "}\n")
+        flag = "sloth{abcdefghijkl}"
+        body = ",".join("0x00" for _ in flag)
+        chal_src = ag._FC_CHALLENGE_SKELETON.replace(ag.TRANSFORM_PLACEHOLDER, constant_transform) \
+                                            .replace(g.ENCODED_PLACEHOLDER, body)
+        with TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            (ws / "src").mkdir(); (ws / "bin").mkdir()
+            (ws / "src" / "challenge.c").write_text(chal_src, encoding="utf-8")
+            r = backend.compile_c(ws, "src/challenge.c", "bin/challenge.exe", tgt)
+            self.assertTrue(r.ok, r.stderr)
+            good = backend.run_binary(ws, "bin/challenge.exe", tgt, stdin_text=flag + "\n")
+            bad = backend.run_binary(ws, "bin/challenge.exe", tgt,
+                                     stdin_text="definitely_wrong_" + flag + "\n")
+            same_length_bad = [
+                (label, backend.run_binary(ws, "bin/challenge.exe", tgt, stdin_text=cand + "\n"))
+                for label, cand in g._recover_same_length_mutations(flag)
+            ]
+        self.assertNotIn(ag.FC_SUCCESS_MARKER, bad.stdout)
+        prob = g._recover_execution_problem(good, bad, ag.FC_SUCCESS_MARKER, flag,
+                                            same_length_bad=same_length_bad)
+        self.assertIsNotNone(prob, "a constant transform must not be declared valid")
+        self.assertEqual(prob[0], "recover-degenerate-transform")
+
+
 if __name__ == "__main__":
     unittest.main()

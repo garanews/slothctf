@@ -199,7 +199,8 @@ def _validate_recover(challenge_dir: Path, metadata: dict, target: Target,
     (flag-swap) proof — that a second, harness-chosen flag is recovered — which is
     a property of the generator, not of the distributed artifact."""
     from .generator import (  # internal reuse
-        _flag_leaks_recover, _recover_execution_problem, _run_solver_isolated,
+        _flag_leaks_recover, _recover_execution_problem, _recover_same_length_mutations,
+        _run_solver_isolated,
     )
 
     flag = str(metadata.get("flag", ""))
@@ -229,7 +230,11 @@ def _validate_recover(challenge_dir: Path, metadata: dict, target: Target,
     good = backend.run_binary(challenge_dir, challenge_rel, target, stdin_text=flag + "\n")
     bad = backend.run_binary(challenge_dir, challenge_rel, target,
                              stdin_text="definitely_wrong_" + flag + "\n")
-    prob = _recover_execution_problem(good, bad, marker, flag)
+    same_length_bad = [
+        (label, backend.run_binary(challenge_dir, challenge_rel, target, stdin_text=cand + "\n"))
+        for label, cand in _recover_same_length_mutations(flag)
+    ]
+    prob = _recover_execution_problem(good, bad, marker, flag, same_length_bad=same_length_bad)
     if prob is not None:
         return _fail(prob[0], prob[1])
 
