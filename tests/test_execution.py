@@ -220,7 +220,8 @@ class StaticAnalysisElfTests(unittest.TestCase):
         self.assertIn("=== sections", ev)
         self.assertIn("=== strings", ev)
         self.assertIn("=== disassembly", ev)
-        self.assertLessEqual(len(ev), 6000)                    # bounded to the context budget
+        # bounded to the (rebalanced) context budget: 600+700+500+6000 nominal max
+        self.assertLessEqual(len(ev), 8500)
 
 
 @unittest.skipUnless(_PE_READY, "needs Docker + the Windows-compat sandbox image")
@@ -235,7 +236,360 @@ class StaticAnalysisPeTests(unittest.TestCase):
             ev = b.static_analysis(ws, "bin/challenge.exe", get_target("pe"))
         self.assertIn("=== sections", ev)
         self.assertIn("=== disassembly", ev)
-        self.assertLessEqual(len(ev), 6000)
+        self.assertLessEqual(len(ev), 8500)
+
+
+# --------------------------------------------------------------------------- #
+# Disassembly SELECTION (ex._compact_disassembly / _entry_point_from_objdump_f /
+# _clip_lines_then_chars): deterministic, symbol-independent boilerplate removal
+# so the solver sees application instructions, not ELF/PLT/CRT startup noise.
+# Pure-Python unit tests first (hand-built objdump-shaped text, no Docker needed),
+# then Docker integration tests against real compiled binaries.
+# --------------------------------------------------------------------------- #
+_SAMPLE_OBJDUMP_D = (
+    "Disassembly of section .plt:\n\n"
+    "0000000000001020 <puts@plt-0x10>:\n"
+    "    1020:\tpush   QWORD PTR [rip+0x2fca]\n"
+    "    1026:\tjmp    QWORD PTR [rip+0x2fcc]\n\n"
+    "0000000000001030 <puts@plt>:\n"
+    "    1030:\tjmp    QWORD PTR [rip+0x2fca]\n"
+    "    1036:\tpush   0x0\n\n"
+    "Disassembly of section .plt.got:\n\n"
+    "0000000000001060 <__cxa_finalize@plt>:\n"
+    "    1060:\tjmp    QWORD PTR [rip+0x2f7a]\n\n"
+    "Disassembly of section .text:\n\n"
+    "0000000000001100 <.text>:\n"
+    "    1100:\txor    ebp,ebp\n"
+    "    1102:\tmov    r9,rdx\n"
+    "    1104:\thlt\n"
+    "    1105:\tpush   rbx\n"
+    "    1106:\txor    ebx,ebx\n"
+    "    1107:\tcall   1030 <puts@plt>\n"
+    "    110c:\tret\n"
+)
+
+
+class DisassemblyCompactionTests(unittest.TestCase):
+    """Pure-Python: ex._compact_disassembly / _entry_point_from_objdump_f /
+    _clip_lines_then_chars, against hand-built objdump-shaped text."""
+
+    def test_entry_point_parsed_from_objdump_f(self):
+        text = ("\nfile.exe:     file format elf64-x86-64\n"
+                "architecture: i386:x86-64, flags 0x00000150:\n"
+                "start address 0x0000000000001100\n")
+        self.assertEqual(ex._entry_point_from_objdump_f(text), 0x1100)
+
+    def test_entry_point_missing_returns_none(self):
+        self.assertIsNone(ex._entry_point_from_objdump_f("no such field here"))
+
+    def test_plt_family_sections_compacted_to_one_line_index(self):
+        compacted, notes = ex._compact_disassembly(_SAMPLE_OBJDUMP_D, entry_point=0x1100)
+        self.assertNotIn("push   QWORD PTR", compacted)   # trampoline body gone
+        self.assertIn("puts@plt-0x10", compacted)          # but the entry is still named
+        self.assertIn("puts@plt>", compacted)
+        self.assertIn("__cxa_finalize@plt", compacted)
+        self.assertTrue(any(".plt" in n for n in notes))
+        self.assertTrue(any(".plt.got" in n for n in notes))
+
+    def test_entry_point_block_compacted_up_to_hlt(self):
+        compacted, notes = ex._compact_disassembly(_SAMPLE_OBJDUMP_D, entry_point=0x1100)
+        # the 3 instructions at/after the entry point, up to and including hlt, are gone...
+        self.assertNotIn("1100:\txor    ebp,ebp", compacted)
+        self.assertNotIn("1104:\thlt", compacted)
+        # ...but application code AFTER that point is fully preserved
+        self.assertIn("1105:\tpush   rbx", compacted)
+        self.assertIn("1106:\txor    ebx,ebx", compacted)
+        self.assertIn("1107:\tcall   1030 <puts@plt>", compacted)
+        self.assertIn("110c:\tret", compacted)
+        self.assertTrue(any("entry point" in n for n in notes))
+
+    def test_no_entry_point_leaves_everything_untouched_except_plt(self):
+        # safer to show too much than to guess and hide application code
+        compacted, notes = ex._compact_disassembly(_SAMPLE_OBJDUMP_D, entry_point=None)
+        self.assertIn("1100:\txor    ebp,ebp", compacted)
+        self.assertIn("1104:\thlt", compacted)
+        self.assertFalse(any("entry point" in n for n in notes))
+
+    def test_entry_point_outside_the_dump_is_a_noop(self):
+        compacted, notes = ex._compact_disassembly(_SAMPLE_OBJDUMP_D, entry_point=0xdeadbeef)
+        self.assertIn("1100:\txor    ebp,ebp", compacted)
+        self.assertFalse(any("entry point" in n for n in notes))
+
+    def test_addresses_mnemonics_operands_and_relocation_comments_pass_through_unchanged(self):
+        raw = ("Disassembly of section .text:\n\n0000000000002000 <.text>:\n"
+              "    2000:\tmov    rax,QWORD PTR [rip+0x10]        # 3010 <stdin@GLIBC_2.2.5>\n")
+        compacted, _ = ex._compact_disassembly(raw, entry_point=None)
+        self.assertIn("2000:\tmov    rax,QWORD PTR [rip+0x10]        # 3010 <stdin@GLIBC_2.2.5>",
+                      compacted)
+
+    def test_clip_never_cuts_a_line_in_half(self):
+        line_len = len("line000 " + "x" * 20)   # 28 chars
+        text = "\n".join(f"line{i:03d} " + "x" * 20 for i in range(50))
+        clipped = ex._clip_lines_then_chars(text, "disassembly", max_lines=100, max_chars=137)
+        for ln in clipped.splitlines():
+            if ln.startswith("line"):
+                self.assertEqual(len(ln), line_len)   # every kept content line is whole, never sliced
+        self.assertIn("truncated to fit 137 chars", clipped)
+
+    def test_clip_line_budget_reports_omitted_count(self):
+        text = "\n".join(f"l{i}" for i in range(10))
+        clipped = ex._clip_lines_then_chars(text, "sections", max_lines=4, max_chars=10_000)
+        self.assertIn("6 more lines truncated", clipped)
+
+    def test_clip_under_budget_is_unchanged(self):
+        text = "a\nb\nc"
+        self.assertEqual(ex._clip_lines_then_chars(text, "x", max_lines=10, max_chars=100), text)
+
+
+_FC_TRANSFORM_FOR_SELECTION = (
+    "void slothctf_transform(const unsigned char *in, size_t n, unsigned char *out) {\n"
+    "    unsigned char s = 0x5a;\n"
+    "    for (size_t i = 0; i < n; i++) {\n"
+    "        unsigned char v = (unsigned char)(in[i] ^ s);\n"
+    "        out[i] = v;\n"
+    "        s = (unsigned char)(s + in[i] + (unsigned char)i);\n"
+    "    }\n"
+    "}\n")
+_FC_CHALLENGE_C_FOR_SELECTION = (
+    "#include <stdio.h>\n#include <string.h>\n#include <stddef.h>\n"
+    + _FC_TRANSFORM_FOR_SELECTION +
+    "static const unsigned char ENC[] = {0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,"
+    "0x0b,0x0c,0x0d,0x0e,0x0f,0x10,0x11,0x12,0x13};\n"
+    "#define FLAG_LEN (sizeof(ENC))\n"
+    "int main(void){\n"
+    "  unsigned char buf[FLAG_LEN]; size_t n=0; int c;\n"
+    "  while((c=fgetc(stdin))!=EOF && c!='\\n'){ if(n<FLAG_LEN) buf[n]=(unsigned char)c; n++; }\n"
+    "  if(n!=FLAG_LEN){ printf(\"WRONG_INPUT\\n\"); return 0; }\n"
+    "  unsigned char computed[FLAG_LEN]; slothctf_transform(buf, FLAG_LEN, computed);\n"
+    "  if(memcmp(computed, ENC, FLAG_LEN)==0) printf(\"FLAG_RECOVERED\\n\");\n"
+    "  else printf(\"WRONG_INPUT\\n\");\n"
+    "  return 0;\n}\n")
+# A tiny inline-friendly variant: the transform is ONE line, trivial enough that gcc -O2
+# may choose to inline it directly into main() instead of emitting a separate function —
+# the selection logic must not assume either shape.
+_INLINE_FRIENDLY_TRANSFORM = (
+    "static inline void slothctf_transform(const unsigned char *in, size_t n, unsigned char *out) {\n"
+    "    for (size_t i = 0; i < n; i++) out[i] = (unsigned char)(in[i] ^ 0x5a);\n"
+    "}\n")
+_INLINE_FRIENDLY_CHALLENGE_C = (
+    "#include <stdio.h>\n#include <string.h>\n#include <stddef.h>\n"
+    + _INLINE_FRIENDLY_TRANSFORM +
+    "static const unsigned char ENC[] = {0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a};\n"
+    "#define FLAG_LEN (sizeof(ENC))\n"
+    "int main(void){\n"
+    "  unsigned char buf[FLAG_LEN]; size_t n=0; int c;\n"
+    "  while((c=fgetc(stdin))!=EOF && c!='\\n'){ if(n<FLAG_LEN) buf[n]=(unsigned char)c; n++; }\n"
+    "  if(n!=FLAG_LEN){ printf(\"WRONG_INPUT\\n\"); return 0; }\n"
+    "  unsigned char computed[FLAG_LEN]; slothctf_transform(buf, FLAG_LEN, computed);\n"
+    "  if(memcmp(computed, ENC, FLAG_LEN)==0) printf(\"FLAG_RECOVERED\\n\");\n"
+    "  else printf(\"WRONG_INPUT\\n\");\n"
+    "  return 0;\n}\n")
+# Deliberately pulls in many extra PLT imports to stress-test trampoline compaction.
+_LONG_BOILERPLATE_C = (
+    "#include <stdio.h>\n#include <string.h>\n#include <stdlib.h>\n#include <ctype.h>\n"
+    "int main(int argc, char **argv){\n"
+    "  char b[64]; if(!fgets(b,sizeof b,stdin)) return 0;\n"
+    "  size_t n = strlen(b); if(n && b[n-1]=='\\n') b[--n]=0;\n"
+    "  if(strcmp(b,\"x\")==0) puts(\"eq\");\n"
+    "  if(strncmp(b,\"y\",1)==0) puts(\"pre\");\n"
+    "  if(isalpha((unsigned char)b[0])) puts(\"alpha\");\n"
+    "  printf(\"%d %s %ld\\n\", (int)n, b, strtol(b,NULL,10));\n"
+    "  qsort(b, n, 1, (int(*)(const void*,const void*))strcmp);\n"
+    "  return 0;\n}\n")
+
+
+def _assemble(binrel, c_src, backend, tgt, workspace, *, stripped=True):
+    (workspace / "src").mkdir(exist_ok=True); (workspace / "bin").mkdir(exist_ok=True)
+    (workspace / "src" / "c.c").write_text(c_src, encoding="utf-8")
+    if stripped:
+        res = backend.compile_c(workspace, "src/c.c", binrel, tgt)
+    else:
+        # bypass compile_c's hardcoded -s so a REAL symbol table is present — the
+        # selection logic must not rely on it either way.
+        from pathlib import PurePosixPath
+        src = PurePosixPath("/work") / "src" / "c.c"
+        out = PurePosixPath("/work") / binrel
+        res = backend._exec(["gcc", "-O2", "-o", str(out), str(src)], workspace, 60.0, ResourceLimits())
+    return res
+
+
+@unittest.skipUnless(_ELF_READY, "needs Docker + the ELF sandbox image")
+class DisassemblySelectionElfDockerTests(unittest.TestCase):
+    """Real compiles: stripped/non-stripped, inline/separate transform, long
+    boilerplate, truncation, and a real citation still verifying against the new
+    (--no-show-raw-insn) format — against ACTUAL binaries, not hand-built text."""
+
+    def _evidence(self, c_src, *, stripped=True, binrel="bin/challenge"):
+        b = DockerLinuxBackend()
+        with TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            res = _assemble(binrel, c_src, b, get_target("elf"), ws, stripped=stripped)
+            self.assertTrue(res.ok, res.stderr)
+            return b.static_analysis(ws, binrel, get_target("elf"))
+
+    def test_stripped_separate_transform_function(self):
+        ev = self._evidence(_FC_CHALLENGE_C_FOR_SELECTION, stripped=True)
+        idx = ev.find("=== disassembly")
+        self.assertNotEqual(idx, -1)
+        disasm = ev[idx:]
+        self.assertIn("xor", disasm.lower())
+        self.assertIn("0x13", disasm)              # FLAG_LEN=19=0x13, as a real immediate
+        self.assertNotIn("endbr64\n    ", disasm[:300])  # entry-point block was compacted away
+
+    def test_non_stripped_real_symbols_do_not_break_selection(self):
+        ev = self._evidence(_FC_CHALLENGE_C_FOR_SELECTION, stripped=False)
+        idx = ev.find("=== disassembly")
+        disasm = ev[idx:]
+        self.assertIn("<main>", disasm)                    # a real symbol now exists...
+        self.assertIn("<slothctf_transform>", disasm)       # ...for both functions
+        self.assertIn("xor", disasm.lower())
+        self.assertIn("0x13", disasm)
+
+    def test_inline_friendly_transform_still_fully_visible(self):
+        ev = self._evidence(_INLINE_FRIENDLY_CHALLENGE_C, stripped=True)
+        idx = ev.find("=== disassembly")
+        disasm = ev[idx:]
+        self.assertIn("xor", disasm.lower())
+        self.assertIn("0x5a", disasm.lower())   # the inline-friendly XOR key, 0x5a
+        self.assertIn("0xa", disasm.lower())    # FLAG_LEN=10=0xa, as a real immediate
+
+    def test_long_boilerplate_plt_is_compacted_not_shown_verbatim(self):
+        ev = self._evidence(_LONG_BOILERPLATE_C, stripped=True, binrel="bin/boiler")
+        idx = ev.find("=== disassembly")
+        disasm = ev[idx:]
+        self.assertIn("import-trampoline entries", disasm)
+        # the harness's own extra imports (strtol, qsort, isalpha, strncmp...) are named
+        # in the compacted index, not shown with their full (boilerplate) trampoline body
+        self.assertIn("strtol@plt", disasm)
+        self.assertNotIn("QWORD PTR [rip+", disasm[disasm.find("import-trampoline"):
+                                                    disasm.find("import-trampoline") + 400])
+
+    def test_citation_against_the_new_format_still_verifies(self):
+        import slothctf.agentic as ag
+        ev = self._evidence(_FC_CHALLENGE_C_FOR_SELECTION, stripped=True)
+        lines = ag._parse_disasm_lines(ev)
+        self.assertTrue(lines, "no instruction lines parsed from the new evidence format")
+        addr, text = next(iter(lines.items()))
+        insn = text.split("\t")[-1].strip()
+        payload = {"analysis": {"evidence": [{"addr": addr, "insn": insn, "claim": "c"}],
+                                "insufficient_evidence": False}, "solver_code": "print(1)"}
+
+        class FS:
+            binary_evidence = ev
+        self.assertIsNone(ag._check_solver_evidence(payload, FS()))
+        # a fabricated address must still be rejected against the new format
+        bad = {"analysis": {"evidence": [{"addr": "0xdeadbeef", "insn": insn, "claim": "c"}],
+                            "insufficient_evidence": False}, "solver_code": "print(1)"}
+        self.assertIsNotNone(ag._check_solver_evidence(bad, FS()))
+
+    def test_tight_budget_truncates_on_whole_lines_and_reports_it(self):
+        b = DockerLinuxBackend()
+        with TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            res = _assemble("bin/challenge", _FC_CHALLENGE_C_FOR_SELECTION, b, get_target("elf"), ws)
+            self.assertTrue(res.ok, res.stderr)
+            ev = b._disassembly_evidence("/work/bin/challenge", "", ws, ResourceLimits())
+        # the method uses its own fixed budget; verify the GENERAL truncation helper
+        # directly with a tiny budget against this run's real compacted text instead
+        idx = ev.find("=== disassembly")
+        real_compacted_disasm = ev[idx:]
+        tight = ex._clip_lines_then_chars(real_compacted_disasm, "disassembly",
+                                          max_lines=1000, max_chars=300)
+        for ln in tight.splitlines():
+            self.assertFalse(ln.startswith("    ") and len(ln) > 200, ln)  # no absurdly long partial line
+        self.assertIn("truncated to fit 300 chars", tight)
+        # no mid-line cut: every content line kept is a complete, valid line from the original
+        kept_lines = [l for l in tight.splitlines() if not l.startswith("[...")]
+        for l in kept_lines:
+            if l.strip() and not l.startswith("["):
+                self.assertIn(l, real_compacted_disasm)
+
+
+@unittest.skipUnless(_PE_READY, "needs Docker + the Windows-compat sandbox image")
+class DisassemblySelectionPeDockerTests(unittest.TestCase):
+    """Same proof on PE (MinGW, with its own CRT startup) — the selection logic must
+    generalize, not just happen to work for ELF's smaller dynamic-linking glue."""
+
+    def test_entry_point_is_detected_on_pe_too(self):
+        # the entry-point detection mechanism itself (objdump -f parsing) works
+        # identically on PE -- this is NOT the same claim as "the transform is visible"
+        # (see the documented limitation below).
+        from slothctf.execution import DockerWinCompatBackend
+        b = DockerWinCompatBackend()
+        with TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            res = _assemble("bin/challenge.exe", _FC_CHALLENGE_C_FOR_SELECTION, b,
+                            get_target("pe"), ws)
+            self.assertTrue(res.ok, res.stderr)
+            fr = b._run_tool(["x86_64-w64-mingw32-objdump", "-f", "/work/bin/challenge.exe"],
+                             ws, 30.0, ResourceLimits())
+        self.assertIsNotNone(ex._entry_point_from_objdump_f(fr.stdout))
+
+    def test_KNOWN_LIMITATION_static_mingw_crt_can_still_bury_the_transform(self):
+        """Documents a known, UNFIXED limitation (same pattern as
+        ForwardCheckCollisionRiskTests): our PE builds use `-static -pthread`
+        (DockerWinCompatBackend.compile_c; needed so the .exe has no missing-DLL
+        problem under Wine). A statically-linked MinGW CRT is far larger than ELF's
+        dynamic-linking glue -- thousands of lines of locale/exception/init machinery
+        -- and _compact_disassembly only removes the entry-point block and PLT-style
+        import trampolines (ELF has none to remove here, since everything is linked
+        in). For a trivial transform this can still leave the actual application code
+        past the 6000-char disassembly budget, confirmed below. This is not claimed
+        to be solved here; building PE dynamically (no `-static`) would likely give it
+        the same small, PLT-like import-thunk shape ELF has, but changes the Wine
+        compatibility trade-off `-static` was added for, so it is a build-configuration
+        decision outside this fix's scope, documented rather than changed."""
+        from slothctf.execution import DockerWinCompatBackend
+        b = DockerWinCompatBackend()
+        with TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            res = _assemble("bin/challenge.exe", _FC_CHALLENGE_C_FOR_SELECTION, b,
+                            get_target("pe"), ws)
+            self.assertTrue(res.ok, res.stderr)
+            ev = b.static_analysis(ws, "bin/challenge.exe", get_target("pe"))
+        idx = ev.find("=== disassembly")
+        disasm = ev[idx:]
+        self.assertIn("more lines truncated", disasm)   # the CRT dump itself is this large
+        self.assertNotIn("0x13", disasm, "if this starts failing, the limitation may be "
+                         "resolved -- re-check before deleting this test")
+
+    def test_pe_citation_against_the_new_format_still_verifies(self):
+        import slothctf.agentic as ag
+        from slothctf.execution import DockerWinCompatBackend
+        b = DockerWinCompatBackend()
+        with TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            res = _assemble("bin/challenge.exe", _FC_CHALLENGE_C_FOR_SELECTION, b,
+                            get_target("pe"), ws)
+            self.assertTrue(res.ok, res.stderr)
+            ev = b.static_analysis(ws, "bin/challenge.exe", get_target("pe"))
+        lines = ag._parse_disasm_lines(ev)
+        self.assertTrue(lines)
+        addr, text = next(iter(lines.items()))
+        insn = text.split("\t")[-1].strip()
+        payload = {"analysis": {"evidence": [{"addr": addr, "insn": insn, "claim": "c"}],
+                                "insufficient_evidence": False}, "solver_code": "print(1)"}
+
+        class FS:
+            binary_evidence = ev
+        self.assertIsNone(ag._check_solver_evidence(payload, FS()))
+
+
+class NoSecretLeakageTests(unittest.TestCase):
+    """The selection functions only ever process the PUBLIC disassembly text of the
+    DISTRIBUTED binary — they take no flag, source, or organizer data as input at all,
+    so there is nothing for them to leak. Documented structurally (signature-level),
+    not re-proving the existing flag-leak check."""
+
+    def test_compact_disassembly_signature_takes_no_organizer_data(self):
+        import inspect
+        params = list(inspect.signature(ex._compact_disassembly).parameters)
+        self.assertEqual(params, ["raw", "entry_point"])
+
+    def test_static_analysis_signature_takes_no_flag_or_source(self):
+        import inspect
+        params = list(inspect.signature(ex.ExecutionBackend.static_analysis).parameters)
+        self.assertEqual(params, ["self", "workspace", "binary_rel", "target", "limits"])
 
 
 # --------------------------------------------------------------------------- #
